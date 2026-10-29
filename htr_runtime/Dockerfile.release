@@ -1,0 +1,10 @@
+# Documentation-only release layer: adds the license notices to an already built
+# runtime image without rebuilding or changing any executable layer.
+#   docker build -f htr_runtime/Dockerfile -t vllm-htr:runtime .
+#   docker build -f htr_runtime/Dockerfile.release --build-arg RUNTIME=vllm-htr:runtime -t vllm-htr:release .
+ARG RUNTIME=vllm-htr:runtime
+FROM ${RUNTIME}
+COPY htr_runtime/ /usr/share/doc/vllm-htr/
+LABEL org.opencontainers.image.title="vLLM HTR" \
+      org.opencontainers.image.source="https://github.com/HawgAuto/vllm-htr" \
+      org.opencontainers.image.description="vLLM HTR serving runtime for Qwen3.8-Flash-Next-HTR on AMD gfx1151 (Strix Halo)"

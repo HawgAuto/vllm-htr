@@ -1,0 +1,9 @@
+# Native artifacts are rebuilt from source inside the pinned image.
+*.so
+*.o
+__pycache__/
+*.pyc
+native-build-receipt.json
+installed-files.json
+# These hipified sources are pinned build inputs, not disposable outputs.
+!native-source/**/*.hip

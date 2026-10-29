@@ -1,0 +1,463 @@
+// E22 K1d hiphcp: GPTQ8-HC-W1 PREFILL ports of the image's HC fused v3g kernels (direct_hc_fused_v3g.hip, sha 5dd2cb28c7f8d5fc).
+//
+// Same tiling / WMMA order / epilogues as hc_dn5 (down + inject, split-K) and hc_ugmq (up + gate*xn + stream mean); the only change
+// is the B (weight) operand: U8 codes + per-(row,128-group) packed sz (fp16 scale | zero<<16) are loaded and dequantised IN-KERNEL,
+// per stage, into the same bf16 LDS tile:  w = bf16_rne((float(q) - float(z)) * float(s))  (= gp8hc wire.reconstruct, fp32 math).
+// No BF16 weight copy ever exists in DRAM.  Correctness oracle: BITWISE equal to the unmodified v3g kernels run on
+// reconstruct()-ed weights (pad rows zero) -- identical B tiles in LDS => identical WMMA sequence.
+//
+// Weight layouts (LYB):
+//   0 = row-major wire  q [NQ, K] u8, sz [NQ, NG]                    (the decode kernels' layout; no extra memory)
+//   1 = k-blocked       q [K/32][NPAD][32] u8, sz [NG][NPAD]         (dn only; contiguous 10.7 KB per stage, repacked once)
+// A operand / xn layouts as v3g (LY 1 = B256 packed xn from direct_hc_v3.combine_norm_pack(ly=1); LY 2 = row-major).
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+
+typedef __bf16 bf16x16 __attribute__((ext_vector_type(16)));
+typedef float f32x8 __attribute__((ext_vector_type(8)));
+typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+typedef uint32_t u32x8 __attribute__((ext_vector_type(8)));
+
+#define RS 20
+__device__ __forceinline__ int sw4(int n, int ch) { return n * RS + 4 * (ch ^ ((n >> 4) & 3)); }
+__device__ __forceinline__ int s16(int r, int c) { return r * 16 + 4 * (c ^ ((r >> 1) & 3)); }
+__device__ __forceinline__ float bf2f(uint32_t bits16) { return __uint_as_float(bits16 << 16); }
+__device__ __forceinline__ uint32_t f2bf_rne(float f) {
+  uint32_t u = __float_as_uint(f);
+  if ((u & 0x7fffffffu) > 0x7f800000u) return (u >> 16) | 0x40u;
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return u >> 16;
+}
+__device__ __forceinline__ float bfround(float f) { return __uint_as_float(f2bf_rne(f) << 16); }
+__device__ __forceinline__ float sigm(float x) { return 1.0f / (1.0f + expf(-x)); }
+__device__ __forceinline__ bf16x16 cat16(u32x4 x0, u32x4 x1) {
+  return __builtin_bit_cast(bf16x16, (u32x8){x0[0], x0[1], x0[2], x0[3], x1[0], x1[1], x1[2], x1[3]});
+}
+__device__ __forceinline__ float h2f(uint32_t h) { return __half2float(__ushort_as_half((unsigned short)h)); }
+
+// 16 u8 codes -> 16 bf16 (two 8-bf16 LDS chunks lo/hi), exact wire arithmetic
+// DEQUANT-V2: validated positive-finite wire domain + branchless FMA + v_perm_b32 BF16 pack.
+__device__ __forceinline__ void deq16_original(const u32x4 q, uint32_t sz, u32x4& lo, u32x4& hi) {
+  const float s = h2f(sz & 0xFFFFu), zf = (float)((sz >> 16) & 0xFFu);
+  uint32_t o[8];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t w = q[i];
+    const uint32_t b0 = f2bf_rne(((float)(w & 0xFFu) - zf) * s);
+    const uint32_t b1 = f2bf_rne(((float)((w >> 8) & 0xFFu) - zf) * s);
+    const uint32_t b2 = f2bf_rne(((float)((w >> 16) & 0xFFu) - zf) * s);
+    const uint32_t b3 = f2bf_rne(((float)(w >> 24) - zf) * s);
+    o[2 * i] = b0 | (b1 << 16);
+    o[2 * i + 1] = b2 | (b3 << 16);
+  }
+  lo = (u32x4){o[0], o[1], o[2], o[3]};
+  hi = (u32x4){o[4], o[5], o[6], o[7]};
+}
+
+__device__ __forceinline__ uint32_t f2bf_hi(float f) {
+  const uint32_t u = __float_as_uint(f);
+  return u + 0x7fffu + ((u >> 16) & 1u);
+}
+__device__ __forceinline__ uint32_t pack_bf16_finite(float f0, float f1) {
+  return __builtin_amdgcn_perm(f2bf_hi(f1), f2bf_hi(f0), 0x07060302u);
+}
+__device__ __forceinline__ void deq16_pos_s_nzs(const u32x4 q, const float s, const float nzs, u32x4& lo, u32x4& hi) {
+  uint32_t o[8];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t w = q[i];
+    const float f0 = __builtin_fmaf((float)(w & 255u), s, nzs);
+    const float f1 = __builtin_fmaf((float)((w >> 8) & 255u), s, nzs);
+    const float f2 = __builtin_fmaf((float)((w >> 16) & 255u), s, nzs);
+    const float f3 = __builtin_fmaf((float)(w >> 24), s, nzs);
+    o[2 * i] = pack_bf16_finite(f0, f1);
+    o[2 * i + 1] = pack_bf16_finite(f2, f3);
+  }
+  lo = (u32x4){o[0], o[1], o[2], o[3]};
+  hi = (u32x4){o[4], o[5], o[6], o[7]};
+}
+__device__ __forceinline__ void deq16_pos(const u32x4 q, uint32_t sz, u32x4& lo, u32x4& hi) {
+  const float s = h2f(sz & 0xFFFFu);
+  const float zf = (float)((sz >> 16) & 255u);
+  deq16_pos_s_nzs(q, s, -zf * s, lo, hi);
+}
+__device__ __forceinline__ void deq16(const u32x4 q, uint32_t sz, u32x4& lo, u32x4& hi) {
+  if ((sz & 0x7c00u) == 0x7c00u) { deq16_original(q, sz, lo, hi); return; }
+  const float s = h2f(sz & 0xFFFFu);
+  if (!(s > 0.0f)) { deq16_original(q, sz, lo, hi); return; }
+  const float zf = (float)((sz >> 16) & 255u);
+  deq16_pos_s_nzs(q, s, -zf * s, lo, hi);
+}
+
+#define DN_N 336
+
+template <int LY>
+__device__ __forceinline__ long long xaddr(int row, int col, int K) {
+  if (LY == 0) return (((long long)(row >> 6) * (K >> 5) + (col >> 5)) * 64 + (row & 63)) * 32 + (col & 31);
+  if (LY == 1) return (((long long)(row >> 6) * (K >> 8) + (col >> 8)) * 64 + (row & 63)) * 256 + (col & 255);
+  return (long long)row * K + col;
+}
+
+// ------------------------------------------------------------------------------------------------ hc_dn5q
+template <int RG, int KS, int LY, int LYB>
+__global__ void __launch_bounds__(96 * RG) hc_dn5q(const __bf16* __restrict__ xn, const uint8_t* __restrict__ wq,
+                                                    const uint32_t* __restrict__ wsz, int NQ, int NG,
+                                                    __bf16* __restrict__ lora, __bf16* __restrict__ inj, float* __restrict__ part,
+                                                    unsigned int* __restrict__ cnt, int M, int K, int R, int HC,
+                                                    long long s_lora, long long s_inj) {
+  constexpr int T = 96 * RG, TM = 16 * RG;
+  constexpr int ACH = TM * 4, BCH = DN_N * 2;  // B: 2 x 16-byte u8 chunks per row per 32-K stage
+  constexpr int NA = (ACH + T - 1) / T, NB = (BCH + T - 1) / T;
+  __shared__ __attribute__((aligned(16))) uint32_t As[2][TM * 16];
+  __shared__ __attribute__((aligned(16))) uint32_t Bs[2][DN_N * 16];
+  __shared__ int s_last;
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
+  const int cw = wave % 3, rg = wave / 3;
+  const int m0 = blockIdx.x * TM, ks = blockIdx.y;
+  const int KSL = K / KS, kbeg = ks * KSL, NS = KSL / 32;
+
+  const int bch = 2 * NQ;
+#pragma unroll
+  for (int i = 0; i < NB; ++i) {
+    const int c = tid + T * i;
+    if (c >= bch && c < BCH) {
+      const int n = c >> 1, h = c & 1;
+      const u32x4 z0 = {0, 0, 0, 0};
+      *(u32x4*)(&Bs[0][s16(n, 2 * h)]) = z0;
+      *(u32x4*)(&Bs[0][s16(n, 2 * h + 1)]) = z0;
+      *(u32x4*)(&Bs[1][s16(n, 2 * h)]) = z0;
+      *(u32x4*)(&Bs[1][s16(n, 2 * h + 1)]) = z0;
+    }
+  }
+  struct Stage { u32x4 a[NA]; u32x4 b[NB]; uint32_t z[NB]; };
+  Stage R0, R1;
+  auto gload = [&](Stage& S, int t, bool load_z, const Stage& Zsrc) {
+    const int k0 = kbeg + t * 32;
+#pragma unroll
+    for (int i = 0; i < NA; ++i) {
+      const int c = tid + T * i;
+      if (c < ACH) {
+        const int row = m0 + (c >> 2);
+        S.a[i] = *(const u32x4*)(xn + xaddr<LY>(row, k0 + 8 * (c & 3), K));
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < NB; ++i) {
+      const int c = tid + T * i;
+      if (c < bch) {
+        const int n = c >> 1, h = c & 1;
+        if (LYB == 0) {
+          S.b[i] = *(const u32x4*)(wq + (long long)n * K + k0 + 16 * h);
+          S.z[i] = load_z ? wsz[(long long)n * NG + (k0 >> 7)] : Zsrc.z[i];
+        } else {
+          S.b[i] = *(const u32x4*)(wq + ((long long)(k0 >> 5) * DN_N + n) * 32 + 16 * h);
+          S.z[i] = load_z ? wsz[(long long)(k0 >> 7) * DN_N + n] : Zsrc.z[i];
+        }
+      }
+    }
+  };
+  auto sstore = [&](const Stage& S, int buf) {
+#pragma unroll
+    for (int i = 0; i < NA; ++i) {
+      const int c = tid + T * i;
+      if (c < ACH) *(u32x4*)(&As[buf][s16(c >> 2, c & 3)]) = S.a[i];
+    }
+#pragma unroll
+    for (int i = 0; i < NB; ++i) {
+      const int c = tid + T * i;
+      if (c < bch) {
+        const int n = c >> 1, h = c & 1;
+        u32x4 lo, hi;
+        deq16_pos(S.b[i], S.z[i], lo, hi);
+        *(u32x4*)(&Bs[buf][s16(n, 2 * h)]) = lo;
+        *(u32x4*)(&Bs[buf][s16(n, 2 * h + 1)]) = hi;
+      }
+    }
+  };
+  f32x8 acc[7];
+#pragma unroll
+  for (int j = 0; j < 7; ++j) acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+  auto compute = [&](int buf) {
+    const uint32_t* as = As[buf];
+    const uint32_t* bs = Bs[buf];
+    const int ar = 16 * rg + l16;
+#pragma unroll
+    for (int kc = 0; kc < 2; ++kc) {
+      const bf16x16 af = cat16(*(const u32x4*)(&as[s16(ar, 2 * kc)]), *(const u32x4*)(&as[s16(ar, 2 * kc + 1)]));
+#pragma unroll
+      for (int j = 0; j < 7; ++j) {
+        const int n = 16 * (cw * 7 + j) + l16;
+        const bf16x16 bf = cat16(*(const u32x4*)(&bs[s16(n, 2 * kc)]), *(const u32x4*)(&bs[s16(n, 2 * kc + 1)]));
+        acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af, bf, acc[j]);
+      }
+    }
+  };
+
+  gload(R0, 0, true, R0);
+  sstore(R0, 0);
+  gload(R0, 1, false, R0);
+  __syncthreads();
+  for (int t = 0; t < NS; t += 2) {
+    if (t + 2 < NS) gload(R1, t + 2, (t & 2) != 0, R0);
+    compute(0);
+    sstore(R0, 1);
+    __syncthreads();
+    if (t + 3 < NS) gload(R0, t + 3, false, R1);
+    compute(1);
+    if (t + 2 < NS) sstore(R1, 0);
+    __syncthreads();
+  }
+
+  if (KS > 1) {
+    float* pp = part + (long long)ks * M * DN_N;
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int row = m0 + 16 * rg + 2 * e + (lane >> 4);
+      if (row < M) {
+#pragma unroll
+        for (int j = 0; j < 7; ++j) pp[(long long)row * DN_N + 16 * (cw * 7 + j) + l16] = acc[j][e];
+      }
+    }
+    __threadfence();
+    __syncthreads();
+    if (tid == 0) s_last = (atomicAdd(&cnt[blockIdx.x], 1u) == (unsigned)(KS - 1));
+    __syncthreads();
+    if (!s_last) return;
+    __threadfence();
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      const int row = m0 + 16 * rg + 2 * e + (lane >> 4);
+      if (row < M) {
+#pragma unroll
+        for (int j = 0; j < 7; ++j) {
+          const long long off = (long long)row * DN_N + 16 * (cw * 7 + j) + l16;
+          float s = 0.0f;
+#pragma unroll
+          for (int q = 0; q < KS; ++q)
+            s += (q == ks) ? acc[j][e]
+                           : __hip_atomic_load(part + (long long)q * M * DN_N + off, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_AGENT);
+          acc[j][e] = s;
+        }
+      }
+    }
+    if (tid == 0) cnt[blockIdx.x] = 0u;
+  }
+
+  const float invhc = 1.0f / (float)HC;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const int row = m0 + 16 * rg + 2 * e + (lane >> 4);
+    if (row >= M) continue;
+#pragma unroll
+    for (int j = 0; j < 7; ++j) {
+      const int col = 16 * (cw * 7 + j) + l16;
+      const float db = bfround(acc[j][e]);
+      if (col < R) {
+        const float x = db * invhc;
+        *(uint16_t*)(lora + (long long)row * s_lora + col) = (uint16_t)f2bf_rne(x * sigm(x));
+      } else if (col < R + HC) {
+        *(uint16_t*)(inj + (long long)row * s_inj + (col - R)) = (uint16_t)f2bf_rne(db);
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ hc_ugmqq
+template <int MW, int RF, int LY>
+__global__ void __launch_bounds__(64 * MW) hc_ugmqq(const __bf16* __restrict__ lora, const uint8_t* __restrict__ uq,
+                                                     const uint32_t* __restrict__ usz, int NG,
+                                                     const __bf16* __restrict__ xn, __bf16* __restrict__ y, int M, int H, int HC,
+                                                     int R, long long s_lora, long long s_y) {
+  constexpr int T = 64 * MW;
+  constexpr int BCH = 128 * 2;          // 16-byte u8 chunks per B stage (128 cols x 32 K)
+  constexpr int NB = (BCH + T - 1) / T;
+  __shared__ __attribute__((aligned(16))) uint32_t Bs[2][128 * RS];
+  const int m0 = (RF ? blockIdx.x : blockIdx.y) * (16 * MW), n0 = (RF ? blockIdx.y : blockIdx.x) * 128;
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
+  const int wm = wave % MW, wn = wave / MW;
+  const int arow = min(m0 + wm * 16 + l16, M - 1);
+  const __bf16* ap = lora + (long long)arow * s_lora;
+  f32x8 mix[4], acc[4];
+#pragma unroll
+  for (int j = 0; j < 4; ++j) mix[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+  const int KC = R / 32, NT = HC * KC;
+  u32x4 bp[NB];
+  float bs[NB], bnzs[NB];
+  auto gloadB = [&](int t) {
+    const int s = t / KC, k0 = (t - s * KC) * 32;
+#pragma unroll
+    for (int i = 0; i < NB; ++i) {
+      const int c = tid + T * i;
+      if (c < BCH) {
+        const long long row = (long long)(s * H + n0 + (c >> 1));
+        bp[i] = *(const u32x4*)(uq + row * R + k0 + 16 * (c & 1));
+        if ((k0 & 127) == 0) {
+          const uint32_t z = usz[row * NG + (k0 >> 7)];
+          const float sc = h2f(z & 0xFFFFu);
+          bs[i] = sc;
+          bnzs[i] = -(float)((z >> 16) & 255u) * sc;
+        }
+      }
+    }
+  };
+  auto sstoreB = [&](int buf) {
+#pragma unroll
+    for (int i = 0; i < NB; ++i) {
+      const int c = tid + T * i;
+      if (c < BCH) {
+        u32x4 lo, hi;
+        deq16_pos_s_nzs(bp[i], bs[i], bnzs[i], lo, hi);
+        *(u32x4*)(&Bs[buf][sw4(c >> 1, 2 * (c & 1))]) = lo;
+        *(u32x4*)(&Bs[buf][sw4(c >> 1, 2 * (c & 1) + 1)]) = hi;
+      }
+    }
+  };
+  gloadB(0);
+  sstoreB(0);
+  __syncthreads();
+  for (int t = 0; t < NT; ++t) {
+    const int s = t / KC, kci = t - s * KC, buf = t & 1;
+    if (kci == 0) {
+#pragma unroll
+      for (int j = 0; j < 4; ++j) acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+    }
+    u32x4 av[4];
+#pragma unroll
+    for (int c = 0; c < 4; ++c) av[c] = *(const u32x4*)(ap + kci * 32 + 8 * c);
+    if (t + 1 < NT) gloadB(t + 1);
+    const uint32_t* bs = Bs[buf];
+#pragma unroll
+    for (int kc = 0; kc < 2; ++kc) {
+      const bf16x16 af = cat16(av[2 * kc], av[2 * kc + 1]);
+#pragma unroll
+      for (int j = 0; j < 4; ++j) {
+        const int n = 64 * wn + 16 * j + l16;
+        const bf16x16 bf = cat16(*(const u32x4*)(&bs[sw4(n, 2 * kc)]), *(const u32x4*)(&bs[sw4(n, 2 * kc + 1)]));
+        acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af, bf, acc[j]);
+      }
+    }
+    if (kci == KC - 1) {
+#pragma unroll
+      for (int e = 0; e < 8; ++e) {
+        const int r = m0 + wm * 16 + 2 * e + (lane >> 4);
+        const int gc0 = s * H + n0 + 64 * wn;
+        const __bf16* xrow0 = xn + xaddr<LY>(r, gc0, HC * H) + l16;
+        const __bf16* xrow1 = xn + xaddr<LY>(r, gc0 + 32, HC * H) + l16;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float g = bfround(acc[j][e]);
+          const float xv = bf2f(*(const uint16_t*)(((j >> 1) ? xrow1 : xrow0) + 16 * (j & 1)));
+          mix[j][e] = __builtin_fmaf(sigm(g), xv, mix[j][e]);
+        }
+      }
+    }
+    if (t + 1 < NT) sstoreB(buf ^ 1);
+    __syncthreads();
+  }
+  const float inv = 1.0f / (float)HC;
+#pragma unroll
+  for (int e = 0; e < 8; ++e) {
+    const int r = m0 + wm * 16 + 2 * e + (lane >> 4);
+    if (r >= M) continue;
+    __bf16* yrow = y + (long long)r * s_y + n0 + 64 * wn + l16;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) *(uint16_t*)(yrow + 16 * j) = (uint16_t)f2bf_rne(mix[j][e] * inv);
+  }
+}
+
+// ------------------------------------------------------------------------------------------------ host
+#define CHK(c) TORCH_CHECK(c, #c)
+
+// xb: packed xn (LY 1, >= ceil(M/128)*128*K bf16) ; q/sz: down packet (LYB 0: [NQ,K]/[NQ,NG]; LYB 1: [K/32,336,32]/[NG,336])
+// lora [M, R] bf16 (row stride s_lora), injb [M, 336] bf16; part fp32 >= KS*M*336; cnt int32 >= grid.x (zeroed, self-resetting)
+void dn5q(torch::Tensor xb, torch::Tensor q, torch::Tensor sz, int64_t NQ, torch::Tensor lora, torch::Tensor injb,
+          torch::Tensor part, torch::Tensor cnt, int64_t M, int64_t K, int64_t R, int64_t HC, int64_t RG, int64_t KS, int64_t LYB) {
+  CHK(xb.dtype() == torch::kBFloat16 && q.dtype() == torch::kUInt8 && sz.dtype() == torch::kInt32);
+  CHK(lora.dtype() == torch::kBFloat16 && injb.dtype() == torch::kBFloat16 && part.dtype() == torch::kFloat32 && cnt.dtype() == torch::kInt32);
+  CHK(q.is_contiguous() && sz.is_contiguous() && xb.is_contiguous() && lora.stride(1) == 1 && injb.stride(1) == 1);
+  CHK(K % (64 * KS) == 0 && (K / KS / 32) % 2 == 0 && K % 256 == 0 && NQ <= DN_N && R + HC <= DN_N && R % 16 == 0);
+  const int NG = (int)((K + 127) / 128);
+  if (LYB == 0) { CHK(q.size(0) == NQ && q.size(1) == K && sz.numel() == NQ * NG); }
+  else { CHK(q.numel() == K * DN_N && sz.numel() == (int64_t)NG * DN_N); }
+  CHK(part.numel() >= KS * M * DN_N && cnt.numel() >= (M + 16 * RG - 1) / (16 * RG));
+  dim3 grid((unsigned)((M + 16 * RG - 1) / (16 * RG)), (unsigned)KS), block((unsigned)(96 * RG));
+  auto st = at::cuda::getCurrentCUDAStream().stream();
+  auto* xp = (const __bf16*)xb.data_ptr();
+  auto* qp = (const uint8_t*)q.data_ptr();
+  auto* zp = (const uint32_t*)sz.data_ptr();
+  auto* lp = (__bf16*)lora.data_ptr();
+  auto* ip = (__bf16*)injb.data_ptr();
+  auto* pp = (float*)part.data_ptr();
+  auto* cp = (unsigned int*)cnt.data_ptr();
+#define DN5Q(RG_, KS_, LYB_) \
+  if (RG == RG_ && KS == KS_ && LYB == LYB_) { hc_dn5q<RG_, KS_, 1, LYB_><<<grid, block, 0, st>>>(xp, qp, zp, (int)NQ, NG, lp, ip, pp, cp, (int)M, (int)K, (int)R, (int)HC, lora.stride(0), injb.stride(0)); return; }
+  DN5Q(8, 1, 0) DN5Q(8, 2, 0) DN5Q(4, 2, 0) DN5Q(4, 4, 0)
+  DN5Q(8, 1, 1) DN5Q(8, 2, 1) DN5Q(4, 2, 1) DN5Q(4, 4, 1)
+#undef DN5Q
+  TORCH_CHECK(false, "dn5q: unsupported RG/KS/LYB");
+}
+
+// lora [M,R] bf16; uq [HC*H, R] u8; usz [HC*H, NG] int32; xn packed (LY 1) or row-major [M, HC*H] (LY 2); y [M, H]
+void ugmqq(torch::Tensor lora, torch::Tensor uq, torch::Tensor usz, torch::Tensor xn, torch::Tensor y, int64_t M, int64_t H,
+           int64_t HC, int64_t R, int64_t MW, int64_t RF, int64_t LY) {
+  CHK(lora.dtype() == torch::kBFloat16 && uq.dtype() == torch::kUInt8 && usz.dtype() == torch::kInt32 && xn.dtype() == torch::kBFloat16);
+  CHK(y.dtype() == torch::kBFloat16 && uq.is_contiguous() && usz.is_contiguous() && xn.is_contiguous() && lora.stride(1) == 1 && y.stride(1) == 1);
+  CHK(H % 128 == 0 && R % 32 == 0 && uq.size(0) == HC * H && uq.size(1) == R);
+  const int NG = (int)((R + 127) / 128);
+  CHK(usz.numel() == HC * H * NG);
+  auto st = at::cuda::getCurrentCUDAStream().stream();
+  const unsigned mt = (unsigned)((M + 16 * MW - 1) / (16 * MW)), nt = (unsigned)(H / 128);
+  dim3 grid = RF ? dim3(mt, nt) : dim3(nt, mt), block((unsigned)(64 * MW));
+  auto* lp = (const __bf16*)lora.data_ptr();
+  auto* qp = (const uint8_t*)uq.data_ptr();
+  auto* zp = (const uint32_t*)usz.data_ptr();
+  auto* xp = (const __bf16*)xn.data_ptr();
+  auto* yp = (__bf16*)y.data_ptr();
+#define UGQ(MW_, RF_, LY_) \
+  if (MW == MW_ && RF == RF_ && LY == LY_) { hc_ugmqq<MW_, RF_, LY_><<<grid, block, 0, st>>>(lp, qp, zp, NG, xp, yp, (int)M, (int)H, (int)HC, (int)R, lora.stride(0), y.stride(0)); return; }
+  UGQ(8, 0, 1) UGQ(4, 0, 1) UGQ(8, 1, 1) UGQ(8, 0, 2) UGQ(4, 0, 2)
+#undef UGQ
+  TORCH_CHECK(false, "ugmqq: unsupported MW/RF/LY");
+}
+
+// one-time repack of the row-major down packet into LYB 1 (k-blocked, padded to 336 rows; pad codes 0 / sz 0)
+std::vector<torch::Tensor> repack_dn(torch::Tensor q, torch::Tensor sz) {
+  CHK(q.dtype() == torch::kUInt8 && sz.dtype() == torch::kInt32 && q.dim() == 2 && q.size(1) % 32 == 0 && q.size(0) <= DN_N);
+  const int64_t NQ = q.size(0), K = q.size(1), NG = (K + 127) / 128;
+  auto qp = torch::zeros({DN_N, K}, q.options());
+  qp.narrow(0, 0, NQ).copy_(q);
+  auto qb = qp.view({DN_N, K / 32, 32}).permute({1, 0, 2}).contiguous();
+  auto zp = torch::zeros({DN_N, NG}, sz.options());
+  zp.narrow(0, 0, NQ).copy_(sz.view({NQ, NG}));
+  return {qb, zp.t().contiguous()};
+}
+
+
+// Test hook calls deq16 (which dispatches positive finite scales to deq16_pos_s_nzs).
+__global__ void k_dequant_probe(const uint8_t* q, const uint32_t* sz, uint16_t* out, int n) {
+  const int row=blockIdx.x*blockDim.x+threadIdx.x;
+  if (row>=n) return;
+  const u32x4 codes=*(const u32x4*)(q+(long long)row*16);
+  u32x4 lo,hi; deq16(codes,sz[row],lo,hi);
+  *(u32x4*)(out+(long long)row*16)=lo;
+  *(u32x4*)(out+(long long)row*16+8)=hi;
+}
+torch::Tensor dequant_probe(torch::Tensor q, torch::Tensor sz) {
+  CHK(q.is_cuda() && sz.is_cuda() && q.dtype()==torch::kUInt8 && sz.dtype()==torch::kInt32);
+  CHK(q.is_contiguous() && sz.is_contiguous() && q.dim()==2 && q.size(1)==16 && sz.numel()==q.size(0));
+  auto out=torch::empty(q.sizes(),q.options().dtype(torch::kInt16));
+  int n=(int)q.size(0);
+  k_dequant_probe<<<(n+255)/256,256,0,at::cuda::getCurrentCUDAStream().stream()>>>(
+    (const uint8_t*)q.data_ptr(),(const uint32_t*)sz.data_ptr(),(uint16_t*)out.data_ptr(),n);
+  return out;
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("dequant_probe", &dequant_probe);
+  m.def("dn5q", &dn5q);
+  m.def("ugmqq", &ugmqq);
+  m.def("repack_dn", &repack_dn);
+}
+

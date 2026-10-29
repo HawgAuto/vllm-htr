@@ -1,7 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Model-runner state for Qwen4Exp PLE inputs."""
+"""Model-runner state for Qwen4Exp PLE inputs. (E59 2026-10-26: + decode-sized steps gather asynchronously with a GPU-side wait
+in the PLE layer, see e59_ple_dev.py; every other step marks sync.) (E53 2026-10-26: E15 ple-hoist-v1 + async prefill gather, see e53_ple_async.py)"""
 
+import json
+import os
 from typing import Any
 
 import torch
@@ -61,6 +64,26 @@ class Qwen4ExpModelState(MambaHybridModelState):
             dtype=torch.int32,
             device=self.device,
         )
+        # E15 PLE hoist (HTR_PLE_HOIST=1|shadow): rows gathered here, before the forward, into one static buffer.
+        self.ple_hoist = os.environ.get("HTR_PLE_HOIST", "0") in ("1", "shadow")
+        self.ple_rows = None
+        self._ple_owner = None
+        self._ple_hoist_n = 0
+        if self.ple_hoist:
+            from .ple_layer import Qwen4ExpPLELayer, Qwen4ExpPLESSDEmbedding
+
+            owners = [m for m in model.modules() if isinstance(m, Qwen4ExpPLELayer)]
+            if len(owners) != 1:
+                raise RuntimeError(f"HTR_PLE_HOIST needs exactly one PLE layer, found {len(owners)}")
+            self._ple_owner = owners[0]
+            emb = self._ple_owner.ple_embedding
+            if not isinstance(emb.ngram_embedding, Qwen4ExpPLESSDEmbedding):
+                raise RuntimeError("HTR_PLE_HOIST requires the SSD PLE embedding")
+            self.ple_rows = torch.zeros(
+                (self.max_num_tokens, emb.embedding_dim), dtype=torch.bfloat16, device=self.device
+            )
+            print("HTR_PLE_HOIST " + json.dumps({"mode": os.environ.get("HTR_PLE_HOIST"),
+                  "rows_buffer": list(self.ple_rows.shape), "layer": self._ple_owner.prefix}), flush=True)
 
     def _prepare_ngram_context(
         self,
@@ -103,10 +126,34 @@ class Qwen4ExpModelState(MambaHybridModelState):
         num_reqs_padded = input_batch.num_reqs_after_padding
         query_start_loc = self.ple_query_start_loc[: num_reqs_padded + 1]
         query_start_loc.copy_(input_batch.query_start_loc[: num_reqs_padded + 1])
+        ngram_context = self._prepare_ngram_context(input_batch, req_states)
         model_inputs.update(
             query_start_loc=query_start_loc,
-            ngram_context=self._prepare_ngram_context(input_batch, req_states),
+            ngram_context=ngram_context,
         )
+        if self.ple_hoist:
+            input_ids = input_batch.input_ids
+            n = int(input_ids.shape[0])
+            rows = self.ple_rows[:n]
+            if n:
+                emb = self._ple_owner.ple_embedding
+                ngram_ids = emb.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+                import e53_ple_async as _e53
+                import e59_ple_dev as _e59
+                if _e53.enabled(n) and getattr(self, "_e53_bufs", None) is None:
+                    self._e53_bufs = _e53.Buffers(self.ple_rows.shape[0] * 16, emb.ngram_embedding.embedding_dim)
+                # E59: decode-sized steps gather on a worker thread; the PLE layer's e59::ple_dev_wait (GPU) waits + copies.
+                if not _e59.submit_decode(emb, ngram_ids, rows, n):
+                    _e59.mark_sync()
+                    # E53: async gather (worker thread) overlapped with layers 0-1; the PLE layer's e53::ple_wait fills rows.
+                    if not (_e53.enabled(n) and _e53.submit(emb, ngram_ids, rows, self._e53_bufs)):
+                        # Same reader/forward as the installed in-op path (blocking D2H ids, pread, H2D) -> exact bytes.
+                        looked = emb.ngram_embedding(ngram_ids)
+                        rows.copy_(looked.flatten(-2))
+                self._ple_hoist_n += 1
+                if self._ple_hoist_n <= 3 or self._ple_hoist_n % 1024 == 0:
+                    print("HTR_PLE_HOIST_STEP " + json.dumps({"n": self._ple_hoist_n, "tokens": n}), flush=True)
+            model_inputs.update(ple_rows=rows)
         return model_inputs
 
     def prepare_dummy_inputs(
@@ -117,6 +164,9 @@ class Qwen4ExpModelState(MambaHybridModelState):
         model_inputs = super().prepare_dummy_inputs(num_reqs, num_tokens)
         if not self.uses_ngram_embedding:
             return model_inputs
+        if self.ple_hoist:
+            import e59_ple_dev as _e59
+            _e59.mark_sync()   # E59: dummy/warmup/capture runs never wait on (or copy) host PLE rows
 
         query_start_loc = self.ple_query_start_loc[: num_reqs + 1]
         query_start_loc[0] = 0
@@ -137,6 +187,10 @@ class Qwen4ExpModelState(MambaHybridModelState):
             query_start_loc=query_start_loc,
             ngram_context=ngram_context,
         )
+        if self.ple_hoist:
+            rows = self.ple_rows[:num_tokens]
+            rows.zero_()
+            model_inputs.update(ple_rows=rows)
         return model_inputs
 
 

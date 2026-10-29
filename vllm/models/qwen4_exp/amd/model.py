@@ -5,6 +5,7 @@
 from collections.abc import Iterable
 from itertools import islice
 
+import e82_graphproof
 import torch
 from torch import nn
 
@@ -289,6 +290,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         input_ids: torch.Tensor | None,
         query_start_loc: torch.Tensor | None,
         ngram_context: torch.Tensor | None,
+        ple_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         attn_hc = self.attn_hyper_connection
         if self.ple is not None:
@@ -307,6 +309,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 input_ids,
                 query_start_loc,
                 ngram_context,
+                ple_rows,
             )
 
         # Fuse a pending combine with this HC module's mix when possible.
@@ -393,6 +396,7 @@ class Qwen4ExpMixtureOfExperts(MixtureOfExperts):
         "inputs_embeds": 0,
         "query_start_loc": 0,
         "ngram_context": 0,
+        "ple_rows": 0,
         "deepstack_input_embeds": 0,
     }
 )
@@ -489,6 +493,7 @@ class Qwen4ExpModel(nn.Module):
         query_start_loc: torch.Tensor | None = None,
         ngram_context: torch.Tensor | None = None,
         deepstack_input_embeds: IntermediateTensors | None = None,
+        ple_rows: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
         if get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -518,6 +523,7 @@ class Qwen4ExpModel(nn.Module):
                 input_ids=input_ids,
                 query_start_loc=query_start_loc,
                 ngram_context=ngram_context,
+                ple_rows=ple_rows,
             )
             if deepstack_input_embeds is not None and layer_idx < len(
                 deepstack_input_embeds
@@ -1017,6 +1023,7 @@ class Qwen4ExpForConditionalGeneration(
             query_start_loc=kwargs.get("query_start_loc"),
             ngram_context=kwargs.get("ngram_context"),
             deepstack_input_embeds=deepstack_input_embeds,
+            ple_rows=kwargs.get("ple_rows"),
         )
         if inputs_embeds is not None and get_pp_group().is_first_rank:
             self._clear_deepstack_input_embeds(inputs_embeds.size(0))

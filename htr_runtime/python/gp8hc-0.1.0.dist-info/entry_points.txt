@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+gp8hc = gp8hc.plugin:register

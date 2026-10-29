@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+htr = htr.vllm_plugin:register

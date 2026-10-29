@@ -1,0 +1,527 @@
+// E49 hpf3s (2026-10-26) = E31 htr_moe_prefill_v3.cu with ONE change in k_hpf3_act<MODE>: padding pairs (sid >= num_valid or
+// expert -1) return before writing A1/A2/S (their rows are only read by WMMA rows whose outputs are discarded, never by the
+// epilogue bias of a consumed row or by the reduce) -> consumed rows and out bitwise == hpf3; padding rows keep stale data.
+// E31 hpf3 (2026-10-26) = byte copy of e15 csrc/htr_moe_prefill_v2.cu (GEMM kernels unchanged) + bandwidth-shaped glue kernels
+// k_hpf3_act<MODE> (one wave per sorted pair, vector loads/stores; S[p] summed in EXACTLY v2's order: 8 virtual-wave lane
+// partials over blocks w, w+8, ..., xor-shuffle tree, then waves 0..7) and k_hpf3_reduce (8 columns per thread, the 10 rows'
+// loads issued together, same fmaf order s = 0..topk-1) -> bitwise identical A1/S/A2/out, see tests/qualify_hpf3.py.
+// E15-C v2 (2026-10-23) HTR routed-expert PREFILL path for gfx1151 — COMPILE-ONLY until the GPU gates in
+// design/PREFILL-KERNEL-DESIGN.md §v2 pass. v1 (htr_moe_prefill.cu) is unchanged and is the measured baseline.
+// Same identity as v1:  x' = H128(su . x)/sqrt128  ->  z = Vint . x' (WMMA f16, f32 acc)  ->  y = sv . H128(scale.cb.z)/sqrt128.
+// Changes vs v1 (each one targets a cost in the v1 cost model / ATT profile):
+//  1. decode reuse: a WG owns up to TWO consecutive moe_align 64-blocks of the SAME expert (BM_eff 128, pairing on even block
+//     boundaries, no plan kernel): every trellis weight is decoded once per 128 rows instead of once per 64.
+//  2. cheaper trellis decode (~3.7 VALU/weight vs ~6 in v1): all 16 windows of a tile row are byte-aligned in either the raw
+//     or the 4-bit-shifted word stream -> one v_perm_b32 each (+3 v_alignbit per row); the 0x6400 f16 magic rides in the
+//     v_sad_u8 accumulator; the -1534 bias subtraction is removed from the inner loop (B holds v + 1534 exactly) and folded
+//     into the epilogue as  z = z' - 1534 * S[p],  S[p] = sum_k A[p,k] (fp32 over the exact f16 A values, from the prologue).
+//  3. register epilogue: in the 8x1 wave layout each wave owns 16 rows x all 128 outputs of the block, so FWHT128 over the
+//     outputs = 3 in-register stages (bits of the tile index j) + 4 DPP row_xmask stages (lane bits) -> no 33.8 KB LDS
+//     epilogue buffer, LDS 54.5 KB -> ~20.5 KB (v1 was LDS-limited to 4 waves/SIMD).
+//  4. B loads: 2 VMEM per tile row (b64 pair + previous dword) instead of 3.
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+
+typedef _Float16 f16x16 __attribute__((ext_vector_type(16)));
+typedef float f32x8 __attribute__((ext_vector_type(8)));
+typedef uint32_t u32x2 __attribute__((ext_vector_type(2)));
+typedef uint32_t u32x4 __attribute__((ext_vector_type(4)));
+typedef uint32_t u32x8 __attribute__((ext_vector_type(8)));
+
+#define BM 64            // moe_align block (sorted rows per block)
+#define BMW 128          // rows per WG (two blocks of one expert)
+#define BN 128
+#define BKS 32
+#define RS 20
+#define HK 4
+#define NWT (8 * HK)
+#define GEN_A 0xDF6ADFu
+#define GEN_B 0x34983u
+#define VBIAS 1534.0f    // B holds 1024 + u = v + 1534 (exact f16 integers <= 2044)
+#define INV128 (1.0f / 11.313708498984761f)
+
+#ifndef HPF2_WPE
+#define HPF2_WPE 8
+#endif
+
+template <int MSK> __device__ __forceinline__ float shx(float v) {
+  const int iv = __builtin_bit_cast(int, v);
+  if constexpr (MSK < 16) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, iv, 0x160 | MSK, 0xF, 0xF, false));
+  } else {
+    return __builtin_bit_cast(float, (int)__builtin_amdgcn_permlanex16((unsigned)iv, (unsigned)iv, 0x76543210u, 0xfedcba98u, false, false));
+  }
+}
+template <int MSK> __device__ __forceinline__ void fwht_stage(float v[4], int lane) {
+  const bool up = (lane & MSK) != 0;
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    const float o = shx<MSK>(v[e]);
+    v[e] = up ? (o - v[e]) : (v[e] + o);
+  }
+}
+__device__ __forceinline__ void fwht128_wave(float v[4], int lane) {      // index 4*lane + e (v1 prologue layout)
+  float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
+  v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+  fwht_stage<1>(v, lane); fwht_stage<2>(v, lane); fwht_stage<4>(v, lane); fwht_stage<8>(v, lane); fwht_stage<16>(v, lane);
+}
+// butterfly over lane bit MSK (< 16, stays inside the 16-lane DPP row) for 8 values
+template <int MSK> __device__ __forceinline__ void lane_stage8(float v[8], int lane) {
+  const bool up = (lane & MSK) != 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    const float o = shx<MSK>(v[j]);
+    v[j] = up ? (o - v[j]) : (v[j] + o);
+  }
+}
+template <int BIT> __device__ __forceinline__ void reg_stage8(float v[8]) {
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    if (!(j & BIT)) { const float a = v[j], b = v[j | BIT]; v[j] = a + b; v[j | BIT] = a - b; }
+  }
+}
+__device__ __forceinline__ int sw4(int n, int ch) { return n * RS + 4 * (ch ^ ((n >> 4) & 3)); }
+__device__ __forceinline__ uint16_t f32_to_bf16_rne(float f) {
+  uint32_t u = __float_as_uint(f);
+  if ((u & 0x7fffffffu) > 0x7f800000u) return (uint16_t)((u >> 16) | 0x40u);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+__device__ __forceinline__ _Float16 f16sat(float f, unsigned& sat) {
+  if (f > 65504.f) { f = 65504.f; ++sat; } else if (f < -65504.f) { f = -65504.f; ++sat; }
+  return (_Float16)f;
+}
+
+// ------------------------------------------------------------------ trellis tile-row decode (K = 4)
+// Tile row r of a 16x16 tile: 16 symbols, symbol j's 16-bit state s_j = (V >> (32 + 4 i)) & 0xFFFF, i = 15 - j, where
+// V = hi:mid:lo:0 (128-bit, hi = word 2r-1 (circular), mid = word 2r, lo = word 2r+1). (== v1 storeB's window b = 20 + 4j.)
+// i even (= 2m): bytes m, m+1 of [lo, mid, hi] (LE) ; i odd (= 2m+1): bytes m, m+1 of [lo4, mid4, hi4] = (V >> 36) words.
+// v_perm_b32(S0, S1, sel): byte sel 0-3 -> S1, 4-7 -> S0, 0x0c -> 0. m <= 3 uses (S0, S1) = (mid, lo), m >= 4 (hi, mid).
+template <int M> __device__ __forceinline__ uint32_t win(uint32_t hi, uint32_t mid, uint32_t lo) {
+  if constexpr (M <= 3) return __builtin_amdgcn_perm(mid, lo, (uint32_t)M | ((uint32_t)(M + 1) << 8) | 0x0c0c0000u);
+  else return __builtin_amdgcn_perm(hi, mid, (uint32_t)(M - 4) | ((uint32_t)(M - 3) << 8) | 0x0c0c0000u);
+}
+// f16 bits of 1024 + u, u = bytesum(s * A + B) in [0, 1020]  (0x6400 = f16 1024, carried in the sad accumulator)
+__device__ __forceinline__ uint32_t tv16(uint32_t s) { return __builtin_amdgcn_sad_u8(s * GEN_A + GEN_B, 0u, 0x6400u); }
+
+template <int I> __device__ __forceinline__ uint32_t sym(uint32_t hi, uint32_t mid, uint32_t lo, uint32_t hi4, uint32_t mid4, uint32_t lo4) {
+  if constexpr ((I & 1) == 0) return win<I / 2>(hi, mid, lo);
+  else return win<I / 2>(hi4, mid4, lo4);
+}
+// o[jj] = f16 pair (j = 2jj low half, 2jj + 1 high half) of v + 1534
+__device__ __forceinline__ void decode_row(uint32_t hi, uint32_t mid, uint32_t lo, uint32_t o[8]) {
+  const uint32_t lo4 = __builtin_amdgcn_alignbit(mid, lo, 4), mid4 = __builtin_amdgcn_alignbit(hi, mid, 4), hi4 = hi >> 4;
+#define HPF2_PAIR(JJ)                                                                                          \
+  {                                                                                                            \
+    const uint32_t a = tv16(sym<15 - 2 * (JJ)>(hi, mid, lo, hi4, mid4, lo4));                                  \
+    const uint32_t b = tv16(sym<14 - 2 * (JJ)>(hi, mid, lo, hi4, mid4, lo4));                                  \
+    o[JJ] = a | (b << 16);                                                                                     \
+  }
+  HPF2_PAIR(0) HPF2_PAIR(1) HPF2_PAIR(2) HPF2_PAIR(3) HPF2_PAIR(4) HPF2_PAIR(5) HPF2_PAIR(6) HPF2_PAIR(7)
+#undef HPF2_PAIR
+}
+
+// ------------------------------------------------------------------ 1/3: activation prologues (one WG = one sorted pair)
+// v1 k_hpf_act + S[p] = sum of the stored f16 values (fp32, fixed order: lane-local, wave shuffle tree, then waves 0..7).
+template <int MODE>
+__global__ __launch_bounds__(256) void k_hpf2_act(const __nv_bfloat16* __restrict__ src, const int32_t* __restrict__ sorted_ids,
+                                                  const int32_t* __restrict__ expert_ids, const uint8_t* __restrict__ su, int topk,
+                                                  int num_valid, _Float16* __restrict__ dst, float* __restrict__ S,
+                                                  unsigned* __restrict__ nsat) {
+  constexpr int D = MODE == 0 ? 2560 : 640, SUOFF = MODE == 0 ? 0 : 320, NB = D / 128;
+  __shared__ float s_part[8];
+  const int p = blockIdx.x, lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+  const int sid = sorted_ids[p], e = expert_ids[p / BM];
+  _Float16* out = dst + (size_t)p * D;
+  unsigned sat = 0;
+  float part = 0.f;
+  for (int blk = w; blk < NB; blk += 8) {
+    const int c0 = blk * 128 + 4 * lane;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    if (sid < num_valid && e >= 0) {
+      const uint8_t* s8 = su + (size_t)e * 400 + SUOFF;
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const int c = c0 + k;
+        float a;
+        if constexpr (MODE == 0) {
+          a = __bfloat162float(src[(size_t)(sid / topk) * D + c]);
+        } else {
+          const float g = __bfloat162float(src[(size_t)p * 1280 + c]), u = __bfloat162float(src[(size_t)p * 1280 + 640 + c]);
+          a = g / (1.f + __expf(-g)) * u;
+        }
+        v[k] = ((s8[c >> 3] >> (c & 7)) & 1) ? -a : a;
+      }
+      fwht128_wave(v, lane);
+    }
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      const _Float16 h = f16sat(v[k] * INV128, sat);
+      out[c0 + k] = h;
+      part += (float)h;
+    }
+  }
+#pragma unroll
+  for (int m = 16; m >= 1; m >>= 1) part += __shfl_xor(part, m, 32);
+  if (lane == 0) s_part[w] = part;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float t = 0.f;
+#pragma unroll
+    for (int i = 0; i < 8; ++i) t += s_part[i];
+    S[p] = t;
+  }
+  if (sat) atomicAdd(nsat, sat);
+}
+
+// ------------------------------------------------------------------ 2/4: grouped GEMM, trellis B decode, register epilogue
+// PH 0 (up):   N = 1280 (n-block nb < 5: gate role 0 strips nb*8.., else up role 1 strips (nb-5)*8..), K = 2560; out Y1 [P, 1280]
+// PH 1 (down): N = 2560 (role 2), K = 640;                                                            out Y2 [P, 2560]
+// Wave layout 8 (M) x 1 (N): wave w owns rows 16w..16w+15 of the WG's 128 rows (rows 64..127 = block y+1) and all 128 outputs.
+struct GemmArgs {
+  const _Float16* A; const float* S;       // [P, K] f16 sorted order; S [P] = row sums of A
+  const uint32_t* qw; const int64_t* qoff;
+  const __half* scales; const uint8_t* sv;
+  const int32_t* sorted_ids; const int32_t* expert_ids; const int32_t* ntpp;
+  __nv_bfloat16* Y;
+  int num_valid, pad; float cb;
+};
+
+template <int PH>
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(HPF2_WPE))) void k_hpf2_gemm(GemmArgs a) {
+  constexpr int N = PH == 0 ? 1280 : 2560, K = PH == 0 ? 2560 : 640, NT = K / 16, NS = K / BKS;
+  __shared__ __attribute__((aligned(16))) uint32_t Bs[2][BN * RS];
+  __shared__ int32_t s_tok[BMW];
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
+  const int y = blockIdx.y, nb = blockIdx.x;
+  const int nbt = a.ntpp[0] / BM;
+  if (y >= nbt) return;
+  const int e = a.expert_ids[y];
+  if (e < 0) return;
+  int nblk = 1;                                   // pair blocks (y, y+1) of one expert when y is even; odd partner exits
+  if (y & 1) { if (a.expert_ids[y - 1] == e) return; }
+  else if (y + 1 < nbt && a.expert_ids[y + 1] == e) nblk = 2;
+  if (tid < BMW) s_tok[tid] = tid < BM * nblk ? a.sorted_ids[y * BM + tid] : a.num_valid;
+  __syncthreads();
+  const int role = PH == 0 ? (nb < 5 ? 0 : 1) : 2, sblk = PH == 0 ? (nb < 5 ? nb : nb - 5) : nb;
+  const size_t pitch = (size_t)NT * NWT + a.pad;
+  const uint32_t* qm = a.qw + a.qoff[(size_t)e * 3 + role] + (size_t)sblk * 8 * pitch;
+  const bool wave_active = s_tok[wave * 16] < a.num_valid;   // padding is a block tail -> first row decides the wave
+  const size_t prow = (size_t)y * BM + wave * 16;            // sorted position of this wave's first row
+  const _Float16* arow = a.A + (prow + l16) * K;
+  const int n2 = tid & 127, h2i = tid >> 7, r = n2 & 15;
+  const uint32_t* strip = qm + (size_t)(n2 >> 4) * pitch;
+
+  u32x4 aX[4], aY[4], aZ[4];
+  uint32_t bX[3], bY[3], bZ[3];
+  auto loadA = [&](u32x4* dst, int k0) {
+    if (wave_active) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) dst[c] = *(const u32x4*)(arow + k0 + 8 * c);
+    }
+  };
+  auto loadB = [&](uint32_t* br, int k0) {        // [0] = previous word (circular), [1] = word 2r, [2] = word 2r+1
+    const uint32_t* tile = strip + (size_t)(k0 / 16 + h2i) * NWT;
+    const u32x2 pr = *(const u32x2*)(tile + 2 * r);
+    br[0] = tile[(2 * r + NWT - 1) % NWT]; br[1] = pr[0]; br[2] = pr[1];
+  };
+  auto storeB = [&](int buf, const uint32_t* br) {
+    uint32_t o[8];
+    decode_row(br[0], br[1], br[2], o);
+    uint32_t* bs = Bs[buf];
+    *(u32x4*)(&bs[sw4(n2, 2 * h2i)]) = (u32x4){o[0], o[1], o[2], o[3]};
+    *(u32x4*)(&bs[sw4(n2, 2 * h2i + 1)]) = (u32x4){o[4], o[5], o[6], o[7]};
+  };
+
+  f32x8 acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+  auto step = [&](int s, const u32x4* cur, const uint32_t* b1, u32x4* nx, uint32_t* b2) {
+    const int buf = s & 1;
+    if (s + 2 < NS) { loadA(nx, (s + 2) * BKS); loadB(b2, (s + 2) * BKS); }
+    if (wave_active) {
+      const uint32_t* bs = Bs[buf];
+#pragma unroll
+      for (int kc = 0; kc < 2; ++kc) {
+        u32x4 x0 = cur[2 * kc], x1 = cur[2 * kc + 1];
+        f16x16 af = __builtin_bit_cast(f16x16, (u32x8){x0[0], x0[1], x0[2], x0[3], x1[0], x1[1], x1[2], x1[3]});
+#pragma unroll
+        for (int j = 0; j < 8; ++j) {
+          const int n = 16 * j + l16;
+          u32x4 y0 = *(const u32x4*)(&bs[sw4(n, 2 * kc)]);
+          u32x4 y1 = *(const u32x4*)(&bs[sw4(n, 2 * kc + 1)]);
+          f16x16 bf = __builtin_bit_cast(f16x16, (u32x8){y0[0], y0[1], y0[2], y0[3], y1[0], y1[1], y1[2], y1[3]});
+          acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af, bf, acc[j]);
+        }
+      }
+    }
+    if (s + 1 < NS) storeB(buf ^ 1, b1);
+    __syncthreads();
+  };
+  loadA(aX, 0); loadB(bX, 0);
+  if (NS > 1) { loadA(aY, BKS); loadB(bY, BKS); }
+  storeB(0, bX);
+  __syncthreads();
+  for (int s = 0; s < NS; s += 3) {
+    step(s, aX, bY, aZ, bZ);
+    if (s + 1 < NS) step(s + 1, aY, bZ, aX, bX);
+    if (s + 2 < NS) step(s + 2, aZ, bX, aY, bY);
+  }
+  if (!wave_active) return;                        // wave-uniform; no block barrier below
+  // ---- register epilogue. acc[j][ei] = z'(row 2ei + (lane>>4), output n = 16j + l16). Per row: t_n = (z'_n - 1534 S) scale_n cb,
+  // FWHT128 over n (bits 4..6 = j in registers, bits 0..3 = l16 via DPP row_xmask), * 1/sqrt128, sv sign, bf16.
+  const int row0 = nb * 128;
+  const int soff = PH == 0 ? 0 : 1280, svoff = PH == 0 ? 0 : 160;
+  const __half* scl = a.scales + (size_t)e * 3840 + soff + row0;
+  const uint8_t* svp = a.sv + (size_t)e * 480 + svoff + (row0 >> 3);
+  float sc[8]; uint32_t neg = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    sc[j] = __half2float(scl[16 * j + l16]) * a.cb;
+    neg |= ((uint32_t)(svp[2 * j + (l16 >> 3)] >> (l16 & 7)) & 1u) << j;
+  }
+  const int hrow = lane >> 4;
+#pragma unroll
+  for (int ei = 0; ei < 8; ++ei) {
+    const int rl = wave * 16 + 2 * ei + hrow;     // row within the WG
+    const float bias = VBIAS * a.S[prow + 2 * ei + hrow];
+    float v[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) v[j] = (acc[j][ei] - bias) * sc[j];
+    reg_stage8<1>(v); reg_stage8<2>(v); reg_stage8<4>(v);
+    lane_stage8<1>(v, lane); lane_stage8<2>(v, lane); lane_stage8<4>(v, lane); lane_stage8<8>(v, lane);
+    if (s_tok[rl] < a.num_valid) {
+      uint16_t* yr = reinterpret_cast<uint16_t*>(a.Y) + (prow + 2 * ei + hrow) * (size_t)N + row0 + l16;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        float yv = v[j] * INV128;
+        if ((neg >> j) & 1u) yv = -yv;
+        yr[16 * j] = f32_to_bf16_rne(yv);
+      }
+    }
+  }
+}
+
+// ------------------------------------------------------------------ 5: deterministic weighted reduce (v1, unchanged)
+__global__ void k_hpf2_inv(const int32_t* __restrict__ sorted_ids, const int32_t* __restrict__ ntpp, int num_valid,
+                           int32_t* __restrict__ inv) {
+  const int p = blockIdx.x * 256 + threadIdx.x;
+  if (p >= ntpp[0]) return;
+  const int s = sorted_ids[p];
+  if (s < num_valid) inv[s] = p;
+}
+__global__ __launch_bounds__(256) void k_hpf2_reduce(const __nv_bfloat16* __restrict__ Y2, const int32_t* __restrict__ inv,
+                                                     const float* __restrict__ w, int topk, __nv_bfloat16* __restrict__ out) {
+  const int t = blockIdx.x;
+  for (int i = threadIdx.x; i < 2560; i += 256) {
+    float acc = 0.f;
+    for (int s = 0; s < topk; ++s) {
+      const float ws = w[t * topk + s];
+      if (ws != 0.f) acc += ws * __bfloat162float(Y2[(size_t)inv[t * topk + s] * 2560 + i]);
+    }
+    out[(size_t)t * 2560 + i] = __float2bfloat16(acc);
+  }
+}
+
+
+// ------------------------------------------------------------------ E31: glue kernels v3 (bitwise == k_hpf2_act / k_hpf2_reduce)
+template <int MODE>
+__global__ __launch_bounds__(128) void k_hpf3_act(const __nv_bfloat16* __restrict__ src, const int32_t* __restrict__ sorted_ids,
+                                                  const int32_t* __restrict__ expert_ids, const uint8_t* __restrict__ su, int topk,
+                                                  int num_valid, int P, _Float16* __restrict__ dst, float* __restrict__ S,
+                                                  unsigned* __restrict__ nsat) {
+  constexpr int D = MODE == 0 ? 2560 : 640, SUOFF = MODE == 0 ? 0 : 320, NB = D / 128;
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+  const int p = blockIdx.x * 4 + w;
+  if (p >= P) return;                                   // wave-uniform
+  const int sid = sorted_ids[p], e = expert_ids[p / BM];
+  const bool live = sid < num_valid && e >= 0;
+  if (!live) return;                                    // E49: padding pairs are never consumed (GEMM epilogue and reduce skip them)
+  _Float16* out = dst + (size_t)p * D;
+  const uint8_t* s8 = su + (size_t)(live ? e : 0) * 400 + SUOFF;
+  unsigned sat = 0;
+  float vpart[8];
+#pragma unroll
+  for (int i = 0; i < 8; ++i) vpart[i] = 0.f;
+#pragma unroll
+  for (int blk = 0; blk < NB; ++blk) {
+    const int c0 = blk * 128 + 4 * lane;
+    float v[4] = {0.f, 0.f, 0.f, 0.f};
+    if (live) {
+      if constexpr (MODE == 0) {
+        const uint2 raw = *reinterpret_cast<const uint2*>(src + (size_t)(sid / topk) * D + c0);
+        const uint32_t r2[2] = {raw.x, raw.y};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          const uint32_t bits = (r2[k >> 1] >> (16 * (k & 1))) & 0xFFFFu;
+          v[k] = __uint_as_float(bits << 16);           // == __bfloat162float
+        }
+      } else {
+        const uint2 rg = *reinterpret_cast<const uint2*>(src + (size_t)p * 1280 + c0);
+        const uint2 ru = *reinterpret_cast<const uint2*>(src + (size_t)p * 1280 + 640 + c0);
+        const uint32_t g2[2] = {rg.x, rg.y}, u2[2] = {ru.x, ru.y};
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+          const float g = __uint_as_float(((g2[k >> 1] >> (16 * (k & 1))) & 0xFFFFu) << 16);
+          const float u = __uint_as_float(((u2[k >> 1] >> (16 * (k & 1))) & 0xFFFFu) << 16);
+          v[k] = g / (1.f + __expf(-g)) * u;
+        }
+      }
+#pragma unroll
+      for (int k = 0; k < 4; ++k) {
+        const int c = c0 + k;
+        v[k] = ((s8[c >> 3] >> (c & 7)) & 1) ? -v[k] : v[k];
+      }
+      fwht128_wave(v, lane);
+    }
+    _Float16 h[4];
+#pragma unroll
+    for (int k = 0; k < 4; ++k) {
+      h[k] = f16sat(v[k] * INV128, sat);
+      vpart[blk & 7] += (float)h[k];
+    }
+    uint2 o;
+    o.x = (uint32_t)__builtin_bit_cast(uint16_t, h[0]) | ((uint32_t)__builtin_bit_cast(uint16_t, h[1]) << 16);
+    o.y = (uint32_t)__builtin_bit_cast(uint16_t, h[2]) | ((uint32_t)__builtin_bit_cast(uint16_t, h[3]) << 16);
+    *reinterpret_cast<uint2*>(out + c0) = o;
+  }
+  float t = 0.f;
+#pragma unroll
+  for (int vw = 0; vw < 8; ++vw) {
+    float part = vpart[vw];
+#pragma unroll
+    for (int m = 16; m >= 1; m >>= 1) part += __shfl_xor(part, m, 32);
+    t += part;
+  }
+  if (lane == 0) S[p] = t;
+  if (sat) atomicAdd(nsat, sat);
+}
+
+// out[t, i] = bf16( sum_s fmaf(w[t,s], Y2[inv[t*topk+s], i], .) ) in s order, w == 0 skipped (== k_hpf2_reduce)
+__global__ __launch_bounds__(320) void k_hpf3_reduce(const __nv_bfloat16* __restrict__ Y2, const int32_t* __restrict__ inv,
+                                                     const float* __restrict__ w, int topk, __nv_bfloat16* __restrict__ out) {
+  const int t = blockIdx.x, i0 = threadIdx.x * 8;      // 320 threads x 8 columns = 2560
+  float acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) acc[j] = 0.f;
+  uint4 rows[10];
+  float ws[10];
+#pragma unroll
+  for (int s = 0; s < 10; ++s) {
+    ws[s] = s < topk ? w[t * topk + s] : 0.f;
+    if (ws[s] != 0.f) rows[s] = *reinterpret_cast<const uint4*>(Y2 + (size_t)inv[t * topk + s] * 2560 + i0);
+    else rows[s] = make_uint4(0, 0, 0, 0);
+  }
+#pragma unroll
+  for (int s = 0; s < 10; ++s) {
+    if (ws[s] != 0.f) {
+      const uint32_t r4[4] = {rows[s].x, rows[s].y, rows[s].z, rows[s].w};
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const float y = __uint_as_float(((r4[j >> 1] >> (16 * (j & 1))) & 0xFFFFu) << 16);
+        acc[j] = __builtin_fmaf(ws[s], y, acc[j]);
+      }
+    }
+  }
+  uint16_t ob[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) ob[j] = __builtin_bit_cast(uint16_t, __float2bfloat16(acc[j]));
+  uint4 o;
+  o.x = ob[0] | ((uint32_t)ob[1] << 16); o.y = ob[2] | ((uint32_t)ob[3] << 16);
+  o.z = ob[4] | ((uint32_t)ob[5] << 16); o.w = ob[6] | ((uint32_t)ob[7] << 16);
+  *reinterpret_cast<uint4*>(out + (size_t)t * 2560 + i0) = o;
+}
+
+// ================================================================== host
+// Same contract as v1 hpf_forward + S scratch (f32 [Pmax], reused by both phases). Stage mask (bit0 act0, bit1 gemm0, bit2 act1,
+// bit3 gemm1, bit4 reduce) is for per-stage timing only; serving uses 31.
+torch::Tensor hpf2_forward(torch::Tensor x, torch::Tensor sorted_ids, torch::Tensor expert_ids, torch::Tensor ntpp, torch::Tensor w,
+                           torch::Tensor qw, torch::Tensor qoff, torch::Tensor scales, torch::Tensor su, torch::Tensor sv, double cb,
+                           int64_t K, int64_t pad, torch::Tensor A1, torch::Tensor Y1, torch::Tensor A2, torch::Tensor Y2,
+                           torch::Tensor S, torch::Tensor inv, torch::Tensor nsat, int64_t stages) {
+  TORCH_CHECK(K == HK, "this build decodes K = 4 only");
+  TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.size(1) == 2560);
+  TORCH_CHECK(w.is_contiguous() && w.scalar_type() == torch::kFloat32 && w.dim() == 2 && w.size(0) == x.size(0));
+  TORCH_CHECK(sorted_ids.scalar_type() == torch::kInt32 && expert_ids.scalar_type() == torch::kInt32 && ntpp.scalar_type() == torch::kInt32);
+  const int T = x.size(0), topk = w.size(1), nv = T * topk, P = sorted_ids.numel();
+  TORCH_CHECK(P % BM == 0 && expert_ids.numel() == P / BM && A1.numel() >= (int64_t)P * 2560 && Y1.numel() >= (int64_t)P * 1280 &&
+              A2.numel() >= (int64_t)P * 640 && Y2.numel() >= (int64_t)P * 2560 && S.numel() >= P && inv.numel() >= nv,
+              "scratch too small");
+  TORCH_CHECK(qw.scalar_type() == torch::kInt32 && qoff.scalar_type() == torch::kInt64 && scales.scalar_type() == torch::kHalf &&
+              su.scalar_type() == torch::kUInt8 && sv.scalar_type() == torch::kUInt8 && S.scalar_type() == torch::kFloat32);
+  auto st = at::cuda::getCurrentCUDAStream();
+  const int32_t* sid = sorted_ids.data_ptr<int32_t>(); const int32_t* eid = expert_ids.data_ptr<int32_t>();
+  unsigned* ns = reinterpret_cast<unsigned*>(nsat.data_ptr<int32_t>());
+  float* Sp = S.data_ptr<float>();
+  _Float16* a1 = reinterpret_cast<_Float16*>(A1.data_ptr<at::Half>());
+  _Float16* a2 = reinterpret_cast<_Float16*>(A2.data_ptr<at::Half>());
+  __nv_bfloat16* y1 = reinterpret_cast<__nv_bfloat16*>(Y1.data_ptr<at::BFloat16>());
+  __nv_bfloat16* y2 = reinterpret_cast<__nv_bfloat16*>(Y2.data_ptr<at::BFloat16>());
+  GemmArgs a;
+  a.S = Sp;
+  a.qw = reinterpret_cast<const uint32_t*>(qw.data_ptr<int32_t>()); a.qoff = qoff.data_ptr<int64_t>();
+  a.scales = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()); a.sv = sv.data_ptr<uint8_t>();
+  a.sorted_ids = sid; a.expert_ids = eid; a.ntpp = ntpp.data_ptr<int32_t>(); a.num_valid = nv; a.pad = (int)pad; a.cb = (float)cb;
+  if (stages & 1)
+    k_hpf2_act<0><<<P, 256, 0, st>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), sid, eid, su.data_ptr<uint8_t>(),
+                                     topk, nv, a1, Sp, ns);
+  if (stages & 2) { a.A = a1; a.Y = y1; k_hpf2_gemm<0><<<dim3(1280 / BN, P / BM), 256, 0, st>>>(a); }
+  if (stages & 4) k_hpf2_act<1><<<P, 256, 0, st>>>(y1, sid, eid, su.data_ptr<uint8_t>(), topk, nv, a2, Sp, ns);
+  if (stages & 8) { a.A = a2; a.Y = y2; k_hpf2_gemm<1><<<dim3(2560 / BN, P / BM), 256, 0, st>>>(a); }
+  auto out = torch::empty({T, 2560}, x.options());
+  if (stages & 16) {
+    k_hpf2_inv<<<(P + 255) / 256, 256, 0, st>>>(sid, a.ntpp, nv, inv.data_ptr<int32_t>());
+    k_hpf2_reduce<<<T, 256, 0, st>>>(y2, inv.data_ptr<int32_t>(), w.data_ptr<float>(), topk,
+                                     reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+  }
+  return out;
+}
+
+
+// E31: hpf3_forward = hpf2_forward with the v3 glue kernels (topk must be <= 10). Same contract and outputs.
+torch::Tensor hpf3_forward(torch::Tensor x, torch::Tensor sorted_ids, torch::Tensor expert_ids, torch::Tensor ntpp, torch::Tensor w,
+                           torch::Tensor qw, torch::Tensor qoff, torch::Tensor scales, torch::Tensor su, torch::Tensor sv, double cb,
+                           int64_t K, int64_t pad, torch::Tensor A1, torch::Tensor Y1, torch::Tensor A2, torch::Tensor Y2,
+                           torch::Tensor S, torch::Tensor inv, torch::Tensor nsat, int64_t stages) {
+  TORCH_CHECK(K == HK, "this build decodes K = 4 only");
+  TORCH_CHECK(x.is_cuda() && x.is_contiguous() && x.scalar_type() == torch::kBFloat16 && x.dim() == 2 && x.size(1) == 2560);
+  TORCH_CHECK(w.is_contiguous() && w.scalar_type() == torch::kFloat32 && w.dim() == 2 && w.size(0) == x.size(0) && w.size(1) <= 10);
+  TORCH_CHECK(sorted_ids.scalar_type() == torch::kInt32 && expert_ids.scalar_type() == torch::kInt32 && ntpp.scalar_type() == torch::kInt32);
+  const int T = x.size(0), topk = w.size(1), nv = T * topk, P = sorted_ids.numel();
+  TORCH_CHECK(P % BM == 0 && expert_ids.numel() == P / BM && A1.numel() >= (int64_t)P * 2560 && Y1.numel() >= (int64_t)P * 1280 &&
+              A2.numel() >= (int64_t)P * 640 && Y2.numel() >= (int64_t)P * 2560 && S.numel() >= P && inv.numel() >= nv,
+              "scratch too small");
+  TORCH_CHECK(qw.scalar_type() == torch::kInt32 && qoff.scalar_type() == torch::kInt64 && scales.scalar_type() == torch::kHalf &&
+              su.scalar_type() == torch::kUInt8 && sv.scalar_type() == torch::kUInt8 && S.scalar_type() == torch::kFloat32);
+  auto st = at::cuda::getCurrentCUDAStream();
+  const int32_t* sid = sorted_ids.data_ptr<int32_t>(); const int32_t* eid = expert_ids.data_ptr<int32_t>();
+  unsigned* ns = reinterpret_cast<unsigned*>(nsat.data_ptr<int32_t>());
+  float* Sp = S.data_ptr<float>();
+  _Float16* a1 = reinterpret_cast<_Float16*>(A1.data_ptr<at::Half>());
+  _Float16* a2 = reinterpret_cast<_Float16*>(A2.data_ptr<at::Half>());
+  __nv_bfloat16* y1 = reinterpret_cast<__nv_bfloat16*>(Y1.data_ptr<at::BFloat16>());
+  __nv_bfloat16* y2 = reinterpret_cast<__nv_bfloat16*>(Y2.data_ptr<at::BFloat16>());
+  GemmArgs a;
+  a.S = Sp;
+  a.qw = reinterpret_cast<const uint32_t*>(qw.data_ptr<int32_t>()); a.qoff = qoff.data_ptr<int64_t>();
+  a.scales = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()); a.sv = sv.data_ptr<uint8_t>();
+  a.sorted_ids = sid; a.expert_ids = eid; a.ntpp = ntpp.data_ptr<int32_t>(); a.num_valid = nv; a.pad = (int)pad; a.cb = (float)cb;
+  const int pg = (P + 3) / 4;
+  if (stages & 1)
+    k_hpf3_act<0><<<pg, 128, 0, st>>>(reinterpret_cast<const __nv_bfloat16*>(x.data_ptr<at::BFloat16>()), sid, eid, su.data_ptr<uint8_t>(),
+                                      topk, nv, P, a1, Sp, ns);
+  if (stages & 2) { a.A = a1; a.Y = y1; k_hpf2_gemm<0><<<dim3(1280 / BN, P / BM), 256, 0, st>>>(a); }
+  if (stages & 4) k_hpf3_act<1><<<pg, 128, 0, st>>>(y1, sid, eid, su.data_ptr<uint8_t>(), topk, nv, P, a2, Sp, ns);
+  if (stages & 8) { a.A = a2; a.Y = y2; k_hpf2_gemm<1><<<dim3(2560 / BN, P / BM), 256, 0, st>>>(a); }
+  auto out = torch::empty({T, 2560}, x.options());
+  if (stages & 16) {
+    k_hpf2_inv<<<(P + 255) / 256, 256, 0, st>>>(sid, a.ntpp, nv, inv.data_ptr<int32_t>());
+    k_hpf3_reduce<<<T, 320, 0, st>>>(y2, inv.data_ptr<int32_t>(), w.data_ptr<float>(), topk,
+                                     reinterpret_cast<__nv_bfloat16*>(out.data_ptr<at::BFloat16>()));
+  }
+  return out;
+}

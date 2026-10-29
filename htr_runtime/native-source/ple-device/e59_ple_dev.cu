@@ -1,0 +1,209 @@
+// E59 (2026-10-26): GPU-side wait for an asynchronous host PLE gather, usable inside a captured HIP graph.
+// Host worker: gathers the step's PLE rows into a coherent pinned buffer, then release-stores ctrl[0] = seq.
+// GPU (PLE layer, after layers 0-1): k_wait_copy spins (thread 0, system-scope acquire) until ctrl[0] == exp[0], then copies exp[1]
+// 16-byte chunks of the pinned rows into the device rows buffer. exp[] is written stream-ordered by k_set_exp (values as kernel
+// arguments) in prepare_inputs, so a captured graph sees the per-step values. Timeout 2 s -> err flag (host aborts), rows untouched.
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <hip/hip_runtime.h>
+#include <cstring>
+#include <atomic>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <pybind11/pybind11.h>
+
+#define CHK(c) TORCH_CHECK(c, #c)
+
+__global__ void k_set_exp(int* exp, int seq, int n16) {
+  if (threadIdx.x == 0) { exp[0] = seq; exp[1] = n16; }
+}
+
+__global__ void __launch_bounds__(256) k_wait_copy(const int* ctrl, const int* exp, const uint4* src, uint4* dst, int cap16, int* err) {
+  // exp is stream-ordered and immutable during this kernel. A synchronous
+  // step has no host producer and must not wait on the asynchronous mailbox.
+  // This uniform return also leaves the prior producer's ready seq untouched.
+  if (exp[1] == 0) return;
+  __shared__ int s_go, s_n;
+  if (threadIdx.x == 0) {
+    const int want = exp[0];
+    const int n16 = exp[1];
+    const unsigned long long t0 = wall_clock64();
+    int ok = 1;
+    while (__hip_atomic_load(ctrl, __ATOMIC_ACQUIRE, __HIP_MEMORY_SCOPE_SYSTEM) != want) {
+      __builtin_amdgcn_s_sleep(1);
+      if (wall_clock64() - t0 > 200000000ull) {        // 2 s at the 100 MHz constant clock
+        ok = 0;
+        __hip_atomic_store(err, 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+        break;
+      }
+    }
+    s_go = ok;
+    s_n = n16 < cap16 ? n16 : cap16;
+  }
+  __syncthreads();
+  if (!s_go) return;
+  __atomic_thread_fence(__ATOMIC_ACQUIRE);
+  const int n = s_n;
+  for (int i = threadIdx.x; i < n; i += blockDim.x) {
+    const unsigned* s4 = reinterpret_cast<const unsigned*>(src + i);
+    uint4 v;
+    v.x = __hip_atomic_load(s4 + 0, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    v.y = __hip_atomic_load(s4 + 1, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    v.z = __hip_atomic_load(s4 + 2, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    v.w = __hip_atomic_load(s4 + 3, __ATOMIC_RELAXED, __HIP_MEMORY_SCOPE_SYSTEM);
+    dst[i] = v;
+  }
+}
+
+// coherent, mapped, portable pinned host buffer (zeroed), returned as a CPU uint8 tensor that frees with hipHostFree
+torch::Tensor alloc_coherent(int64_t nbytes) {
+  void* p = nullptr;
+  CHK(hipHostMalloc(&p, (size_t)nbytes, hipHostMallocCoherent | hipHostMallocMapped | hipHostMallocPortable) == hipSuccess);
+  std::memset(p, 0, (size_t)nbytes);
+  auto opts = torch::TensorOptions().dtype(torch::kUInt8).device(torch::kCPU);
+  return torch::from_blob(p, {nbytes}, [](void* q) { (void)hipHostFree(q); }, opts);
+}
+
+int64_t device_ptr(torch::Tensor host) {
+  void* d = nullptr;
+  CHK(hipHostGetDevicePointer(&d, host.data_ptr(), 0) == hipSuccess);
+  return reinterpret_cast<int64_t>(d);
+}
+
+void set_exp(torch::Tensor exp, int64_t seq, int64_t n16) {
+  CHK(exp.is_cuda() && exp.dtype() == torch::kInt32 && exp.numel() >= 2);
+  k_set_exp<<<1, 32, 0, at::cuda::getCurrentCUDAStream().stream()>>>(exp.data_ptr<int>(), (int)seq, (int)n16);
+}
+
+void wait_copy(torch::Tensor rows, int64_t ctrl_dptr, torch::Tensor exp, int64_t src_dptr, int64_t err_dptr) {
+  CHK(rows.is_cuda() && rows.is_contiguous() && (rows.numel() * rows.element_size()) % 16 == 0);
+  CHK(exp.is_cuda() && exp.dtype() == torch::kInt32);
+  const int cap16 = (int)(rows.numel() * rows.element_size() / 16);
+  k_wait_copy<<<1, 256, 0, at::cuda::getCurrentCUDAStream().stream()>>>(
+      reinterpret_cast<const int*>(ctrl_dptr), exp.data_ptr<int>(), reinterpret_cast<const uint4*>(src_dptr),
+      reinterpret_cast<uint4*>(rows.data_ptr()), cap16, reinterpret_cast<int*>(err_dptr));
+}
+
+// host-side release store of the ready sequence number (after the rows bytes were written)
+void host_release(torch::Tensor ctrl, int64_t seq) {
+  int* p = reinterpret_cast<int*>(ctrl.data_ptr());
+  std::atomic_thread_fence(std::memory_order_release);
+  __atomic_store_n(p, (int)seq, __ATOMIC_RELEASE);
+}
+
+int64_t host_load(torch::Tensor ctrl, int64_t idx) {
+  int* p = reinterpret_cast<int*>(ctrl.data_ptr());
+  return (int64_t)__atomic_load_n(p + idx, __ATOMIC_ACQUIRE);
+}
+
+// ---------------------------------------------------------------- native (GIL-free) gather worker
+// One persistent std::thread: waits for a job (seq, event, ids, m), hipEventSynchronize(event) (the non_blocking D2H of the step's
+// n-gram ids), calls the E27 native library's ple_gather_ids (same function/arguments the Python native arm uses) straight into the
+// coherent pinned rows buffer, then release-stores ctrl[0] = seq. On a gather error: ctrl[2] = rc, ctrl[1] = 2, ctrl[0] = seq (GPU
+// proceeds with stale rows; the host raises on its next step).
+typedef int (*gather_fn_t)(const int64_t*, int64_t, const int32_t*, const int64_t*, const int64_t*, int64_t, int64_t, int64_t, int64_t,
+                           char*, int, int, int64_t*);
+struct Worker {
+  std::thread th;
+  std::mutex mu;
+  std::condition_variable cv;
+  bool have = false, busy = false, stop = false;
+  int64_t seq = 0, m = 0;
+  hipEvent_t ev = nullptr;
+  const int64_t* ids = nullptr;
+  gather_fn_t fn = nullptr;
+  const int32_t* fds = nullptr;
+  const int64_t *base = nullptr, *rows = nullptr;
+  int64_t nparts = 0, shard = 0, row_bytes = 0, num_emb = 0;
+  char* out = nullptr;
+  int* ctrl = nullptr;
+  int threads = 1, min_runs = 1;
+  int64_t stats[3] = {0, 0, 0};
+  int64_t jobs = 0, errors = 0;
+};
+static Worker* g_w = nullptr;
+
+static void worker_loop(Worker* w) {
+  for (;;) {
+    std::unique_lock<std::mutex> lk(w->mu);
+    w->cv.wait(lk, [&] { return w->have || w->stop; });
+    if (w->stop) return;
+    const int64_t seq = w->seq, m = w->m;
+    hipEvent_t ev = w->ev;
+    const int64_t* ids = w->ids;
+    w->have = false;
+    w->busy = true;
+    lk.unlock();
+    int rc = (int)hipEventSynchronize(ev);
+    if (rc == 0)
+      rc = w->fn(ids, m, w->fds, w->base, w->rows, w->nparts, w->shard, w->row_bytes, w->num_emb, w->out, w->threads, w->min_runs,
+                 w->stats);
+    if (rc != 0) {
+      __atomic_store_n(w->ctrl + 2, rc, __ATOMIC_RELAXED);
+      __atomic_store_n(w->ctrl + 1, 2, __ATOMIC_RELAXED);
+    }
+    std::atomic_thread_fence(std::memory_order_release);
+    __atomic_store_n(w->ctrl, (int)seq, __ATOMIC_RELEASE);
+    lk.lock();
+    w->busy = false;
+    w->jobs++;
+    if (rc != 0) w->errors++;
+    lk.unlock();
+    w->cv.notify_all();
+  }
+}
+
+void worker_start(int64_t fn, int64_t fds, int64_t base, int64_t rows, int64_t nparts, int64_t shard, int64_t row_bytes,
+                  int64_t num_emb, torch::Tensor rows_h, torch::Tensor ctrl, int64_t threads, int64_t min_runs) {
+  CHK(g_w == nullptr);
+  auto* w = new Worker();
+  w->fn = reinterpret_cast<gather_fn_t>(fn);
+  w->fds = reinterpret_cast<const int32_t*>(fds);
+  w->base = reinterpret_cast<const int64_t*>(base);
+  w->rows = reinterpret_cast<const int64_t*>(rows);
+  w->nparts = nparts; w->shard = shard; w->row_bytes = row_bytes; w->num_emb = num_emb;
+  w->out = reinterpret_cast<char*>(rows_h.data_ptr());
+  w->ctrl = reinterpret_cast<int*>(ctrl.data_ptr());
+  w->threads = (int)threads; w->min_runs = (int)min_runs;
+  w->th = std::thread(worker_loop, w);
+  w->th.detach();
+  g_w = w;
+}
+
+void worker_submit(int64_t seq, int64_t ev, int64_t ids, int64_t m) {
+  CHK(g_w != nullptr);
+  {
+    std::lock_guard<std::mutex> lk(g_w->mu);
+    CHK(!g_w->have && !g_w->busy);
+    g_w->seq = seq; g_w->ev = reinterpret_cast<hipEvent_t>(ev); g_w->ids = reinterpret_cast<const int64_t*>(ids); g_w->m = m;
+    g_w->have = true;
+  }
+  g_w->cv.notify_all();
+}
+
+void worker_wait_idle() {
+  if (g_w == nullptr) return;
+  pybind11::gil_scoped_release nogil;
+  std::unique_lock<std::mutex> lk(g_w->mu);
+  g_w->cv.wait(lk, [&] { return !g_w->have && !g_w->busy; });
+}
+
+std::vector<int64_t> worker_stats() {
+  if (g_w == nullptr) return {};
+  std::lock_guard<std::mutex> lk(g_w->mu);
+  return {g_w->jobs, g_w->errors, g_w->stats[0], g_w->stats[1], g_w->stats[2]};
+}
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("worker_start", &worker_start);
+  m.def("worker_submit", &worker_submit);
+  m.def("worker_wait_idle", &worker_wait_idle);
+  m.def("worker_stats", &worker_stats);
+  m.def("alloc_coherent", &alloc_coherent);
+  m.def("device_ptr", &device_ptr);
+  m.def("set_exp", &set_exp);
+  m.def("wait_copy", &wait_copy);
+  m.def("host_release", &host_release);
+  m.def("host_load", &host_load);
+}

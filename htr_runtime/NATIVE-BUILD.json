@@ -1,0 +1,143 @@
+{
+  "schema": "htr-native-build-v1",
+  "target": "gfx1151",
+  "modules": [
+    {
+      "name": "htr_kernels",
+      "recipe": "native-recipes/htr_kernels.ninja.in",
+      "output": "native-bin/htr_kernels.so",
+      "sources": [
+        "native-source/dense/htr_kernels.cpp",
+        "native-source/dense/htr_kernels.hip"
+      ],
+      "accepted_binary_sha256": "282a4edcf318c8d50468e0c02afb165ead0a1f2e8f31373148a7a73bdcd690e4"
+    },
+    {
+      "name": "htr_moe2",
+      "recipe": "native-recipes/htr_moe2.ninja.in",
+      "output": "native-bin/htr_moe2.so",
+      "sources": [
+        "native-source/moe2/kernel.hip",
+        "native-source/moe2/kernel.cpp"
+      ],
+      "accepted_binary_sha256": "de777aacdbf4e7b9c5786c382c866962253a903e552b7c1ee18e61c861ad64f2"
+    },
+    {
+      "name": "htr_moe_prefill_v3",
+      "recipe": "native-recipes/htr_moe_prefill_v3.ninja.in",
+      "output": "native-bin/htr_moe_prefill_v3.so",
+      "sources": [
+        "native-source/prefill/htr_moe_prefill_v6.cpp",
+        "native-source/prefill/htr_moe_prefill_v6.hip"
+      ],
+      "accepted_binary_sha256": "02e138ff0c810aea6aecf0f7d7ce12cccc01e4e5e71975aa6f0145aea00b826e"
+    },
+    {
+      "name": "htr_moe_serve_k",
+      "recipe": "native-recipes/htr_moe_serve_k.ninja.in",
+      "output": "native-bin/htr_moe_serve_k.so",
+      "sources": [
+        "native-source/moe/htr_moe.hip",
+        "native-source/moe/htr_moe.cpp"
+      ],
+      "accepted_binary_sha256": "93dfb88bf129b54667b99e36a0d785bfe491286dcad32382ed3fea1d81ede363"
+    },
+    {
+      "name": "htr_dq_arena",
+      "recipe": "native-recipes/htr_dq_arena.ninja.in",
+      "output": "native-bin/htr_dq_arena.so",
+      "sources": [
+        "native-source/moe/dq_arena.hip",
+        "native-source/moe/dq_arena.cpp"
+      ],
+      "accepted_binary_sha256": "ba61f6f98385013bf1febc2ae3bfefbbbd1cc67b6c1d1b0a09ce83b5be994c85"
+    },
+    {
+      "name": "htr_moe_prefill",
+      "recipe": "native-recipes/htr_moe_prefill.ninja.in",
+      "output": "native-bin/htr_moe_prefill.so",
+      "sources": [
+        "native-source/moe/htr_moe_prefill.hip",
+        "native-source/moe/htr_moe_prefill.cpp"
+      ],
+      "accepted_binary_sha256": "870f0032836c12f4e187b841d567d0c91d4133500bf2e22c21a04adaa7c009d1"
+    },
+    {
+      "name": "htr_moe_prefill_v2",
+      "recipe": "native-recipes/htr_moe_prefill_v2.ninja.in",
+      "output": "native-bin/htr_moe_prefill_v2.so",
+      "sources": [
+        "native-source/moe/htr_moe_prefill_v2.cpp",
+        "native-source/moe/htr_moe_prefill_v2.hip"
+      ],
+      "accepted_binary_sha256": "b9ecd0bf98f9e9c19c6a979db747a45283b0cb7a0fb5c6fa00981d832fb9639f"
+    },
+    {
+      "name": "e59_pledev_ext",
+      "recipe": "native-recipes/e59_pledev_ext.ninja.in",
+      "output": "native-bin/e59_pledev_ext.so",
+      "sources": [
+        "native-source/ple-device/e59_ple_dev.hip"
+      ],
+      "accepted_binary_sha256": "8ce36d6b71bb3ac8bb39ce5dc06a82127283c0726830b92d0341dfed4ebb0a9b"
+    },
+    {
+      "name": "hiphc",
+      "recipe": "native-recipes/hiphc.ninja.in",
+      "output": "python/hiphc_build/hiphc.so",
+      "sources": [
+        "native-source/hiphc_build/hiphc.hip"
+      ],
+      "accepted_binary_sha256": "53759d8f05c351f846bf11a592d9d6d3e74dd2d8a44480bcdd5d81c3fe86b588"
+    },
+    {
+      "name": "hiphcp",
+      "recipe": "native-recipes/hiphcp.ninja.in",
+      "output": "python/hiphcp_build/hiphcp.so",
+      "sources": [
+        "native-source/hiphcp_build/hiphcp.hip"
+      ],
+      "accepted_binary_sha256": "125e3deeaa6e5e8a3860a4318224e48f237dc08a2d5597e5195b50593e6e60fe"
+    },
+    {
+      "name": "ple_gather_v2",
+      "recipe": "native-recipes/ple_gather_v2.ninja.in",
+      "output": "native-bin/ple_gather_v2.so",
+      "sources": [
+        "native-source/ple-gather/ple_gather_v2.c"
+      ],
+      "accepted_binary_sha256": "328ce52ced3d79e32311752bb1f80b87e2090bc9512ec8b8d67d3d3fa6688ddf"
+    }
+  ],
+  "files": {
+    "native-source/dense/htr_kernels.cpp": "ae08b45113e8731bb05efca3b62f8681e67661bff394393652867687e49e4947",
+    "native-source/dense/htr_kernels.hip": "68d105e999683b73e982e2bf887348784a46c5e15f0d8e64ba05b1a568b8d324",
+    "native-recipes/htr_kernels.ninja.in": "67ec846734546cef13aa2fb2c0a2163c985d5b0461c74cf98d4911ccd4e05c6d",
+    "native-source/moe2/kernel.hip": "406e3fd4b2e376ae0eb3918e86dbe3eca94796264c3b5272831712a62e992678",
+    "native-source/moe2/kernel.cpp": "cb3026664fe8946f333fdc3785bf5564fb27a5e481244cec44252790bc979e66",
+    "native-recipes/htr_moe2.ninja.in": "75e613ee26f8a1bd7cbea13726e176d99354e72be3b8e775865b7db45f663594",
+    "native-source/prefill/htr_moe_prefill_v6.cpp": "c666c17b76f31eb7ce8b90d2589d33aa2df159d6f2c7e479de7a00f9d8b7e1a3",
+    "native-source/prefill/htr_moe_prefill_v6.hip": "610974736304e1f50f18bb30c97f1d7b37d03915d16af37637ed991562f54bff",
+    "native-recipes/htr_moe_prefill_v3.ninja.in": "99fc621ff88552f1f884f02092511ff7f44d21dee4508863072562995a9d00c8",
+    "native-source/moe/htr_moe.hip": "75522bc9a720ff3e24f080d823317677c731bc2640cfea0210b1d2bf5001cc02",
+    "native-source/moe/htr_moe.cpp": "52868f187ef8953540ef9288849362af58f803f4d96d2458daa49bb64abaf063",
+    "native-recipes/htr_moe_serve_k.ninja.in": "3cd01bbd030130627ff4dddc40286763a7dfde5bad816e28c20f8e2d59b5ed64",
+    "native-source/moe/dq_arena.hip": "87cc348cf7c165c410e8ac24a5c5ccd637b03188278a30014c7237a1af2e391e",
+    "native-source/moe/dq_arena.cpp": "79146ce1e3e72899e7bd7eb7681bb1b4e6c5e4655c4df21653c893a3a7b92bb4",
+    "native-recipes/htr_dq_arena.ninja.in": "d81da28cf270e7073a8d46346737bfe3842594295bce0645c56044b6d67ae35e",
+    "native-source/moe/htr_moe_prefill.hip": "0c1293faf215efb32b00057a9c6cf7cfac564cddf682ea2cb351e7a69106f133",
+    "native-source/moe/htr_moe_prefill.cpp": "e372f0b8f8811b89aeb01d6506b12733c37f8ff68fbfdde6e1a9001851a44c6f",
+    "native-recipes/htr_moe_prefill.ninja.in": "496cf2dfacc309cf56373f28ebf4f9dd5810663ca27c28405a3a3dcc9f04b6ee",
+    "native-source/moe/htr_moe_prefill_v2.cpp": "b95eb50597aecb0c23635b9d675338ab63c6c8035873ed368611594794bc35ab",
+    "native-source/moe/htr_moe_prefill_v2.hip": "10889f65222b87868dfac62dc53a800be9c600707c176be2b09e9c5ed4caef90",
+    "native-recipes/htr_moe_prefill_v2.ninja.in": "6d855d1ae5ddac3634c887140bf8fc4f2dfa3496688b293f04048bab8e91bd2d",
+    "native-source/ple-device/e59_ple_dev.hip": "4818d98a18814249652fc6d2eda78be8212115545fb85f589954ec6519a95936",
+    "native-recipes/e59_pledev_ext.ninja.in": "893449acb4b30e1edb3c333e31467cd083a72aabd59dcc23f6929edb55e48bba",
+    "native-source/hiphc_build/hiphc.hip": "6fa60f806e5ed825bdb315aa751e2961851e8be750c5062298f8fcc2e1c85d94",
+    "native-recipes/hiphc.ninja.in": "5f05e4552c2aa740af3f5a351b47046db4eeb1266480a7e5dd119032b1edbb48",
+    "native-source/hiphcp_build/hiphcp.hip": "ce1c088477d784fa17d9573b8e8455eeb8d4b60f0fe1dc7c516784f0ed89321d",
+    "native-recipes/hiphcp.ninja.in": "669dff3c9dfddb6fae44077b7400aa6dadcc1605f55b6cbf6104b230744cb197",
+    "native-recipes/ple_gather_v2.ninja.in": "a689fe3c1f753eed5304c726b87aa7aa5bf9025091b4e6e0913b70733d045533",
+    "native-source/ple-gather/ple_gather_v2.c": "e148fc97e8326b14ce57fe480f95a1f39c483493118efed5ca53c8a048c6e869"
+  }
+}

@@ -1,0 +1,4 @@
+rule compile
+  command = gcc -O2 -Wall -Wextra -fPIC -shared -pthread -o $out $in
+build ple_gather_v2.so: compile @SOURCE@/native-source/ple-gather/ple_gather_v2.c
+default ple_gather_v2.so

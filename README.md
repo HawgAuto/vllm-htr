@@ -1,4 +1,14 @@
 <!-- markdownlint-disable MD001 MD041 -->
+# vLLM HTR
+
+A gfx1151/Strix Halo serving fork for Qwen3.8 HTR, integrating HTR kernels, GPTQ8 hyper-connections, SSD-backed PLE, and the QSA1600/MTP3 release profile.
+
+[Build and run vLLM HTR](htr_runtime/README.md) · [Model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [HTR format and quantizer](https://github.com/HawgAuto/HTR)
+
+This fork preserves upstream vLLM ancestry. Use the HTR-specific Docker recipe and instructions above for this model; the upstream installation instructions below describe upstream vLLM, not this custom runtime. Qualification and publication status are tracked separately from source/build readiness.
+
+## Upstream vLLM
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">

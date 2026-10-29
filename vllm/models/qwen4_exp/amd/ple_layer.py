@@ -61,16 +61,31 @@ def _ple_checkpoint_prefix(runtime_prefix: str) -> str:
     )
 
 
+import e53_ple_async as _e53_ple_async  # noqa: F401  E53: registers torch.ops.e53.ple_wait
+import e59_ple_dev as _e59_ple_dev  # noqa: F401  E59: registers torch.ops.e59.ple_dev_wait
+import os as _htr_os
+_HTR_PLE_HOIST = _htr_os.environ.get("HTR_PLE_HOIST", "0")
+if _HTR_PLE_HOIST not in ("0", "1", "shadow"):
+    raise ValueError(f"HTR_PLE_HOIST must be 0, 1 or shadow, got {_HTR_PLE_HOIST!r}")
+_HTR_PLE_SHADOW_N = [0]
+import json as _htr_json
+
+
 def validate_qwen4_ple_ssd_config(vllm_config: VllmConfig) -> None:
     """Reject execution modes that cannot safely perform synchronous SSD I/O."""
     if vllm_config.model_config.dtype != torch.bfloat16:
         raise ValueError("VLLM_QWEN4_PLE_SSD requires native BF16 model dtype")
     compilation = vllm_config.compilation_config
-    if compilation.cudagraph_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
+    if _HTR_PLE_HOIST == "1":
+        # E15 PLE hoist: the forward never performs SSD I/O (rows arrive as a static input buffer), so any graph mode is safe.
+        compilation = None
+    if compilation is None:
+        pass
+    elif compilation.cudagraph_mode not in (CUDAGraphMode.NONE, CUDAGraphMode.PIECEWISE):
         raise ValueError(
             "SSD PLE requires NONE or PIECEWISE graphs; pread cannot be captured"
         )
-    if compilation.cudagraph_mode == CUDAGraphMode.PIECEWISE:
+    if compilation is not None and compilation.cudagraph_mode == CUDAGraphMode.PIECEWISE:
         split_op = "vllm::qwen4_exp_amd_ple_ssd_embedding"
         if not is_breakable_cudagraph_enabled() and not (
             compilation.mode == CompilationMode.VLLM_COMPILE
@@ -587,6 +602,25 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        ple_rows: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        if ple_rows is None:
+            ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+            return self._lookup(ngram_ids)
+        if _HTR_PLE_HOIST == "shadow":
+            ngram_ids = self.compute_ngram_ids(input_ids, query_start_loc, ngram_context)
+            ref = self._lookup(ngram_ids)
+            torch._assert_async(
+                (ref.view(torch.int16) == ple_rows.view(torch.int16)).all(),
+                "HTR_PLE_HOIST shadow: hoisted PLE rows differ from the in-graph SSD lookup",
+            )
+        return ple_rows
+
+    def compute_ngram_ids(
+        self,
+        input_ids: torch.Tensor,
+        query_start_loc: torch.Tensor,
+        ngram_context: torch.Tensor,
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
@@ -680,6 +714,9 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             ids = torch.remainder(mixed.unsqueeze(-1), sizes) + offsets
             id_blocks.append(ids[request_indices, adjusted_columns])
         ngram_ids = torch.cat(id_blocks, dim=-1)
+        return ngram_ids
+
+    def _lookup(self, ngram_ids: torch.Tensor) -> torch.Tensor:
         output = ngram_ids.new_empty(
             (ngram_ids.shape[0], self.embedding_dim),
             dtype=self.ngram_embedding.params_dtype,
@@ -1382,6 +1419,7 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         input_ids: torch.Tensor,
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        ple_rows: torch.Tensor | None = None,
     ) -> torch.Tensor:
         input_ids = input_ids.reshape(-1)
         if input_ids.shape[0] != hidden_states.shape[0]:
@@ -1390,7 +1428,10 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
                 f"token length, got {input_ids.shape[0]} and "
                 f"{hidden_states.shape[0]}"
             )
-        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context)
+        if ple_rows is not None:
+            torch.ops.e53.ple_wait(ple_rows, hidden_states)   # E53: fills ple_rows if an async gather is in flight (else no-op)
+            torch.ops.e59.ple_dev_wait(ple_rows, hidden_states)   # E59: GPU waits for/copies async decode rows (else no-op)
+        embeddings = self.ple_embedding(input_ids, query_start_loc, ngram_context, ple_rows)
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
@@ -1441,6 +1482,11 @@ def qwen4_exp_amd_ple_ssd_embedding(
     if not isinstance(embedding, Qwen4ExpPLESSDEmbedding):
         raise TypeError(f"{layer_name} is not an SSD PLE owner")
     output.copy_(_ssd_ple_lookup_or_profile_zeros(embedding, ngram_ids).flatten(-2))
+    if _HTR_PLE_HOIST == "shadow":
+        _HTR_PLE_SHADOW_N[0] += 1
+        n = _HTR_PLE_SHADOW_N[0]
+        if n <= 4 or n % 256 == 0:
+            print("HTR_PLE_SHADOW " + _htr_json.dumps({"calls": n, "rows": int(ngram_ids.shape[0])}), flush=True)
 
 
 def qwen4_exp_ple_short_conv(

@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+htr_moe = htr_moe_serve.plugin:register

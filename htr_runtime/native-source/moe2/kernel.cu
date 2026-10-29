@@ -1,0 +1,493 @@
+// E29 (2026-10-26): byte copy of e15 csrc/htr_moe.cu + (a) k_moe_plan2 = k_moe_plan + number of groups, (b) k_e82_moe<PH=1, FUSE>:
+// the per-(group, strip-block) last arriver additionally bumps a per-strip-block counter; the last of the ng groups computes
+// y[t, i] = sum_s w[t,s] * dn[slot(t,s), i] for its 128 columns with exactly k_moe_combine's expression (same fp32 order),
+// so k_moe_combine (one launch + ~17 us/layer) disappears and y is bitwise identical.
+// HTR routed-MoE decode consumer v0 (2026-10-21), gfx1151. Qwen3.8 expert geometry: hidden 2560, expert intermediate 640, top-k 10.
+// Derived from the qualified e10 k_gemv_fused (prologue H128(su.x) per 128-block in LDS with power-of-2 block scales, trellis tile
+// decode + fdot2, split-K partials, self-resetting arrival counter, last-arriver H128/scales/sv epilogue). Device helpers below are
+// copied verbatim from e10-htr-toolbox/htr/csrc/htr_kernels.cu (sha256 recorded in MANIFEST).
+//
+// Per MoE layer and decode step (T <= 8 tokens, A = T*topk assignments, M = launch row bucket >= max tokens per expert):
+//   k_moe_plan   (1 WG)       ids -> groups: group a is non-empty iff assignment a is the first occurrence of its expert;
+//                             it carries every token that chose that expert (dedup, so shared experts are read once). Static
+//                             shapes, no host sync -> graph-capturable.
+//   k_e82_moe<PH=0>  grid (10, ns, A)  gate|up GEMV (m = 1280: strip-blocks 0-4 gate, 5-9 up; n = 2560) -> gu f32 [A, M, 1280]
+//   k_e82_moe<PH=1>  grid (20, ns, A)  down GEMV on h = silu(gate)*up computed in the prologue (m = 2560, n = 640) -> dn f32 [A, M, 2560]
+//   k_moe_combine                 y[t] = sum_s w[t,s] * dn[slot(t,s)] (fixed slot order, deterministic) -> bf16 [T, 2560]
+// Mixed widths: K is read per expert from kexp[]; the branch is uniform per WG (one expert per WG) -> no divergence. KF != 0 builds
+// a fixed-K kernel that skips experts of other widths (per-width launches / uniform-recipe control for the register footprint).
+#include <torch/extension.h>
+#include <ATen/cuda/CUDAContext.h>
+#include <cuda_runtime.h>
+#include <cuda_fp16.h>
+#include <cuda_bf16.h>
+#include <stdint.h>
+
+#define GEN_A 0xDF6ADFu
+#define GEN_B 0x34983u
+typedef _Float16 h2v __attribute__((ext_vector_type(2)));
+
+// ---------------------------------------------------------------- verbatim e10 helpers
+__device__ __forceinline__ uint32_t sad_bytesum(uint32_t x, uint32_t acc) {
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
+  return __builtin_amdgcn_sad_u8(x, 0u, acc);
+#else
+  return (x & 0xFF) + ((x >> 8) & 0xFF) + ((x >> 16) & 0xFF) + (x >> 24) + acc;
+#endif
+}
+__device__ __forceinline__ uint32_t alignbit(uint32_t hi, uint32_t lo, uint32_t sh) {
+  return __builtin_amdgcn_alignbit(hi, lo, sh);
+}
+template <int B>
+__device__ __forceinline__ uint32_t ext16(const uint32_t* V) {
+  constexpr int w = B >> 5, off = B & 31;
+  if constexpr (off <= 16) return (V[w] >> (16 - off)) & 0xFFFFu;
+  else return alignbit(V[w], V[w + 1], 48 - off) & 0xFFFFu;
+}
+__device__ __forceinline__ uint32_t val_f16bits(uint32_t s) {
+  return sad_bytesum(s * GEN_A + GEN_B, 0x6400u);
+}
+__device__ __forceinline__ h2v as_h2(uint32_t u) { return __builtin_bit_cast(h2v, u); }
+template <int MSK> __device__ __forceinline__ float shx(float v) {
+  const int iv = __builtin_bit_cast(int, v);
+  if constexpr (MSK < 16) {
+    return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, iv, 0x160 | MSK, 0xF, 0xF, false));
+  } else {
+    return __builtin_bit_cast(float, (int)__builtin_amdgcn_permlanex16((unsigned)iv, (unsigned)iv, 0x76543210u, 0xfedcba98u, false, false));
+  }
+}
+__device__ __forceinline__ float wave_max(float a) {
+  a = fmaxf(a, shx<16>(a)); a = fmaxf(a, shx<8>(a)); a = fmaxf(a, shx<4>(a)); a = fmaxf(a, shx<2>(a)); a = fmaxf(a, shx<1>(a));
+  return a;
+}
+__device__ __forceinline__ float wave_sum(float a) {
+  a += shx<16>(a); a += shx<8>(a); a += shx<4>(a); a += shx<2>(a); a += shx<1>(a);
+  return a;
+}
+template <int MSK> __device__ __forceinline__ void fwht_stage(float v[4], int lane) {
+  const bool up = (lane & MSK) != 0;
+#pragma unroll
+  for (int e = 0; e < 4; ++e) {
+    const float o = shx<MSK>(v[e]);
+    v[e] = up ? (o - v[e]) : (v[e] + o);
+  }
+}
+__device__ __forceinline__ void fwht128_wave(float v[4], int lane) {
+  float a = v[0] + v[1], b = v[0] - v[1], c = v[2] + v[3], d = v[2] - v[3];
+  v[0] = a + c; v[1] = b + d; v[2] = a - c; v[3] = b - d;
+  fwht_stage<1>(v, lane); fwht_stage<2>(v, lane); fwht_stage<4>(v, lane); fwht_stage<8>(v, lane); fwht_stage<16>(v, lane);
+}
+
+// ---------------------------------------------------------------- layout constants (Qwen3.8 routed experts)
+#define MOE_H 2560
+#define MOE_I 640
+#define MOE_MAXB 16                 // max 128-blocks of input per WG (LDS x~ chunk)
+#define SC_STRIDE 3840              // scales per expert: gate 640 | up 640 | down 2560
+#define SV_STRIDE 480               // sv bytes per expert: gate 80 | up 80 | down 320
+#define SU_STRIDE 400               // su bytes per expert: gate/up (shared) 320 | down 80
+
+struct MoeArgs {
+  const uint32_t* qw;   const int64_t* qoff;  const int* kexp;
+  const __half* scales; const uint8_t* su;    const uint8_t* sv;
+  const int* grp_e;     const int* grp_rows;  const int* grp_n;
+  const __nv_bfloat16* x;                     // PH0 input [T, 2560]
+  const float* gu;                            // PH1 input [A, M, 1280]
+  float* part; unsigned* counters; float* out;
+  int bps, ns; float cb;
+  int spadk[6];  // v2: padding words appended to every 16-row strip of a width-K expert's matrices (pitch = nt*8K + spadk[K]);
+                 //     v1 had one spad for all K. Breaks 2^12-aligned strip pitches (DRAM aliasing; see bench_layout_L3.json)
+  int fence_ra;  // v1: 1 = release fence before arrival atomic + acquire in last arriver; 0 = v0 __threadfence() pair
+  // E29 fused combine (PH 1 only)
+  const int* slot; const float* wts; const int* ng; unsigned* cnt2; __nv_bfloat16* y; int T, topk;
+};
+
+// trellis tile loop for one 16-row strip over input 128-blocks [b0, b0+nb): verbatim k_gemv_fused inner loop
+template <int K, int M>
+__device__ __forceinline__ void tile_loop(const uint32_t* __restrict__ qm, size_t pitch, int i, int b0, int nb, int lane,
+                                          _Float16 (*xs_l)[MOE_MAXB * 128], float (*bscale)[MOE_MAXB], float* a0, float* a1) {
+  const int g = lane >> 3, q = lane & 7;
+  for (int jl = g; jl < nb * 8; jl += 4) {
+    const int j = b0 * 8 + jl, bl = jl >> 3;
+    const uint32_t* tp = qm + (size_t)i * pitch + (size_t)j * (8 * K);   // v0: ((size_t)i * nt + j) * (8 * K)
+    uint32_t V[K + 1];
+    if constexpr (K == 4 && M == 1) {
+      V[0] = __builtin_nontemporal_load(tp + (q * K + 8 * K - 1) % (8 * K));
+#pragma unroll
+      for (int k = 0; k < K; ++k) V[k + 1] = __builtin_nontemporal_load(tp + q * K + k);
+    } else {
+      V[0] = tp[(q * K + 8 * K - 1) % (8 * K)];
+#pragma unroll
+      for (int k = 0; k < K; ++k) V[k + 1] = tp[q * K + k];
+    }
+    h2v xv[M][8];
+    float d0[M], d1[M];
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
+      uint4 u0 = xp[0], u1 = xp[1];
+      xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
+      xv[r][4] = as_h2(u1.x); xv[r][5] = as_h2(u1.y); xv[r][6] = as_h2(u1.z); xv[r][7] = as_h2(u1.w);
+      d0[r] = 0.f; d1[r] = 0.f;
+    }
+#define HTR_PAIRM(U)                                                                       \
+    {                                                                                      \
+      uint32_t lo = val_f16bits(ext16<16 + ((U) + 1) * K>(V));                             \
+      uint32_t hi = val_f16bits(ext16<16 + ((U) + 2) * K>(V));                             \
+      h2v w2 = as_h2(lo | (hi << 16));                                                     \
+      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
+        if ((U) < 16) d0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], d0[r], false); \
+        else d1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], d1[r], false);      \
+      }                                                                                    \
+    }
+    HTR_PAIRM(0) HTR_PAIRM(2) HTR_PAIRM(4) HTR_PAIRM(6) HTR_PAIRM(8) HTR_PAIRM(10) HTR_PAIRM(12) HTR_PAIRM(14)
+    HTR_PAIRM(16) HTR_PAIRM(18) HTR_PAIRM(20) HTR_PAIRM(22) HTR_PAIRM(24) HTR_PAIRM(26) HTR_PAIRM(28) HTR_PAIRM(30)
+#undef HTR_PAIRM
+#pragma unroll
+    for (int r = 0; r < M; ++r) { const float s = bscale[r][bl]; a0[r] += s * d0[r]; a1[r] += s * d1[r]; }
+  }
+}
+
+__device__ __forceinline__ float silu_f(float g) { return g / (1.0f + __expf(-g)); }
+
+template <int KF, int M, int PH, int FUSE = 0>
+__global__ __launch_bounds__(256) void k_e82_moe(MoeArgs a) {
+  constexpr int m = PH == 0 ? 2 * MOE_I : MOE_H;       // output rows (gate|up fused for PH0)
+  constexpr int n = PH == 0 ? MOE_H : MOE_I;           // input columns
+  constexpr int nt = n >> 4, MPB = m >> 7;
+  __shared__ __attribute__((aligned(16))) _Float16 xs_l[M][MOE_MAXB * 128];
+  __shared__ float bscale[M][MOE_MAXB];
+  __shared__ float bsum[M][MOE_MAXB];
+  __shared__ float ep[128];
+  __shared__ unsigned is_last;
+  __shared__ unsigned is_last2;
+  const int gidx = blockIdx.z, sb = blockIdx.x, sp = blockIdx.y, ns = a.ns;
+  const int e = a.grp_e[gidx];
+  if (e < 0) return;
+  const int K = a.kexp[e];
+  if constexpr (KF != 0) { if (K != KF) return; }
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+  const int mr = a.grp_n[gidx];
+  // matrix selection
+  int sbl, mat;                                         // mat: 0 gate, 1 up, 2 down
+  if constexpr (PH == 0) { mat = sb < 5 ? 0 : 1; sbl = sb < 5 ? sb : sb - 5; } else { mat = 2; sbl = sb; }
+  const uint32_t* qm = a.qw + a.qoff[(size_t)e * 3 + mat];
+  const __half* scl = a.scales + (size_t)e * SC_STRIDE + (mat == 0 ? 0 : mat == 1 ? MOE_I : 2 * MOE_I);
+  const uint8_t* svp = a.sv + (size_t)e * SV_STRIDE + (mat == 0 ? 0 : mat == 1 ? 80 : 160);
+  const uint8_t* sup = a.su + (size_t)e * SU_STRIDE + (PH == 0 ? 0 : 320);
+  const int b0 = sp * a.bps, b1 = min(n >> 7, b0 + a.bps), nb = b1 - b0;
+  // ---- prologue: x~ = f16(H128(su . x) / blockscale) for this WG's input chunk, rows r < mr
+  for (int it = w; it < M * nb; it += 8) {
+    const int r = it / nb, bl = it % nb, base = (b0 + bl) * 128 + lane * 4;
+    float v[4];
+    if (r < mr) {
+      if constexpr (PH == 0) {
+        const __nv_bfloat16* xr = a.x + (size_t)a.grp_rows[gidx * M + r] * MOE_H;
+#pragma unroll
+        for (int e2 = 0; e2 < 4; ++e2) v[e2] = __bfloat162float(xr[base + e2]);
+      } else {
+        const float* gr = a.gu + ((size_t)gidx * M + r) * (2 * MOE_I);
+#pragma unroll
+        for (int e2 = 0; e2 < 4; ++e2) v[e2] = silu_f(gr[base + e2]) * gr[MOE_I + base + e2];
+      }
+    } else {
+#pragma unroll
+      for (int e2 = 0; e2 < 4; ++e2) v[e2] = 0.f;
+    }
+#pragma unroll
+    for (int e2 = 0; e2 < 4; ++e2) {
+      const int idx = base + e2;
+      if ((sup[idx >> 3] >> (idx & 7)) & 1) v[e2] = -v[e2];
+    }
+    fwht128_wave(v, lane);
+    float am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+    am = wave_max(am);
+    am *= (1.0f / 11.313708498984761f);
+    const float sc = am > 30000.f ? exp2f(ceilf(log2f(am / 30000.f))) : 1.f;
+    const float inv = (1.0f / 11.313708498984761f) / sc;
+    float sum = 0.f;
+#pragma unroll
+    for (int e2 = 0; e2 < 4; ++e2) {
+      _Float16 h = (_Float16)(v[e2] * inv);
+      xs_l[r][bl * 128 + lane * 4 + e2] = h;
+      sum += (float)h;
+    }
+    sum = wave_sum(sum);
+    if (lane == 0) { bscale[r][bl] = sc; bsum[r][bl] = sum; }
+  }
+  __syncthreads();
+  // ---- trellis GEMV over this WG's 8 strips x chunk
+  const int il = sbl * 8 + w;                           // 16-row strip inside the selected matrix
+  float a0[M], a1[M];
+#pragma unroll
+  for (int r = 0; r < M; ++r) { a0[r] = 0.f; a1[r] = 0.f; }
+  if constexpr (KF != 0) {
+    tile_loop<KF, M>(qm, (size_t)nt * 8 * KF + a.spadk[KF], il, b0, nb, lane, xs_l, bscale, a0, a1);
+  } else {
+    switch (K) {
+      case 3: tile_loop<3, M>(qm, (size_t)nt * 24 + a.spadk[3], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+      case 4: tile_loop<4, M>(qm, (size_t)nt * 32 + a.spadk[4], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+      case 5: tile_loop<5, M>(qm, (size_t)nt * 40 + a.spadk[5], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+      default: __builtin_trap();
+    }
+  }
+#pragma unroll
+  for (int r = 0; r < M; ++r) {
+    a0[r] += shx<8>(a0[r]); a0[r] += shx<16>(a0[r]);
+    a1[r] += shx<8>(a1[r]); a1[r] += shx<16>(a1[r]);
+  }
+  const int q = lane & 7;
+  if ((lane >> 3) == 0) {
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      float off = 0.f;
+      for (int bl = 0; bl < nb; ++bl) off += bscale[r][bl] * bsum[r][bl];
+      off *= 1534.0f;
+      float* pp = a.part + (((size_t)gidx * ns + sp) * M + r) * m + (sb * 8 + w) * 16 + 2 * q;
+      pp[0] = a0[r] - off; pp[1] = a1[r] - off;
+    }
+  }
+  if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent"); else __threadfence();
+  __syncthreads();
+  unsigned* cnt = a.counters + (size_t)gidx * MPB + sb;
+  if (threadIdx.x == 0) is_last = (atomicAdd(cnt, 1u) == (unsigned)(ns - 1));
+  __syncthreads();
+  if (!is_last) return;
+  if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); else __threadfence();
+  // ---- epilogue (last WG of this expert's strip-block): sum splits, scale*cb, output H128, sv -> f32 out
+  const int t = threadIdx.x, rl = sbl * 128 + (t & 127), row = sb * 128 + (t & 127);
+  for (int r = 0; r < mr; ++r) {
+    if (t < 128) {
+      float s = 0.f;
+      for (int k = 0; k < ns; ++k) s += __builtin_nontemporal_load(a.part + (((size_t)gidx * ns + k) * M + r) * m + row);
+      ep[t] = s * __half2float(scl[rl]) * a.cb;
+    }
+    __syncthreads();
+    for (int h = 1; h < 128; h <<= 1) {
+      float x0 = 0.f, x1 = 0.f;
+      if (t < 128) { x0 = ep[t]; x1 = ep[t ^ h]; }
+      __syncthreads();
+      if (t < 128) ep[t] = (t & h) ? (x1 - x0) : (x0 + x1);
+      __syncthreads();
+    }
+    if (t < 128) {
+      float o = ep[t] * (1.0f / 11.313708498984761f);
+      if ((svp[rl >> 3] >> (rl & 7)) & 1) o = -o;
+      a.out[((size_t)gidx * M + r) * m + row] = o;
+    }
+    __syncthreads();
+  }
+  if (t == 0) *cnt = 0u;
+  if constexpr (FUSE != 0 && PH == 1) {
+    // all of this WG's a.out rows for strip-block sb are written; publish, then count groups done for sb
+    if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent"); else __threadfence();
+    __syncthreads();
+    if (t == 0) is_last2 = (atomicAdd(a.cnt2 + sb, 1u) == (unsigned)(a.ng[0] - 1));
+    __syncthreads();
+    if (!is_last2) return;
+    if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); else __threadfence();
+    if (t < 128) {
+      const int i = sb * 128 + t;                 // == k_moe_combine column i (MOE_H = 20 strip-blocks x 128)
+      for (int tk = 0; tk < a.T; ++tk) {
+        float s = 0.f;
+        for (int k = 0; k < a.topk; ++k) {
+          const int sl = a.slot[tk * a.topk + k];
+          if (sl >= 0) s += a.wts[tk * a.topk + k] * a.out[(size_t)sl * MOE_H + i];
+        }
+        a.y[(size_t)tk * MOE_H + i] = __float2bfloat16(s);
+      }
+    }
+    if (t == 0) a.cnt2[sb] = 0u;
+  }
+}
+
+// ---------------------------------------------------------------- plan: A = T*topk assignments (<= 256), one WG
+// grp_e[a] = expert if a is the first assignment of that expert, else -1; grp_rows[a, 0..n) = tokens choosing it (assignment order);
+// slot[a'] = owner*M + position for every assignment a' (or -1 for invalid ids).
+__global__ void k_moe_plan(const int* __restrict__ ids, int A, int topk, int M, int* __restrict__ grp_e, int* __restrict__ grp_rows,
+                           int* __restrict__ grp_n, int* __restrict__ slot) {
+  const int a = threadIdx.x;
+  if (a >= A) return;
+  const int e = ids[a];
+  int first = a;
+  if (e >= 0)
+    for (int b = 0; b < a; ++b) if (ids[b] == e) { first = b; break; }
+  if (e < 0) { grp_e[a] = -1; grp_n[a] = 0; slot[a] = -1; return; }
+  if (first != a) { grp_e[a] = -1; grp_n[a] = 0; return; }
+  int c = 0;
+  for (int b = a; b < A; ++b)
+    if (ids[b] == e) {
+      if (c < M) { grp_rows[a * M + c] = b / topk; slot[b] = a * M + c; }
+      ++c;
+    }
+  grp_e[a] = e; grp_n[a] = c < M ? c : M;
+  for (int c2 = c; c2 < M; ++c2) grp_rows[a * M + c2] = 0;
+  if (c > M) __builtin_trap();                     // M bucket must cover tokens per expert (host guarantees M >= T)
+}
+
+
+// E29: k_moe_plan + ng[0] = number of groups (first occurrences of a valid expert). Identical grp_e/grp_rows/grp_n/slot.
+__global__ void k_moe_plan2(const int* __restrict__ ids, int A, int topk, int M, int* __restrict__ grp_e, int* __restrict__ grp_rows,
+                            int* __restrict__ grp_n, int* __restrict__ slot, int* __restrict__ ng) {
+  __shared__ int s_ng;
+  const int a = threadIdx.x;
+  if (a == 0) s_ng = 0;
+  __syncthreads();
+  if (a < A) {
+    const int e = ids[a];
+    int first = a;
+    if (e >= 0)
+      for (int b = 0; b < a; ++b) if (ids[b] == e) { first = b; break; }
+    if (e < 0) { grp_e[a] = -1; grp_n[a] = 0; slot[a] = -1; }
+    else if (first != a) { grp_e[a] = -1; grp_n[a] = 0; }
+    else {
+      int c = 0;
+      for (int b = a; b < A; ++b)
+        if (ids[b] == e) {
+          if (c < M) { grp_rows[a * M + c] = b / topk; slot[b] = a * M + c; }
+          ++c;
+        }
+      grp_e[a] = e; grp_n[a] = c < M ? c : M;
+      for (int c2 = c; c2 < M; ++c2) grp_rows[a * M + c2] = 0;
+      if (c > M) __builtin_trap();
+      atomicAdd(&s_ng, 1);
+    }
+  }
+  __syncthreads();
+  if (a == 0) ng[0] = s_ng;
+}
+
+// y[t, i] = sum_s w[t, s] * dn[slot[t*topk+s], i]   (fixed slot order)
+__global__ __launch_bounds__(256) void k_moe_combine(const float* __restrict__ dn, const int* __restrict__ slot,
+                                                     const float* __restrict__ wts, int topk, __nv_bfloat16* __restrict__ y) {
+  const int tk = blockIdx.x;
+  for (int i = threadIdx.x; i < MOE_H; i += 256) {
+    float s = 0.f;
+    for (int k = 0; k < topk; ++k) {
+      const int sl = slot[tk * topk + k];
+      if (sl >= 0) s += wts[tk * topk + k] * dn[(size_t)sl * MOE_H + i];
+    }
+    y[(size_t)tk * MOE_H + i] = __float2bfloat16(s);
+  }
+}
+
+// ================================================================ host
+template <int KF, int M, int PH>
+static void launch_moe(dim3 grid, cudaStream_t st, MoeArgs a) {
+  if constexpr (PH == 1) {
+    if (a.y != nullptr) { k_e82_moe<KF, M, PH, 1><<<grid, 256, 0, st>>>(a); return; }
+  }
+  k_e82_moe<KF, M, PH><<<grid, 256, 0, st>>>(a);
+}
+template <int KF, int PH>
+static void moe_dispatch_m(int M, dim3 grid, cudaStream_t st, MoeArgs a) {
+  switch (M) {
+    case 1: launch_moe<KF, 1, PH>(grid, st, a); break;
+    case 2: launch_moe<KF, 2, PH>(grid, st, a); break;
+    case 4: launch_moe<KF, 4, PH>(grid, st, a); break;
+    case 8: launch_moe<KF, 8, PH>(grid, st, a); break;
+    default: TORCH_CHECK(false, "M bucket must be 1/2/4/8");
+  }
+}
+template <int PH>
+static void moe_dispatch(int kf, int M, dim3 grid, cudaStream_t st, MoeArgs a) {
+  switch (kf) {
+    case 0: moe_dispatch_m<0, PH>(M, grid, st, a); break;
+    case 3: moe_dispatch_m<3, PH>(M, grid, st, a); break;
+    case 4: moe_dispatch_m<4, PH>(M, grid, st, a); break;
+    case 5: moe_dispatch_m<5, PH>(M, grid, st, a); break;
+    default: TORCH_CHECK(false, "kf must be 0/3/4/5");
+  }
+}
+
+std::vector<torch::Tensor> moe_plan(torch::Tensor ids, int64_t M) {
+  TORCH_CHECK(ids.dim() == 2 && ids.scalar_type() == torch::kInt32 && ids.is_contiguous() && ids.is_cuda());
+  const int T = ids.size(0), topk = ids.size(1), A = T * topk;
+  TORCH_CHECK(A <= 256 && M >= T && (M == 1 || M == 2 || M == 4 || M == 8));
+  auto o = ids.options();
+  auto grp_e = torch::empty({A}, o), grp_rows = torch::empty({A, M}, o), grp_n = torch::empty({A}, o), slot = torch::empty({A}, o);
+  k_moe_plan<<<1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(ids.data_ptr<int>(), A, topk, (int)M, grp_e.data_ptr<int>(),
+      grp_rows.data_ptr<int>(), grp_n.data_ptr<int>(), slot.data_ptr<int>());
+  return {grp_e, grp_rows, grp_n, slot};
+}
+
+// phase 0: x bf16 [T, 2560] -> out [A, M, 1280]; phase 1: gu f32 [A, M, 1280] -> out [A, M, 2560]. part/out/counters preallocated.
+void moe_gemv(int64_t phase, int64_t kf, int64_t M, torch::Tensor qw, torch::Tensor qoff, torch::Tensor kexp, torch::Tensor scales,
+              torch::Tensor su, torch::Tensor sv, torch::Tensor grp_e, torch::Tensor grp_rows, torch::Tensor grp_n,
+              torch::Tensor xin, torch::Tensor part, torch::Tensor counters, torch::Tensor out, int64_t bps, double cb,
+              int64_t spad3, int64_t spad4, int64_t spad5, int64_t fence_ra) {
+  const int A = grp_e.size(0);
+  const int m = phase == 0 ? 2 * MOE_I : MOE_H, n = phase == 0 ? MOE_H : MOE_I, nbt = n / 128;
+  TORCH_CHECK(bps >= 1 && bps <= MOE_MAXB);
+  const int ns = (nbt + bps - 1) / bps;
+  TORCH_CHECK(part.numel() >= (int64_t)A * ns * M * m && out.numel() >= (int64_t)A * M * m && counters.numel() >= A * (m / 128));
+  TORCH_CHECK(qw.scalar_type() == torch::kInt32 && qoff.scalar_type() == torch::kInt64 && kexp.scalar_type() == torch::kInt32);
+  MoeArgs a;
+  a.qw = reinterpret_cast<const uint32_t*>(qw.data_ptr<int32_t>()); a.qoff = qoff.data_ptr<int64_t>(); a.kexp = kexp.data_ptr<int>();
+  a.scales = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()); a.su = su.data_ptr<uint8_t>(); a.sv = sv.data_ptr<uint8_t>();
+  a.grp_e = grp_e.data_ptr<int>(); a.grp_rows = grp_rows.data_ptr<int>(); a.grp_n = grp_n.data_ptr<int>();
+  a.x = phase == 0 ? reinterpret_cast<const __nv_bfloat16*>(xin.data_ptr<at::BFloat16>()) : nullptr;
+  a.gu = phase == 1 ? xin.data_ptr<float>() : nullptr;
+  a.part = part.data_ptr<float>(); a.counters = reinterpret_cast<unsigned*>(counters.data_ptr<int32_t>()); a.out = out.data_ptr<float>();
+  a.bps = (int)bps; a.ns = ns; a.cb = (float)cb;
+  TORCH_CHECK(spad3 >= 0 && spad4 >= 0 && spad5 >= 0 && spad3 % 4 == 0 && spad4 % 4 == 0 && spad5 % 4 == 0);
+  for (int k = 0; k < 6; ++k) a.spadk[k] = 0;
+  a.spadk[3] = (int)spad3; a.spadk[4] = (int)spad4; a.spadk[5] = (int)spad5; a.fence_ra = fence_ra ? 1 : 0;
+  a.slot = nullptr; a.wts = nullptr; a.ng = nullptr; a.cnt2 = nullptr; a.y = nullptr; a.T = 0; a.topk = 0;
+  dim3 grid(m / 128, ns, A);
+  auto st = at::cuda::getCurrentCUDAStream();
+  if (phase == 0) moe_dispatch<0>((int)kf, (int)M, grid, st, a); else moe_dispatch<1>((int)kf, (int)M, grid, st, a);
+}
+
+torch::Tensor moe_combine(torch::Tensor dn, torch::Tensor slot, torch::Tensor wts) {
+  TORCH_CHECK(wts.dim() == 2 && wts.scalar_type() == torch::kFloat32 && wts.is_contiguous());
+  const int T = wts.size(0), topk = wts.size(1);
+  auto y = torch::empty({T, MOE_H}, dn.options().dtype(torch::kBFloat16));
+  k_moe_combine<<<T, 256, 0, at::cuda::getCurrentCUDAStream()>>>(dn.data_ptr<float>(), slot.data_ptr<int>(), wts.data_ptr<float>(), topk,
+      reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>()));
+  return y;
+}
+
+
+// E29: phase-1 down GEMV with the combine fused into the last-arriver epilogue; returns y bf16 [T, 2560].
+std::vector<torch::Tensor> moe_plan2(torch::Tensor ids, int64_t M) {
+  TORCH_CHECK(ids.dim() == 2 && ids.scalar_type() == torch::kInt32 && ids.is_contiguous() && ids.is_cuda());
+  const int T = ids.size(0), topk = ids.size(1), A = T * topk;
+  TORCH_CHECK(A <= 256 && M >= T && (M == 1 || M == 2 || M == 4 || M == 8));
+  auto o = ids.options();
+  auto grp_e = torch::empty({A}, o), grp_rows = torch::empty({A, M}, o), grp_n = torch::empty({A}, o), slot = torch::empty({A}, o);
+  auto ng = torch::empty({1}, o);
+  k_moe_plan2<<<1, 256, 0, at::cuda::getCurrentCUDAStream()>>>(ids.data_ptr<int>(), A, topk, (int)M, grp_e.data_ptr<int>(),
+      grp_rows.data_ptr<int>(), grp_n.data_ptr<int>(), slot.data_ptr<int>(), ng.data_ptr<int>());
+  return {grp_e, grp_rows, grp_n, slot, ng};
+}
+
+torch::Tensor moe_gemv_dn_fused(int64_t kf, int64_t M, torch::Tensor qw, torch::Tensor qoff, torch::Tensor kexp, torch::Tensor scales,
+                                torch::Tensor su, torch::Tensor sv, torch::Tensor grp_e, torch::Tensor grp_rows, torch::Tensor grp_n,
+                                torch::Tensor gu, torch::Tensor part, torch::Tensor counters, torch::Tensor dn, int64_t bps, double cb,
+                                int64_t spad3, int64_t spad4, int64_t spad5, int64_t fence_ra, torch::Tensor slot, torch::Tensor wts,
+                                torch::Tensor ng, torch::Tensor cnt2) {
+  const int A = grp_e.size(0);
+  const int m = MOE_H, n = MOE_I, nbt = n / 128;
+  TORCH_CHECK(bps >= 1 && bps <= MOE_MAXB);
+  const int ns = (nbt + bps - 1) / bps;
+  TORCH_CHECK(part.numel() >= (int64_t)A * ns * M * m && dn.numel() >= (int64_t)A * M * m && counters.numel() >= A * (m / 128));
+  TORCH_CHECK(wts.dim() == 2 && wts.scalar_type() == torch::kFloat32 && wts.is_contiguous() && slot.numel() == wts.numel());
+  TORCH_CHECK(cnt2.numel() >= m / 128 && cnt2.scalar_type() == torch::kInt32 && ng.numel() == 1);
+  const int T = wts.size(0), topk = wts.size(1);
+  auto y = torch::empty({T, MOE_H}, dn.options().dtype(torch::kBFloat16));
+  MoeArgs a;
+  a.qw = reinterpret_cast<const uint32_t*>(qw.data_ptr<int32_t>()); a.qoff = qoff.data_ptr<int64_t>(); a.kexp = kexp.data_ptr<int>();
+  a.scales = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>()); a.su = su.data_ptr<uint8_t>(); a.sv = sv.data_ptr<uint8_t>();
+  a.grp_e = grp_e.data_ptr<int>(); a.grp_rows = grp_rows.data_ptr<int>(); a.grp_n = grp_n.data_ptr<int>();
+  a.x = nullptr; a.gu = gu.data_ptr<float>();
+  a.part = part.data_ptr<float>(); a.counters = reinterpret_cast<unsigned*>(counters.data_ptr<int32_t>()); a.out = dn.data_ptr<float>();
+  a.bps = (int)bps; a.ns = ns; a.cb = (float)cb;
+  for (int k = 0; k < 6; ++k) a.spadk[k] = 0;
+  a.spadk[3] = (int)spad3; a.spadk[4] = (int)spad4; a.spadk[5] = (int)spad5; a.fence_ra = fence_ra ? 1 : 0;
+  a.slot = slot.data_ptr<int>(); a.wts = wts.data_ptr<float>(); a.ng = ng.data_ptr<int>();
+  a.cnt2 = reinterpret_cast<unsigned*>(cnt2.data_ptr<int32_t>()); a.y = reinterpret_cast<__nv_bfloat16*>(y.data_ptr<at::BFloat16>());
+  a.T = T; a.topk = topk;
+  dim3 grid(m / 128, ns, A);
+  moe_dispatch<1>((int)kf, (int)M, grid, at::cuda::getCurrentCUDAStream(), a);
+  return y;
+}

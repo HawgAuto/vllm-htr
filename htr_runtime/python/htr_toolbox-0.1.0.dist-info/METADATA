@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: htr-toolbox
+Version: 0.1.0
+Summary: HTR-W1 vLLM quantization plugin (E10 campaign, path-installed via PYTHONPATH; no sitecustomize)

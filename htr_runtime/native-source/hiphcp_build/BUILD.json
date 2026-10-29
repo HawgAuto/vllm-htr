@@ -1,0 +1,12 @@
+{
+  "variant": "v2-meta",
+  "src_sha": "30eec8076786cf0eeb3122d2f92defe4f38d0d8011f5756a3454219ba6c4f7a4",
+  "so": "hiphcp.so",
+  "so_sha": "125e3deeaa6e5e8a3860a4318224e48f237dc08a2d5597e5195b50593e6e60fe",
+  "extra_cuda_cflags": [
+    "-O3",
+    "--offload-arch=gfx1151",
+    "-ffp-contract=off",
+    "-Rpass-analysis=kernel-resource-usage"
+  ]
+}
