@@ -54,8 +54,32 @@ def validate(root):
         for relative in [row['recipe'], *row['sources']]:
             if relative not in manifest['files']:
                 raise ValueError(f'unbound build input: {relative}')
+    for row in manifest.get('hsaco', []):
+        output = member(root, row['output'])
+        if output in outputs or output.suffix != '.hsaco' or row['source'] not in manifest['files']:
+            raise ValueError('invalid hsaco build row: ' + row['name'])
+        outputs.add(output)
     check_files(root, manifest['files'])
     return manifest
+
+
+def build_hsaco(root, work, row):
+    """Code-object kernels loaded at run time by hash. The exact command is part of the contract (hipcc emits a
+    different code object without -save-temps), so the output must equal the qualified binary."""
+    work.mkdir()
+    source = member(root, row['source'])
+    # hipcc derives the code object's compilation-unit id from the source path as given, so compile a local copy
+    # by its bare file name (the qualified binary was built that way).
+    shutil.copyfile(source, work / source.name)
+    out = work / (row['name'] + '.hsaco')
+    subprocess.run([*row['command'], source.name, '-o', out.name], cwd=work, check=True)
+    got = digest(out)
+    if got != row['required_sha256']:
+        raise ValueError(f"{row['name']}: built {got}, qualified {row['required_sha256']}")
+    dest = member(root, row['output'])
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(out, dest)
+    return dest
 
 
 def main():
@@ -67,6 +91,7 @@ def main():
     manifest = validate(ROOT)
     if args.check:
         print(json.dumps({'validated_modules': len(manifest['modules']),
+                          'validated_hsaco': len(manifest.get('hsaco', [])),
                           'bound_files': len(manifest['files'])}))
         return
     if args.jobs < 1:
@@ -86,6 +111,10 @@ def main():
         dest = member(ROOT, row['output'])
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, dest)
+        receipt['outputs'][row['output']] = {'sha256': digest(dest), 'bytes': dest.stat().st_size}
+    for row in manifest.get('hsaco', []):
+        print('BUILD_HSACO ' + row['name'], flush=True)
+        dest = build_hsaco(ROOT, args.work / row['name'], row)
         receipt['outputs'][row['output']] = {'sha256': digest(dest), 'bytes': dest.stat().st_size}
     # Do not permit source mutation during a build to silently rebind provenance.
     check_files(ROOT, manifest['files'])

@@ -1,2 +1,0 @@
-[vllm.general_plugins]
-e94_geometry = e94_geometry:register

@@ -12,6 +12,7 @@ COPY haloloom/qwen38/validate.py /opt/haloloom/qwen38/validate.py
 COPY vllm/models/qwen4_exp/amd/model.py /opt/venv/lib/python3.14/site-packages/vllm/models/qwen4_exp/amd/model.py
 COPY vllm/models/qwen4_exp/amd/ple_layer.py /opt/venv/lib/python3.14/site-packages/vllm/models/qwen4_exp/amd/ple_layer.py
 COPY vllm/models/qwen4_exp/amd/model_state.py /opt/venv/lib/python3.14/site-packages/vllm/models/qwen4_exp/amd/model_state.py
+COPY vllm/models/qwen4_exp/amd/qsa.py /opt/venv/lib/python3.14/site-packages/vllm/models/qwen4_exp/amd/qsa.py
 RUN /opt/venv/bin/python3 /opt/vllm-htr/install_layer.py
 ENV PYTHONPATH=/opt/vllm-htr/python PYTHONDONTWRITEBYTECODE=1 HTR_NATIVE_DIR=/opt/vllm-htr/native-bin
 USER 1000:1000

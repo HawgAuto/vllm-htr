@@ -250,3 +250,5 @@ def install():
 def register():
     """vllm.general_plugins entry point (vllm_site/htr_moe_serve-0.1.0.dist-info). Never import from sitecustomize."""
     install()
+    from . import partition4
+    partition4.register()

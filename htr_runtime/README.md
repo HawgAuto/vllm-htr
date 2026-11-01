@@ -1,6 +1,6 @@
 # vLLM HTR runtime
 
-This is the serving runtime for [Qwen3.8-Flash-Next-HTR](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR), based on the image-bound vLLM fork at `322c106f3409df1eeb29d2c14434b389b36c2b43`. It integrates HTR dense and routed-expert operators, GPTQ8 hyper-connection kernels, SSD-backed PLE reads, and the selected QSA1600/MTP3 configuration.
+This is the serving runtime for [Qwen3.8-Flash-Next-HTR](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR), based on the image-bound vLLM fork at `322c106f3409df1eeb29d2c14434b389b36c2b43`. It integrates HTR dense and routed-expert operators, GPTQ8 hyper-connection kernels, SSD-backed PLE reads, the TAU v2 QSA attention kernel, and the serving launcher.
 
 The separate [HTR project](https://github.com/HawgAuto/HTR) documents the quantizer and format. This repository supplies their model-serving integration; it does not replace the upstream vLLM project.
 
@@ -12,7 +12,7 @@ From the repository root:
 docker build --pull=false -f htr_runtime/Dockerfile -t vllm-htr:local .
 ```
 
-The Dockerfile pins the existing ROCm/PyTorch/vLLM base by digest, compiles all eleven HTR/native extensions from the included source, and installs the Python runtime. The build needs no GPU. It does not compile against host ROCm or copy private prebuilt libraries from the checkout. `NATIVE-BUILD.json` binds the selected source and Ninja recipes by SHA-256. Recipes retain the accepted math flags: HIPHC decode uses `-ffp-contract=fast`, while HIPHCP prefill uses `-ffp-contract=off`. Native compiler work products remain in the build stage, not the serving image.
+The Dockerfile pins the existing ROCm/PyTorch/vLLM base by digest, compiles all eleven HTR/native extensions and the TAU v2 QSA code object from the included source, and installs the Python runtime. The build needs no GPU. It does not compile against host ROCm or copy private prebuilt libraries from the checkout. `NATIVE-BUILD.json` binds the selected source and Ninja recipes by SHA-256. Recipes retain the accepted math flags: HIPHC decode uses `-ffp-contract=fast`, while HIPHCP prefill uses `-ffp-contract=off`. The TAU v2 code object is built with the exact command recorded in `NATIVE-BUILD.json` and the build fails unless it matches the qualified binary hash. Native compiler work products remain in the build stage, not the serving image.
 
 The generated image includes `native-build-receipt.json` and `installed-files.json`. The launcher checks the installed runtime and native-checkpoint metadata before starting vLLM. Those checks detect drift; they are not signatures against a malicious image publisher.
 
@@ -51,17 +51,45 @@ docker run --rm --network none --pull=never \
 
 The API implements the OpenAI-compatible endpoints under `/v1`, with model name `qwen38-htr`. The host port is loopback-only; add an authenticated reverse proxy before any external exposure. The launcher's container bind defaults to `0.0.0.0`; `--host`, `--port`, and `--served-model-name` are supported overrides.
 
-## Selected profile
+## Serving profile and levers
 
-- QSA1600 with probabilistic MTP, three draft tokens.
+Defaults (the release profile):
+
+- MTP speculative decoding with three probabilistic draft tokens.
 - Thinking enabled, with the Qwen3 reasoning parser.
 - Temperature 0.7, top-p 0.8, top-k 20; neutral penalties. These are the selected release settings, not a claim about vendor defaults.
-- Configured context: 262,144 tokens; fixed KV budget: 8 GiB; one sequence; maximum batched tokens: 12,288.
+- Context 262,144 tokens; BF16 KV pool 8 GiB; one sequence; maximum batched tokens 12,288.
 - Prefix caching and `align` Mamba state caching retained.
 - `FULL_AND_PIECEWISE` graph mode; capture sizes 1–5. No eager-mode substitute.
-- Dedicated writable cache namespace, `htr-qsa1600-v1`. No predecessor compile cache is silently reused. First startup includes compilation/autotuning and can be substantially slower than warm startup.
 
-The configured context ceiling is not evidence of a completed 262K-token quality or capacity test. QSA1600 is an approximate sparse-attention policy; it must not be represented as numerically identical to full attention. Short delivery checks are not new quality rankings or throughput benchmarks.
+Levers (launcher flags after the image name):
+
+| Flag | Default | Notes |
+|---|---|---|
+| `--mtp {0,3}` | 3 | 0 disables speculative decoding |
+| `--max-num-seqs N` | 1 | up to 4 with MTP3, up to 32 with MTP0 |
+| `--context N` | 262144 | up to 1,048,576; above 262,144 static YaRN is applied |
+| `--yarn-factor F` | auto | 2 up to 524,288, otherwise 4 |
+| `--kv-cache-gib G` | 8 | BF16 KV pool size |
+| `--max-num-batched-tokens N` | 12288 | prefill chunk and scheduler budget |
+| `--cudagraph-sizes a,b,...` | from seqs/MTP | decode graph capture sizes |
+| `--no-prefix-caching` | off | |
+
+`--print-command` shows the exact vLLM command, the cache profile and the levers without starting anything.
+
+## Quick load
+
+Each distinct set of compile-relevant levers (everything above except the KV pool size, host and port) gets its own compile/autotune cache under `/workspace/cache/<profile>`. The first start with a new lever set compiles graphs and tunes kernels; later starts with the same levers load that cache. To do the first start ahead of time, add `--build-seed`: the launcher starts the server, sends warm-up requests across prefill lengths (64 tokens to 32K), stops the server, and writes `<cache>/SEED.json`. Keep `/workspace` on a persistent volume and reuse it.
+
+## Runtime features
+
+- Dense HTR linears: fused GEMV for decode; for prefill each weight is dequantized to BF16 per call and multiplied with the vendor GEMM. No persistent BF16 weight copy is kept.
+- QSA sparse attention (`htr_qsa`): the release split-K Triton kernel, or the native TAU v2 kernel for prefills with more than 256 rows. TAU v2 is bitwise equal to split-K; the first admitted calls of every process are re-run through split-K and must match bit for bit (`HTR_QSA_TAU=0` disables it).
+- Autotune pin (`HTR_AUTOTUNE_PIN`): fixed Triton configs for the FLA prefill kernels and Inductor deterministic mode, so independent processes run the same kernels.
+- MoE partition4 (`HTR_MOE_PARTITION4`): 5–47-token MoE steps run on 4-row partitions with a parity-preserving plan; arithmetic unchanged.
+- Routed-expert HPF3 prefill, fused decode combine, GPTQ8 hyper-connection kernels, device-side PLE gather, MTP draft filtering.
+
+QSA attention follows the model's own top-k sparse selection; it is not full attention.
 
 ## Model packaging
 

@@ -5,7 +5,6 @@
 from collections.abc import Iterable
 from itertools import islice
 
-import e82_graphproof
 import torch
 from torch import nn
 

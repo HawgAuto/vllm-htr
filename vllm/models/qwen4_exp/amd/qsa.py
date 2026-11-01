@@ -169,8 +169,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
 
         num_tokens = attn_metadata.num_actual_tokens
         if _GL_OUT_TAIL:
-            # rows [:num_tokens] are fully written by the union path (NaN-poison selfchecked in the adapter) and zeroed
-            # by the adapter before any native fallback; only the tail keeps the zero-init semantics here.
+            # rows [:num_tokens] are zeroed by htr_qsa.attention(zero_fallback=True) before the kernel runs;
+            # only the tail keeps the zero-init here.
             output[num_tokens:].zero_()
         else:
             output.zero_()
@@ -188,16 +188,9 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if key_cache.dtype != torch.bfloat16 or query.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA requires BF16 Q/K/V")
 
-        from direct_qsa_union_adapter_v1 import qsa_native_unique_paged_attention
+        from htr_qsa import attention as htr_qsa_attention
 
-        indexer = getattr(layer, "indexer", None)
-        qualified_unique = (
-            isinstance(indexer, QSAIndexer)
-            and indexer.compress_ratio == 4
-            and indexer.token_topk == 2048
-            and not indexer.skip_topk
-        )
-        qsa_native_unique_paged_attention(
+        htr_qsa_attention(
             query[:num_tokens],
             key_cache,
             value_cache,
@@ -205,10 +198,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             attn_metadata.block_table,
             token_to_req,
             output[:num_tokens],
-            qualified_unique=qualified_unique,
             zero_fallback=_GL_OUT_TAIL,
-            context_len=(attn_metadata.max_seq_len
-                         if isinstance(getattr(attn_metadata, "max_seq_len", None), int) else None),
         )
         return output
 
@@ -512,26 +502,18 @@ def qwen4_exp_qsa_with_output(
             output,
         )
         return
-    # nb2-gatefuse-v1: this op owns the QSA output gate. The native union path may gate rows [0:n] in its epilogue
-    # (qsa_native_v3k_gate, exhaustively proven equal to inductor's mul_sigmoid); every other row/path gets the
-    # verbatim inductor-body Triton kernel in place. Exactly one application per element.
-    import direct_qsa_union_kernel_v1 as _uk
-    ctx = _uk.gf_begin(output, gate)
-    try:
-        layer._run_qsa(
-            hidden_states,
-            positions,
-            query,
-            key,
-            value,
-            output,
-        )
-    finally:
-        n = _uk.gf_end(ctx)
-    if n == 0:
-        _uk.gf_apply_(output, gate)
-    elif output.shape[0] > n:
-        _uk.gf_apply_(output[n:], gate[n:])
+    # nb2-gatefuse-v1: this op owns the QSA output gate, applied once per element after attention with the
+    # verbatim inductor-body Triton kernel (htr_qsa.gate_apply_).
+    from htr_qsa import gate_apply_
+    layer._run_qsa(
+        hidden_states,
+        positions,
+        query,
+        key,
+        value,
+        output,
+    )
+    gate_apply_(output, gate)
 
 
 direct_register_custom_op(

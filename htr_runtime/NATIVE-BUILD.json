@@ -138,6 +138,22 @@
     "native-source/hiphcp_build/hiphcp.hip": "ce1c088477d784fa17d9573b8e8455eeb8d4b60f0fe1dc7c516784f0ed89321d",
     "native-recipes/hiphcp.ninja.in": "669dff3c9dfddb6fae44077b7400aa6dadcc1605f55b6cbf6104b230744cb197",
     "native-recipes/ple_gather_v2.ninja.in": "a689fe3c1f753eed5304c726b87aa7aa5bf9025091b4e6e0913b70733d045533",
-    "native-source/ple-gather/ple_gather_v2.c": "e148fc97e8326b14ce57fe480f95a1f39c483493118efed5ca53c8a048c6e869"
-  }
+    "native-source/ple-gather/ple_gather_v2.c": "e148fc97e8326b14ce57fe480f95a1f39c483493118efed5ca53c8a048c6e869",
+    "native-source/qsa_tau/qsa_tau_v2.hip": "581bee354a25c61c7e1167c1e18dba9757d457ffacacadfb3433086ea0315e9c"
+  },
+  "hsaco": [
+    {
+      "name": "qsa_tau_v2",
+      "source": "native-source/qsa_tau/qsa_tau_v2.hip",
+      "output": "native-bin/qsa_tau_v2.hsaco",
+      "command": [
+        "/opt/rocm/bin/hipcc",
+        "--genco",
+        "-O3",
+        "--offload-arch=gfx1151",
+        "-save-temps"
+      ],
+      "required_sha256": "e5a845c8407cd2ed78560e7b9f83ba5c202a11749914618ded862aab056a355c"
+    }
+  ]
 }

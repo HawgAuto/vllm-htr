@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+htr_autotune_pin = htr_autotune_pin:register

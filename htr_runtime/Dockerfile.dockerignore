@@ -12,6 +12,7 @@
 !vllm/models/qwen4_exp/amd/model.py
 !vllm/models/qwen4_exp/amd/ple_layer.py
 !vllm/models/qwen4_exp/amd/model_state.py
+!vllm/models/qwen4_exp/amd/qsa.py
 **/__pycache__
 **/*.pyc
 **/*.so

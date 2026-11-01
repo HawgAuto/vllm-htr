@@ -62,11 +62,6 @@ EPI8 = os.environ.get("HTR_EPI8", "1") == "1"
 # v4: 8 < M <= GEMV_LOOP_MAX uses the chunked decode GEMV (dev/bench_smallm.json: 3-6x faster than dequant_w+GEMM at M 9-32,
 # break-even ~M 96 on MiMo shapes). 0 disables.
 GEMV_LOOP_MAX = int(os.environ.get("HTR_GEMV_LOOP_MAX", "64"))
-# E36 (2026-10-26): HTR_DQ_CACHE=1 caches the prefill dequantized bf16 weights (process lifetime; ~2 bytes x dense params).
-DQ_CACHE = os.environ.get("HTR_DQ_CACHE", "0") == "1"
-_DQC = {}
-_DQC_BYTES = [0]
-import json  # noqa: E402
 
 
 def _ns_eff(mt, nt, nsplit):
@@ -95,19 +90,9 @@ def _linear_impl(x2, qweight, scales, su, sv, bias):
                                    int(EPI8 and _ns_eff(mt, nt, ns) % 8 == 0)))
         return torch.cat(outs)
     if M > GEMV_MAX_M and PREFILL == "w":
-        if DQ_CACHE:
-            # E36: keep the dequantized original-basis bf16 W per weight (same k_dequant_w output, computed once per process):
-            # bitwise identical GEMM inputs; removes the per-forward dequant of every dense weight (~37 ms per prefill step).
-            key = (qweight.data_ptr(), scales.data_ptr(), su.data_ptr(), sv.data_ptr(), tuple(qweight.shape))
-            W = _DQC.get(key)
-            if W is None:
-                W = E.dequant_w(qweight, scales, CB, su, sv)
-                _DQC[key] = W
-                _DQC_BYTES[0] += W.numel() * W.element_size()
-                if len(_DQC) in (1, 50, 100, 150, 200):
-                    print("HTR_DQ_CACHE " + json.dumps(dict(entries=len(_DQC), bytes=_DQC_BYTES[0])), flush=True)
-        else:
-            W = E.dequant_w(qweight, scales, CB, su, sv)
+        # Prefill: dequantize this weight to BF16 for the duration of the call, then the vendor BF16 GEMM. No
+        # persistent BF16 copy is kept (a process-lifetime cache gave the same tokens but held ~4-6 GiB).
+        W = E.dequant_w(qweight, scales, CB, su, sv)
         if x2.dtype != torch.bfloat16:
             W = W.to(x2.dtype)
         return torch.nn.functional.linear(x2, W, bias)
