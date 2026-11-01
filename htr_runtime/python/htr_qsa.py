@@ -8,7 +8,7 @@ Called by vllm/models/qwen4_exp/amd/qsa.py for every QSA attention call. Two ker
             build_native.py). Bitwise equal to split-K by construction (operator gates: 47/47 single-request,
             26 page-1600 cases, 35/35 multi-request mixed steps) and faster on long prefills. Admitted only for
             gfx1151 BF16 prefills with more than 256 query rows, outside CUDA-graph capture, on the page-1568 KV
-            geometry or the exact page-1600 / 164-page table geometry below.
+            geometry (MTP off) or the page-1600 KV geometry (MTP on) below, at any KV block count / page-table width.
 
 HTR_QSA_TAU=1 (default) enables TAU v2; 0 sends every call to split-K. The first HTR_QSA_TAU_CHECKS admitted calls
 (default 8) and the first HTR_QSA_TAU_MR_CHECKS admitted multi-request calls (default 8) also run split-K into a
@@ -101,16 +101,21 @@ def _module():
 
 
 def page1600_admitted(q, k, v, idx, bt, t2r, out):
-    """Exact page-1600 / 164-page-table geometry (E159 G1F single request 257..8192 rows, G1G multi-request
-    257..12288 rows). Additional to the general TAU guards in admitted()."""
+    """Page-1600 KV geometry (the MTP attention block size: vLLM raises the block to 1600 so the attention page covers
+    the mamba page). Row bounds as qualified (E159 G1F single request 257..8192 rows, G1G multi-request 257..12288
+    rows). The KV block count and page-table width follow the served context / KV budget: the kernel takes both as
+    arguments (as on the page-1568 path) and every call is bounded by the storage check below. Additional to the
+    general TAU guards in admitted(); the bitwise split-K selfchecks apply to page-1600 calls like any other."""
     n = q.shape[0] if q.ndim == 3 else 0
     nreq = bt.shape[0] if bt.ndim == 2 else 0
     hi = 8192 if nreq == 1 else 12288
     if not (q.is_cuda and nreq >= 1 and 257 <= n <= hi and q.shape == (n, 24, 256) and q.stride() == (6144, 256, 1)):
         return False
-    if not (k.shape == v.shape == (195, 1600, 2, 256) and k.stride() == v.stride() == (21964800, 1024, 512, 1)):
+    if not (k.ndim == 4 and k.shape == v.shape and k.shape[0] >= 1 and k.shape[1:] == (1600, 2, 256)
+            and k.stride() == v.stride() and k.stride()[1:] == (1024, 512, 1) and k.stride(0) >= 1600 * 1024):
         return False
-    if not (idx.shape == (n, 2051) and idx.stride() == (2051, 1) and bt.shape == (nreq, 164) and bt.stride() == (164, 1)
+    w = bt.shape[1] if bt.ndim == 2 else 0
+    if not (idx.shape == (n, 2051) and idx.stride() == (2051, 1) and w >= 1 and bt.stride() == (w, 1)
             and t2r.shape == (n,) and t2r.stride() == (1,)):
         return False
     if not (q.dtype == k.dtype == v.dtype == torch.bfloat16 and idx.dtype == bt.dtype == t2r.dtype == torch.int32):

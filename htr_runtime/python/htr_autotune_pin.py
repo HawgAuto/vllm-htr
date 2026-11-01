@@ -9,7 +9,8 @@ kernels:
      processes on gfx1151 (H=48, K=V=128, BT=64), merge = lowest-median 2-stage config.
   2. Inductor deterministic mode (torch._inductor.config.deterministic / TORCHINDUCTOR_DETERMINISTIC): reductions
      compile with one filtered config and are never re-tuned; only numerics-neutral pointwise launch configs may still
-     be benchmarked.
+     be benchmarked. Kept on across Dynamo frames (Dynamo's use_deterministic_algorithms restore would otherwise
+     clear it after the first compiled frame).
 Logs: HTR_AUTOTUNE_PIN_ACTIVE (register), HTR_AUTOTUNE_PIN_APPLIED (first call of each pinned kernel),
 HTR_AUTOTUNE_PIN_BENCH (first Triton-runtime benchmark per kernel anywhere in the process).
 """
@@ -67,8 +68,28 @@ def register():
     if getattr(Autotuner.run, '_htr_pin', False):
         return
     os.environ['TORCHINDUCTOR_DETERMINISTIC'] = '1'
+    import torch
     import torch._inductor.config as ic
     ic.deterministic = True
+    # torch>=2.13: torch.use_deterministic_algorithms(mode) also writes inductor config.deterministic = mode, and
+    # Dynamo restores the eager flag (False) with that call after every traced frame. Without this wrapper Inductor
+    # deterministic mode is silently dropped after the first compiled frame (the model backbone then compiles with
+    # per-process reduction autotuning). The eager flag itself is passed through unchanged.
+    orig_uda = torch.use_deterministic_algorithms
+    if not getattr(orig_uda, '_htr_pin', False):
+        restored = []
+
+        def use_deterministic_algorithms(mode, *, warn_only=False):
+            orig_uda(mode, warn_only=warn_only)
+            if not ic.deterministic:
+                ic.deterministic = True
+                if not restored:
+                    restored.append(True)
+                    _log('HTR_AUTOTUNE_PIN_RESTORE', eager_mode=bool(mode), inductor_deterministic=True)
+
+        use_deterministic_algorithms._htr_pin = True
+        use_deterministic_algorithms.__wrapped__ = orig_uda
+        torch.use_deterministic_algorithms = use_deterministic_algorithms
     orig_run, orig_bench = Autotuner.run, Autotuner._bench
     benched = set()
 
