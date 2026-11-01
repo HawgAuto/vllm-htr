@@ -51,7 +51,7 @@
   "--generation-config",
   "auto",
   "--compilation-config",
-  "{\"cudagraph_capture_sizes\": [1, 2, 3, 4, 5], \"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"max_cudagraph_capture_size\": 5}",
+  "{\"cudagraph_capture_sizes\": [1, 2, 3, 4, 5], \"cudagraph_mode\": \"FULL_AND_PIECEWISE\", \"max_cudagraph_capture_size\": 5, \"inductor_compile_config\": {\"combo_kernels\": false, \"benchmark_combo_kernel\": false}}",
   "--speculative-config",
   "{\"method\": \"mtp\", \"model\": \"/model/draft\", \"num_speculative_tokens\": 3, \"draft_sample_method\": \"probabilistic\"}"
 ]

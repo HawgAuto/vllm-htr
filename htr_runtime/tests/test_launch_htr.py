@@ -41,10 +41,23 @@ class LaunchContract(unittest.TestCase):
                           'draft_sample_method': 'probabilistic'})
         self.assertEqual(json.loads(value(argv, '--compilation-config')),
                          {'cudagraph_capture_sizes': [1, 2, 3, 4, 5], 'cudagraph_mode': 'FULL_AND_PIECEWISE',
-                          'max_cudagraph_capture_size': 5})
+                          'max_cudagraph_capture_size': 5,
+                          'inductor_compile_config': {'combo_kernels': False, 'benchmark_combo_kernel': False}})
         self.assertIn('--enable-prefix-caching', argv)
         self.assertNotIn('--hf-overrides', argv)
         self.assertNotIn('--enforce-eager', argv)
+
+    def test_combo_kernel_benchmark_off_under_deterministic_inductor(self):
+        # htr_autotune_pin keeps Inductor deterministic mode on; torch then bans non-vetted benchmarking, and vLLM's
+        # default inductor_compile_config (combo_kernels + benchmark_combo_kernel) would abort the first compile.
+        # Combo kernels are disabled explicitly (both keys, so vLLM does not inject its defaults); the reference
+        # compiles produced zero combo kernels, so the kernel set is unchanged.
+        m = launcher()
+        for extra in ((), ('--mtp', '0', '--max-num-seqs', '4', '--kv-cache-gib', '6', '--context', '196608')):
+            args, argv = build(m, *extra)
+            ic = json.loads(value(argv, '--compilation-config'))['inductor_compile_config']
+            self.assertIs(ic['combo_kernels'], False)
+            self.assertIs(ic['benchmark_combo_kernel'], False)
 
     def test_levers(self):
         m = launcher()
