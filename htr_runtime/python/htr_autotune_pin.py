@@ -66,6 +66,8 @@ def register():
         raise RuntimeError('HTR_AUTOTUNE_PIN must be 0 or 1')
     import htr_gdn_pin
     htr_gdn_pin.install()
+    import htr_mtp_norm_pin
+    htr_mtp_norm_pin.install()
     from triton.runtime.autotuner import Autotuner
     if getattr(Autotuner.run, '_htr_pin', False):
         return

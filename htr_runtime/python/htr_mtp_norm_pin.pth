@@ -1,0 +1,1 @@
+import htr_mtp_norm_pin; htr_mtp_norm_pin.install()
