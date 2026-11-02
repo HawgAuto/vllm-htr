@@ -112,8 +112,8 @@ def profile(args):
     runtime = hashlib.sha256((ROOT / 'runtime-env.json').read_bytes() + (ROOT / 'server-argv.json').read_bytes())
     # Old images/seeds must not bypass a changed numerical or launcher policy.
     members = [ROOT / 'VERSION', ROOT / 'NATIVE-BUILD.json', ROOT / 'launch_htr.py',
-               *sorted((ROOT / 'python').glob('*.py')),
-               *sorted((ROOT / 'python').glob('*.pth'))]
+               *sorted((ROOT / 'python').rglob('*.py')),
+               *sorted((ROOT / 'python').rglob('*.pth'))]
     for member in members:
         if member.is_file():
             runtime.update(str(member.relative_to(ROOT)).encode() + b'\0' + member.read_bytes())

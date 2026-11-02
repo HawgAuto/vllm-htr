@@ -93,11 +93,14 @@ def chunk_route(ar, x, ids32, w32):
     return out
 
 
-def bf16_scratch(dev):
-    b = _BF.get(str(dev))
+def bf16_scratch(dev, *, persistent=True):
+    """Fallbacks may reuse expanded weights; correctness checks must not retain them."""
+    b = _BF.get(str(dev)) if persistent else None
     if b is None:
-        b = _BF[str(dev)] = (torch.empty(A.NE, 2 * A.I, A.H, dtype=torch.bfloat16, device=dev),
-                             torch.empty(A.NE, A.H, A.I, dtype=torch.bfloat16, device=dev))
+        b = (torch.empty(A.NE, 2 * A.I, A.H, dtype=torch.bfloat16, device=dev),
+             torch.empty(A.NE, A.H, A.I, dtype=torch.bfloat16, device=dev))
+        if persistent:
+            _BF[str(dev)] = b
     return b
 
 
@@ -120,9 +123,9 @@ def dequant_layer(ar, w13, w2):
     return w13, w2
 
 
-def dequant_route(ar, x, ids, w):
+def dequant_route(ar, x, ids, w, *, persistent_scratch=True):
     from vllm.model_executor.layers.fused_moe.fused_moe import fused_experts
-    w13, w2 = dequant_layer(ar, *bf16_scratch(x.device))
+    w13, w2 = dequant_layer(ar, *bf16_scratch(x.device, persistent=persistent_scratch))
     valid = ids >= 0
     return fused_experts(x, w13, w2, torch.where(valid, w, torch.zeros_like(w)).to(torch.float32),
                          torch.where(valid, ids, torch.zeros_like(ids)), global_num_experts=A.NE)

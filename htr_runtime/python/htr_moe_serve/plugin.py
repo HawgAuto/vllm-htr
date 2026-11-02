@@ -126,19 +126,28 @@ def _method_class():
             key = route
             if key in self._checked or torch.cuda.is_current_stream_capturing():
                 return
-            self._checked.add(key)
             if route == 'v2':      # v2 must be checked on >= V2_MIN rows (R.forward on <= 8 rows would take the decode route)
                 n = min(x.shape[0], 1024)
                 a = R.v2_route(self.ar, x[:n].contiguous(), ids[:n], w[:n]).float()
             else:
                 n = min(x.shape[0], R.MAXT)
                 a = R.forward(self.ar, x[:n].contiguous(), ids[:n], w[:n]).float()
-            b = R.dequant_route(self.ar, x[:n].contiguous(), ids[:n], w[:n]).float()
-            rel = float((a - b).norm() / b.norm().clamp_min(1e-30))
-            ok = bool(torch.isfinite(a).all()) and rel <= 3e-2
-            _log('HTR_MOE_SELFCHECK', L=self.L, route=route, rows=n, rel=rel, ok=ok)
-            if not ok:
-                raise RuntimeError(f'HTR MoE selfcheck L{self.L} {route}: rel {rel}')
+            try:
+                b = R.dequant_route(self.ar, x[:n].contiguous(), ids[:n], w[:n], persistent_scratch=False).float()
+                rel = float((a - b).norm() / b.norm().clamp_min(1e-30))
+                ok = bool(torch.isfinite(a).all()) and rel <= 3e-2
+                _log('HTR_MOE_SELFCHECK', L=self.L, route=route, rows=n, rel=rel, ok=ok,
+                     reference_scratch='temporary')
+                if not ok:
+                    raise RuntimeError(f'HTR MoE selfcheck L{self.L} {route}: rel {rel}')
+                self._checked.add(key)
+            finally:
+                # No graph capture reaches this block. The reference tensors have no
+                # global owner; return their inactive blocks to ROCm as well, rather
+                # than leaving 4.6875 GiB reserved by the caching allocator. Live
+                # fallback/graph allocations are untouched by empty_cache().
+                with torch.cuda.device(x.device):
+                    torch.cuda.empty_cache()
 
         def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
             if x.device.type != 'cuda':
