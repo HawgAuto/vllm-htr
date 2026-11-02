@@ -14,7 +14,7 @@ This names the existing working, qualified HTR runtime and complete model checkp
 
 ### Access and limitations
 
-The runtime source and complete model checkpoint are public. The prebuilt GHCR image currently requires authorized package access; that distribution restriction is separate from the working source release. See [source-build instructions](htr_runtime/README.md) and the [model running guide](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR/blob/v0.1.0/docs/RUNNING.md).
+The runtime source, complete model checkpoint and prebuilt GHCR image are public. The image can be pulled anonymously without a GitHub account, token or `docker login`. The visibility change preserves the tested image digest, runtime code, checkpoint and release tags. See the maintained [image/source-build instructions](htr_runtime/README.md) and [model running guide](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR/blob/main/docs/RUNNING.md); immutable release-tag snapshots retain their original documentation.
 
 QSA1600 is approximate sparse attention. The configured 262,144-token ceiling is not a completed maximum-context test. Final-composite quality and image/video execution are not qualified. No precompiled quick-load seed is shipped in v0.1.0. Historical performance tables remain labeled with their original runtime/configuration.
 
