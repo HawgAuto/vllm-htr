@@ -1,6 +1,11 @@
 <!-- markdownlint-disable MD001 MD041 -->
 # vLLM HTR
 
+**Current release: v0.1.0 — the initial working HTR runtime release.**
+[Release notes](https://github.com/HawgAuto/vllm-htr/releases/tag/htr-v0.1.0) · [Release history and update roadmap](RELEASES.md)
+
+The existing qualified runtime is v0.1.0. The serving work currently underway is the first update, v0.2.0; FP8 KV and the other deferred work are planned for the second update, v0.3.0. Neither update is included in v0.1.0.
+
 A gfx1151/Strix Halo serving fork for Qwen3.8 HTR, integrating HTR kernels, GPTQ8 hyper-connections, SSD-backed PLE, and the QSA1600/MTP3 release profile.
 
 [Build and run vLLM HTR](htr_runtime/README.md) · [Model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [HTR format and quantizer](https://github.com/HawgAuto/HTR)

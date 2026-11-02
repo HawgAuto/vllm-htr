@@ -1,5 +1,7 @@
 # vLLM HTR runtime
 
+**HTR release v0.1.0 — initial working runtime.** [Release notes and exact source/image pins](https://github.com/HawgAuto/vllm-htr/releases/tag/htr-v0.1.0) · [Release history](../RELEASES.md).
+
 This is the serving runtime for [Qwen3.8-Flash-Next-HTR](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR), based on the image-bound vLLM fork at `322c106f3409df1eeb29d2c14434b389b36c2b43`. It integrates HTR dense and routed-expert operators, GPTQ8 hyper-connection kernels, SSD-backed PLE reads, and the selected QSA1600/MTP3 configuration.
 
 The separate [HTR project](https://github.com/HawgAuto/HTR) documents the quantizer and format. This repository supplies their model-serving integration; it does not replace the upstream vLLM project.
@@ -71,7 +73,7 @@ The target is mixed precision: HTR5 dense projections, HTR4 output/routed-expert
 
 ## Verification status
 
-Source-bound build and CPU checks are separate from physical GPU/model qualification and publication. Local build or import success alone does not establish real serving, performance, or public availability. Final release evidence must identify the tested image and remote source revision; do not treat this source staging README as a completed qualification receipt.
+The existing v0.1.0 runtime has passed final-image text, reasoning, MTP and structured tool-call/result delivery checks; see the [exact-image receipt and its recorded adjudication](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR/blob/v0.1.0/evidence/release-qualification.json). All 63 checkpoint files are complete and hash-verified. The source is public; the prebuilt GHCR package still requires access. Its pinned HaloLoom build base is public, so source builds do not require access to the prebuilt HTR package. These are existing qualification results, not a new speed/quality benchmark or validation of the upcoming v0.2.0 changes. A local rebuild has its own image identity and does not inherit the prebuilt manifest digest.
 
 Run the installed CPU suite without exposing devices:
 
