@@ -8,14 +8,14 @@ The separate [HTR project](https://github.com/HawgAuto/HTR) documents the quanti
 
 ## Get the prebuilt image
 
-The versioned release image is distributed publicly. No GitHub account, token or `docker login` is required. Use the immutable manifest recorded in the version's release notes when a digest pin is needed.
+The versioned release image is distributed publicly. No GitHub account, token or `docker login` is required. The command below pins the tested Linux/amd64 platform manifest. The readable version alias is `ghcr.io/hawgauto/vllm-htr:v0.2.0`.
 
 ```sh
-IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.0
+IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:4c3bbfc5f42dad17c1a3bca2a911502aa0670aff1314e87e11bc900eaff491df
 docker pull "$IMAGE"
 ```
 
-Release tags are immutable. The image includes the native extensions; no host compiler or separate native-library download is needed. Continue to [Run](#run), or build from source instead. The older `v0.1.0` and `qsa1600-release-20261028` tags remain unchanged and use their own historical instructions.
+Runtime executable source: [`ad52c7df6d461d653199264f6d5bc216984aea3b`](https://github.com/HawgAuto/vllm-htr/tree/ad52c7df6d461d653199264f6d5bc216984aea3b). The `htr-v0.2.0` tag adds release documentation without changing those executable bytes. Release tags are immutable. The image includes the native extensions; no host compiler or separate native-library download is needed. Continue to [Run](#run), or build from source instead. The older `v0.1.0` and `qsa1600-release-20261028` tags remain unchanged and use their own historical instructions.
 
 ## Build from source
 
@@ -43,7 +43,7 @@ docker run --rm --init --pull=never --name vllm-htr \
   --device /dev/kfd --device /dev/dri/renderD128 \
   --group-add "$(stat -c %g /dev/kfd)" \
   --group-add "$(stat -c %g /dev/dri/renderD128)" \
-  --memory 108g --memory-swap 108g --pids-limit 8192 \
+  --pids-limit 8192 \
   --shm-size 16g --ulimit core=0 \
   --security-opt no-new-privileges:true \
   -p 127.0.0.1:8000:8000 \
@@ -52,7 +52,7 @@ docker run --rm --init --pull=never --name vllm-htr \
   "$IMAGE"
 ```
 
-Resolve the correct AMD render node on multi-GPU hosts instead of assuming `renderD128`. Do not co-load another large shared-memory GPU workload. The limits shown leave a reserve on the intended 128 GB machine; they are not a promise that any other workload will fit alongside it.
+Resolve the correct AMD render node on multi-GPU hosts instead of assuming `renderD128`. No Docker memory/swap cap is set in this qualified launch. Do not co-load another large shared-memory workload; reported MemAvailable is an observation, not a reserved budget.
 
 For a no-device model/runtime metadata preflight:
 
@@ -82,24 +82,25 @@ Levers (launcher flags after the image name):
 |---|---|---|
 | `--mtp {0,3}` | 3 | 0 disables speculative decoding |
 | `--max-num-seqs N` | 1 | up to 4 with MTP3, up to 32 with MTP0 |
-| `--context N` | 262144 | up to 1,048,576; above 262,144 static YaRN is applied |
-| `--yarn-factor F` | auto | 2 up to 524,288, otherwise 4 |
+| `--context N` | 262144 | syntax limit 1,048,576; above 262,144 static YaRN is applied; use measured profiles below, not this syntax limit as a fit guarantee |
+| `--yarn-factor F` | auto | 2 up to 524,288, otherwise 4; measured long profiles explicitly pin 4 |
 | `--kv-cache-gib G` | 8 | BF16 KV pool size |
 | `--max-num-batched-tokens N` | 12288 | prefill chunk and scheduler budget |
 | `--cudagraph-sizes a,b,...` | from seqs/MTP | decode graph capture sizes |
 | `--no-prefix-caching` | off | |
 
-`--print-command` shows the exact vLLM command, the cache profile and the levers without starting anything.
+`--print-command` shows the exact vLLM command, the cache profile and the levers without starting anything. These bounds are parser limits, not qualification of every combination; use the documented default or the measured profiles below, and requalify other geometries.
 
 ## Quick load
 
-Each distinct set of compile-relevant levers (everything above except the KV pool size, host and port), runtime source and HTR version gets its own compile/autotune cache under `/workspace/cache/<profile>`. The first start with a new lever set compiles graphs and tunes kernels; later starts with the same levers load that cache. To do the first start ahead of time, add `--build-seed`: the launcher starts the server, sends warm-up requests across prefill lengths (64 tokens to 32K), stops the server, and writes `<cache>/SEED.json`. Keep `/workspace` on a persistent volume and reuse it.
+Each distinct set of compile-relevant levers (everything above except the KV pool size, host and port), runtime source and HTR version gets its own compile/autotune cache under `/workspace/cache/<profile>`. The first start with a new lever set compiles graphs and tunes kernels; later starts with the same levers load that cache. Compiler caches are permitted; they are not expanded model-weight caches. To do the first start ahead of time, add `--build-seed`: the launcher starts the server, sends warm-up requests across prefill lengths (64 tokens to 32K), stops the server, and writes `<cache>/SEED.json`. Keep `/workspace` on a persistent volume and reuse it. Repeat the same profile flags for the subsequent normal start, omitting only `--build-seed`. Fresh-process replay was checked through this public workflow; exact configurations and timings are below. New request shapes can still compile: quick load is not a zero-JIT promise. Do not reuse an older-version seed or copy graphs between profiles.
 
 ## Runtime features
 
 - Dense HTR linears: fused GEMV for decode; for prefill each weight is dequantized to BF16 per call and multiplied with the vendor GEMM. No persistent BF16 weight copy is kept.
-- QSA sparse attention (`htr_qsa`): the release split-K Triton kernel, or the native TAU v2 kernel for prefills with more than 256 rows. TAU v2 is bitwise equal to split-K; the first admitted calls of every process are re-run through split-K and must match bit for bit (`HTR_QSA_TAU=0` disables it).
-- Autotune pin (`HTR_AUTOTUNE_PIN`): fixed Triton configs for the FLA prefill kernels and sticky Inductor deterministic mode. A source/signature-bound GDN norm/gate policy (`HTR_GDN_XBLOCK1`) selects XBLOCK=1 with two warps before compilation and checks serialized native launchers before loading. Determinism alone does not choose reference-equivalent reduction geometry. Incompatible old seeds are rejected; regenerate them with this runtime. Concurrent request scheduling can still change batch composition and outputs.
+- QSA sparse attention (`htr_qsa`): the release split-K Triton kernel, or the native TAU v2 kernel for eligible 257–8192-row prefills. TAU v2 is bitwise equal to split-K; the first admitted calls of every process are re-run through split-K and must match bit for bit (`HTR_QSA_TAU=0` disables it).
+- Autotune pin (`HTR_AUTOTUNE_PIN`): fixed Triton configs for the FLA prefill kernels and sticky Inductor deterministic mode. A source/signature-bound GDN norm/gate policy (`HTR_GDN_XBLOCK1`) selects XBLOCK=1 for MTP0 or XBLOCK=4 for MTP3, with two warps, before compilation and checks serialized native launchers before loading. The MTP3-only RMS policy preserves `R0_BLOCK=16384`, 32 warps and the reference native code object; it is absent in MTP0. Determinism alone does not choose reference-equivalent reduction geometry. Incompatible old seeds are rejected; regenerate them with this runtime. Concurrent request scheduling can still change batch composition and outputs.
+- MoE numerical self-check reference scratch is temporary and released after the check; the check tolerance and ordinary fallback behavior are preserved.
 - MoE partition4 (`HTR_MOE_PARTITION4`): 5–47-token MoE steps run on 4-row partitions with a parity-preserving plan; arithmetic unchanged.
 - Routed-expert HPF3 prefill, fused decode combine, GPTQ8 hyper-connection kernels, device-side PLE gather, MTP draft filtering.
 
@@ -113,7 +114,57 @@ The target is mixed precision: HTR5 dense projections, HTR4 output/routed-expert
 
 ## Verification status
 
-The existing v0.1.0 runtime has passed final-image text, reasoning, MTP and structured tool-call/result delivery checks; see the [exact-image receipt and its recorded adjudication](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR/blob/v0.1.0/evidence/release-qualification.json). All 63 checkpoint files are complete and hash-verified. The source, prebuilt GHCR image and pinned HaloLoom build base are public. Anonymous access to the unchanged prebuilt manifest and an image layer has been verified. These are existing qualification results, not a new speed/quality benchmark or validation of the upcoming v0.2.0 changes. A local rebuild has its own image identity and does not inherit the prebuilt manifest digest.
+The final image passed18/18 complete old/new output comparisons for the memory-lifetime fix, including16 pairs with identical returned logprobs, plus the default-command text, reasoning and structured tool-call/result gate. The separately labeled predecessor passed six26-output fresh/cached/reference comparisons; those are preserved provenance, not a rerun on this final image. The API check used the image environment without diagnostic overrides, the selected temperature0.7/top-p0.8/top-k20 sampler, and thinking enabled. It returned a parsed `get_weather(city="Paris")` call, then used the supplied 18°C test fixture in the follow-up answer. This is a tool protocol test, not a live weather lookup.
+
+The predecessor image sha256:0c31a8266bb71a7cc8698683c9c52ab86ca65c064f3ac0a625be835e698d1238 used context196608, 6GiB BF16 KV, seqs4, batched12288 and no YaRN. Ready times were310.743s fresh /125.464s cached for MTP0, and380.902s /145.362s for MTP3. Existing cache files were unchanged;8 and16 compiler files were added respectively, with no new tuning records. These times are not measurements of the default seqs1 profile or the separate public-seed profiles. The final-image default MTP3 API profile took631.785s to ready from an empty workspace.
+
+See the [versioned qualification report](releases/v0.2.0-qualification.md), [machine-readable evidence](releases/v0.2.0-qualification.json) and [all84 original speed rows](releases/v0.2.0-speed-rows.csv). The unchanged63 checkpoint files remain hash-verified. A local source build has its own image identity; it does not inherit the prebuilt manifest digest.
+
+## Measured BF16-KV / YaRN ×4 profiles
+
+All four configurations below completed the actual public `--build-seed` workflow and an independent fresh-process cold replay on the released image. Each uses **context1,000,000, static YaRN4, a shared27GiB BF16 KV pool and batched-token budget12,288**. Graphs, prefix caching and Mamba `align` caching stay enabled.
+
+| MTP | Slots | Build leg wall s | Cold ready s | Ready MemAvailable GiB | Short-request minimum GiB | Aggregate KV tokens | Equal-share estimate per slot |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 3 | 1 | 501.478 | 170.424 | 11.941181 | 11.638920 | 1,020,123 | 1,000,000 |
+| 0 | 1 | 429.832 | 170.737 | 14.624199 | 14.339275 | 1,126,738 | 1,000,000 |
+| 3 | 4 | 553.750 | 200.821 | 8.963573 | 9.269318 | 1,020,123 | 255,030 |
+| 0 | 4 | 486.647 | 170.436 | 13.517921 | 13.481205 | 1,126,738 | 281,684 |
+
+Build-leg wall includes startup, the public warmups and teardown; cold-ready time ends at HTTP readiness. These are not prefill/decode throughput measurements. Equal-share values are allocation estimates capped by the per-request context limit, not tested filled histories. All10 short correctness requests passed; four-slot runs had4 overlapping requests.
+
+These were **uncapped GPU-container launches**: no Docker `--memory`/`--memory-swap` ceiling or artificial free-memory veto. They still required exclusive GPU ownership, correct outputs and clean teardown. Startup/compilation used substantial swap. The tightest build reached2.185791GiB MemAvailable; readiness and short-request minima are different phases, not reserved headroom or a co-loading guarantee.
+
+**Scope:** public warmups reached32,768 prompt tokens. A full-million-token prefill, long-position retrieval/quality and four simultaneous million-token histories were not tested. These are working configured profiles, not a measured hardware maximum.
+
+### Choose a long-profile configuration
+
+In the complete Docker launch command above, replace its final `"$IMAGE"` line with the selected line below. Do not add the old108GiB container cap:
+
+```sh
+# MTP3, 1 slot(s)
+"$IMAGE" --mtp 3 --max-num-seqs 1 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
+# MTP0, 1 slot(s)
+"$IMAGE" --mtp 0 --max-num-seqs 1 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
+# MTP3, 4 slot(s)
+"$IMAGE" --mtp 3 --max-num-seqs 4 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
+# MTP0, 4 slot(s)
+"$IMAGE" --mtp 0 --max-num-seqs 4 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
+```
+
+Append `--build-seed` to the chosen line for its one-time public warmup pass, then start again without that flag using the same writable workspace. Profiles are independently namespaced. Changing a compile-relevant lever selects another cache.
+
+| MTP | Slots | Replay-added compiler files | Of those, new HSACOs | Existing files changed/removed | Tuning files added/changed |
+|---|---:|---:|---:|---:|---:|
+| 3 | 1 | 40 | 5 | 0 | 0 |
+| 0 | 1 | 16 | 2 | 0 | 0 |
+| 3 | 4 | 48 | 6 | 0 | 0 |
+| 0 | 4 | 40 | 5 | 0 | 0 |
+
+Each replay directly loaded AOT and preserved every existing seed entry. New shape-specific JIT is allowed and disclosed; this is not compilation-free startup. No downloaded prebuilt seed blob is shipped. Use the public builder on your own workspace.
+
+
+QSA1600 is approximate sparse attention, not parity with full attention. Solo reference identity is scoped to the original qualification roster; concurrent scheduling can change outputs. These checks do not establish broad model-quality, image/video or agent-compatibility qualification; full-million prefill/retrieval was not run. The known short-prefill overhead and PLE/I/O tails are not claimed fixed. FP8 KV, memory attribution and further tuning remain outside v0.2.0.
 
 Run the installed CPU suite without exposing devices:
 

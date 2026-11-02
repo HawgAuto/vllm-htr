@@ -1,133 +1,37 @@
-<!-- markdownlint-disable MD001 MD041 -->
 # vLLM HTR
 
-**HTR v0.2.0 — the first serving update.**
-[Versioned release notes](https://github.com/HawgAuto/vllm-htr/releases/tag/htr-v0.2.0) · [Release history and update roadmap](RELEASES.md)
+**HTR v0.2.0 — the first serving update for Qwen3.8-Flash-Next-HTR on AMD Strix Halo.**
 
-This update integrates TAU v2 attention, partitioned MoE dispatch, per-call dense-prefill dequantization without a persistent BF16 weight copy, reference-bound reduction geometry, and configurable quick-load seeds. Checkpoint weights and quantization are unchanged. BF16 context/capacity limits and exact image qualification belong to the versioned release evidence. The initial v0.1.0 remains available; FP8 KV and deferred tuning are planned for v0.3.0 and are not included here.
+[Pull or build and run](htr_runtime/README.md) · [Model and download](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Release notes](https://github.com/HawgAuto/vllm-htr/releases/tag/htr-v0.2.0) · [Release history](RELEASES.md)
 
-A gfx1151/Strix Halo serving fork for Qwen3.8 HTR, integrating HTR kernels, GPTQ8 hyper-connections, SSD-backed PLE, and the QSA1600/MTP3 release profile.
+This fork integrates the custom HTR weight format with vLLM's serving engine on gfx1151: packed dense/expert kernels, GPTQ8 hyperconnections, SSD-backed PLE embeddings, sparse attention and MTP3. It is not a stock-vLLM installation or a new model quantization.
 
-[Pull or build and run vLLM HTR](htr_runtime/README.md) · [Model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [HTR format and quantizer](https://github.com/HawgAuto/HTR)
-
-The qualified prebuilt image is public; no GitHub account, token or `docker login` is required:
+## Get the tested image
 
 ```sh
-docker pull ghcr.io/hawgauto/vllm-htr:v0.2.0
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:4c3bbfc5f42dad17c1a3bca2a911502aa0670aff1314e87e11bc900eaff491df
 ```
 
-See the [runtime guide](htr_runtime/README.md#get-the-prebuilt-image) for the immutable image digest, requirements and launch command. Building from source is optional.
+The equivalent version tag is `ghcr.io/hawgauto/vllm-htr:v0.2.0`. Public access requires no GitHub account, token or `docker login`. Use the [runtime guide](htr_runtime/README.md) for model/workspace mounts, AMD device access, the loopback API and optional source builds. The intended host is Linux/gfx1151 with approximately128GB shared memory and fast local SSD storage.
 
-This fork preserves upstream vLLM ancestry. Use the HTR-specific Docker recipe and instructions above for this model; the upstream installation instructions below describe upstream vLLM, not this custom runtime. Qualification and publication status are tracked separately from source/build readiness.
+## What this update delivers
 
-## Upstream vLLM
+- TAU v2 attention on eligible prefill shapes, with bitwise reference checks and split-K fallback.
+- Partition4 dispatch for selected small MoE batches, preserving the accepted arithmetic.
+- Dense-prefill dequantization per call instead of a persistent expanded BF16 shadow.
+- Temporary MoE self-check reference scratch, recovering approximately4.6875GiB at readiness in matched tests without removing numerical checks.
+- Mode-specific reference GDN geometry and the reference MTP RMS reduction, including serialized-code validation.
+- Source/version/profile-bound compile caches and a public `--build-seed` workflow.
+- Four configured-million profiles: MTP0 or MTP3, one or four slots, YaRN4 and a shared27GiB BF16 KV pool.
 
-<p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-dark.png">
-    <img alt="vLLM" src="https://raw.githubusercontent.com/vllm-project/vllm/main/docs/assets/logos/vllm-logo-text-light.png" width=55%>
-  </picture>
-</p>
+All four seed-build/cold-replay workflows passed. Full-million prefill and long-position quality were not tested; four slots share the pool, not four million-token allocations. New shapes can still compile. The final documented default command passed text, reasoning and a structured tool-call/result round trip.
 
-<h3 align="center">
-Easy, fast, and cheap LLM serving for everyone
-</h3>
+[Detailed qualification, memory observations and preserved predecessor speed rows](htr_runtime/releases/v0.2.0-qualification.md) · [Machine-readable evidence](htr_runtime/releases/v0.2.0-qualification.json)
 
-<p align="center">
-| <a href="https://docs.vllm.ai"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://arxiv.org/abs/2309.06180"><b>Paper</b></a> | <a href="https://x.com/vllm_project"><b>Twitter/X</b></a> | <a href="https://discuss.vllm.ai"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> |
-</p>
+Checkpoint weights and quantization are unchanged. v0.1.0 source/image/model tags remain immutable. FP8 KV, the short-prefill speed repair and PLE/I/O work are deferred to v0.3.0; this release does not claim those gains or broad semantic/multimodal quality.
 
-🔥 We have built a vLLM website to help you get started with vLLM. Please visit [vllm.ai](https://vllm.ai) to learn more.
-For events, please visit [vllm.ai/events](https://vllm.ai/events) to join us.
+## Source and lineage
 
----
+Executable HTR source: [`ad52c7df6d461d653199264f6d5bc216984aea3b`](https://github.com/HawgAuto/vllm-htr/tree/ad52c7df6d461d653199264f6d5bc216984aea3b). The release tag adds documentation and evidence without changing executable bytes. This repository preserves [upstream vLLM](https://github.com/vllm-project/vllm) ancestry; [vLLM documentation](https://docs.vllm.ai/) describes the underlying engine, while the linked HTR guide supplies this model's required runtime.
 
-## About
-
-vLLM is a fast and easy-to-use library for LLM inference and serving.
-
-Originally developed in the [Sky Computing Lab](https://sky.cs.berkeley.edu) at UC Berkeley, vLLM has grown into one of the most active open-source AI projects built and maintained by a diverse community of many dozens of academic institutions and companies from over 2000 contributors.
-
-vLLM is fast with:
-
-- State-of-the-art serving throughput
-- Efficient management of attention key and value memory with [**PagedAttention**](https://blog.vllm.ai/2023/06/20/vllm.html)
-- Continuous batching of incoming requests, chunked prefill, prefix caching
-- Fast and flexible model execution with piecewise and full CUDA/HIP graphs
-- Quantization: FP8, MXFP8/MXFP4, NVFP4, INT8, INT4, GPTQ/AWQ, GGUF, compressed-tensors, ModelOpt, TorchAO, and [more](https://docs.vllm.ai/en/latest/features/quantization/index.html)
-- Optimized attention kernels including FlashAttention, FlashInfer, TRTLLM-GEN, FlashMLA, and Triton
-- Optimized GEMM/MoE kernels for various precisions using CUTLASS, TRTLLM-GEN, CuTeDSL
-- Speculative decoding including n-gram, suffix, EAGLE, DFlash
-- Automatic kernel generation and graph-level transformations using torch.compile
-- Disaggregated prefill, decode, and encode
-
-vLLM is flexible and easy to use with:
-
-- Seamless integration with popular Hugging Face models
-- High-throughput serving with various decoding algorithms, including *parallel sampling*, *beam search*, and more
-- Tensor, pipeline, data, expert, and context parallelism for distributed inference
-- Streaming outputs
-- Generation of structured outputs using xgrammar or guidance
-- Tool calling and reasoning parsers
-- OpenAI-compatible API server, plus Anthropic Messages API and gRPC support
-- Efficient multi-LoRA support for dense and MoE layers
-- Support for NVIDIA GPUs, AMD GPUs, Intel GPUs, and x86/ARM/PowerPC CPUs. Additionally, diverse hardware plugins such as Google TPUs, Intel Gaudi, IBM Spyre, Huawei Ascend, Rebellions NPU, Apple Silicon, MetaX GPU, and more.
-
-vLLM seamlessly supports 200+ model architectures on Hugging Face, including:
-
-- Decoder-only LLMs (e.g., Llama, Qwen, Gemma)
-- Mixture-of-Expert LLMs (e.g., Mixtral, DeepSeek-V3, Qwen-MoE, GPT-OSS)
-- Hybrid attention and state-space models (e.g., Mamba, Qwen3.5)
-- Multi-modal models (e.g., LLaVA, Qwen-VL, Pixtral)
-- Embedding and retrieval models (e.g., E5-Mistral, GTE, ColBERT)
-- Reward and classification models (e.g., Qwen-Math)
-
-Find the full list of supported models [here](https://docs.vllm.ai/en/latest/models/supported_models.html).
-
-## Getting Started
-
-Install vLLM with [`uv`](https://docs.astral.sh/uv/) (recommended) or `pip`:
-
-```bash
-uv pip install vllm
-```
-
-Or [build from source](https://docs.vllm.ai/en/latest/getting_started/installation/gpu/index.html#build-wheel-from-source) for development.
-
-Visit our [documentation](https://docs.vllm.ai/en/latest/) to learn more.
-
-- [Installation](https://docs.vllm.ai/en/latest/getting_started/installation.html)
-- [Quickstart](https://docs.vllm.ai/en/latest/getting_started/quickstart.html)
-- [List of Supported Models](https://docs.vllm.ai/en/latest/models/supported_models.html)
-
-## Contributing
-
-We welcome and value any contributions and collaborations.
-Please check out [Contributing to vLLM](https://docs.vllm.ai/en/latest/contributing/index.html) for how to get involved.
-
-## Citation
-
-If you use vLLM for your research, please cite our [paper](https://arxiv.org/abs/2309.06180):
-
-```bibtex
-@inproceedings{kwon2023efficient,
-  title={Efficient Memory Management for Large Language Model Serving with PagedAttention},
-  author={Woosuk Kwon and Zhuohan Li and Siyuan Zhuang and Ying Sheng and Lianmin Zheng and Cody Hao Yu and Joseph E. Gonzalez and Hao Zhang and Ion Stoica},
-  booktitle={Proceedings of the ACM SIGOPS 29th Symposium on Operating Systems Principles},
-  year={2023}
-}
-```
-
-## Contact Us
-
-<!-- --8<-- [start:contact-us] -->
-- For technical questions and feature requests, please use GitHub [Issues](https://github.com/vllm-project/vllm/issues)
-- For discussing with fellow users, please use the [vLLM Forum](https://discuss.vllm.ai)
-- For coordinating contributions and development, please use [Slack](https://slack.vllm.ai)
-- For security disclosures, please use GitHub's [Security Advisories](https://github.com/vllm-project/vllm/security/advisories) feature
-- For collaborations and partnerships, please contact us at [collaboration@vllm.ai](mailto:collaboration@vllm.ai)
-<!-- --8<-- [end:contact-us] -->
-
-## Media Kit
-
-- If you wish to use vLLM's logo, please refer to [our media kit repo](https://github.com/vllm-project/media-kit)
+[HTR format and quantizer](https://github.com/HawgAuto/HTR) · [Methodology](https://github.com/HawgAuto/HTR/blob/main/docs/METHODOLOGY.md) · [Acknowledgments and exlr8 → ExLlamaV3/EXL3 → QTIP lineage](https://github.com/HawgAuto/HTR/blob/main/docs/LINEAGE.md). Upstream licenses and notices are retained. Model weights have their own Qwen Community License; see the model card.

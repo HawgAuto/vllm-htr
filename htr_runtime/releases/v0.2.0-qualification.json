@@ -1,0 +1,553 @@
+{
+  "api_delivery": {
+    "card_lifecycle_deltas": [
+      "create/start/stop/rm lifecycle instead of --rm",
+      "unique --name and ownership --label",
+      "host port 18000 instead of 8000",
+      "--oom-score-adj 1000 host protection"
+    ],
+    "cases": [
+      {
+        "case": "arithmetic",
+        "final_answer": "437",
+        "finish_reason": "stop",
+        "thinking_delivered": true,
+        "usage": {
+          "completion_tokens": 44,
+          "completion_tokens_details": {
+            "reasoning_tokens": 38
+          },
+          "prompt_tokens": 71,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 115
+        },
+        "wall_seconds": 4.72527617495507
+      },
+      {
+        "case": "qsa-long",
+        "final_answer": "899",
+        "finish_reason": "stop",
+        "thinking_delivered": true,
+        "usage": {
+          "completion_tokens": 71,
+          "completion_tokens_details": {
+            "reasoning_tokens": 65
+          },
+          "prompt_tokens": 5683,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 3200,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 5754
+        },
+        "wall_seconds": 11.843927453737706
+      },
+      {
+        "arguments": {
+          "city": "Paris"
+        },
+        "case": "tool-call",
+        "finish_reason": "tool_calls",
+        "thinking_delivered": true,
+        "tool": "get_weather",
+        "usage": {
+          "completion_tokens": 51,
+          "completion_tokens_details": {
+            "reasoning_tokens": 23
+          },
+          "prompt_tokens": 329,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 380
+        },
+        "wall_seconds": 1.765412762761116
+      },
+      {
+        "case": "tool-result",
+        "content": "It's currently **sunny** in Paris with a temperature of **18\u00b0C** (about 64\u00b0F).",
+        "finish_reason": "stop",
+        "thinking_delivered": true,
+        "usage": {
+          "completion_tokens": 40,
+          "completion_tokens_details": {
+            "reasoning_tokens": 12
+          },
+          "prompt_tokens": 393,
+          "prompt_tokens_details": {
+            "cached_tokens": 0,
+            "created_cache_tokens": 0,
+            "multimodal_tokens": null
+          },
+          "total_tokens": 433
+        },
+        "wall_seconds": 1.5341798081062734
+      }
+    ],
+    "cleanup": {
+      "active_gpu_owners_absent": true,
+      "original_leases_released": true,
+      "owned_containers_absent": true,
+      "test_port_released": true
+    },
+    "container_memory_cap": null,
+    "drafts": 63.0,
+    "image_env_equal": true,
+    "kernels": {
+      "gdn_code": {
+        "5fb96eb9708e5575a71874a2d405aeb3ecc4913d62a96f43c9a62f644b681a3f": "cbb2c0ef08942bca83ec9c8f7c6754304d3a98d359485c8ebe9c00e3a087deb2"
+      },
+      "norm_code": {
+        "c9640f0c0fee9a172eee7f1c72355737cc7c31d898bdcde80349c84084674004": "c21432ca65f81eb8fe3ff78b6817885ab8907188774d685db6c2dc62bc203bd2"
+      },
+      "tau_pages": [
+        1600
+      ],
+      "tau_selfchecks": 8
+    },
+    "live_external_weather_lookup": false,
+    "memory": {
+      "aggregate_kv_tokens": 276313,
+      "graph_gib": 0.19,
+      "model_load_gib": 65.68
+    },
+    "moe_selfcheck_count": 96,
+    "platform_manifest": "sha256:4c3bbfc5f42dad17c1a3bca2a911502aa0670aff1314e87e11bc900eaff491df",
+    "profile": {
+      "context": 262144,
+      "cudagraph_sizes": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "kv_gib": 8,
+      "max_num_batched_tokens": 12288,
+      "max_num_seqs": 1,
+      "mtp": 3,
+      "prefix_caching": true,
+      "yarn_factor": null
+    },
+    "registry_byte_unchanged": true,
+    "sampler": {
+      "seed": 314159,
+      "temperature": 0.7,
+      "thinking": true,
+      "top_k": 20,
+      "top_p": 0.8
+    },
+    "startup_seconds": 631.7854395890608,
+    "status": "PASS",
+    "temporary_oracle_scratch": true,
+    "tool_call_id_matches_result": true,
+    "tool_result_fixture": {
+      "city": "Paris",
+      "conditions": "sunny",
+      "temperature_c": 18
+    }
+  },
+  "checkpoint_bytes": 173759296105,
+  "checkpoint_changed": false,
+  "checkpoint_changed_scope": "No checkpoint changes relative to the current metadata-corrected release base; original executable/weight qualification remains valid.",
+  "checkpoint_files": 63,
+  "checkpoint_metadata_base_revision": "88994ea64048a37c1dd79947db2fe3d3991c7b5b",
+  "checkpoint_verified_revision": "5ffabdde9d79f48a2dd6c2331140f1936ca6bb16",
+  "checkpoint_verified_revision_scope": "Original checkpoint qualification; the metadata-only correction below preserves every weight and tensor mapping.",
+  "completed_input_sha256": {
+    "api_audit": "a6a1be795429278536ea699de46466680f7a7aa62cb3a4c7203bf539d17cc77c",
+    "equivalence_audit": "c2818334e4f764cb1594af72c1bc012def1979a701fb08274391ad9d4d7c3e2e",
+    "final_api_audit": "d5902f2fb0324564c865f6bafb5944f73eb874e4424a8f920cb97017c75b358e",
+    "final_memory_workflow_audit": "9d635ba38bedb84ccd181608fe3e49f23070e610ff3fdf3a850247b6a05343c0"
+  },
+  "context_qualification": "FOUR_FIXED_MILLION_STARTUP_BUILD_REPLAY_WORKFLOWS_PASS",
+  "distribution": {
+    "buildkit_attestation_not_published": true,
+    "checkpoint_files_changed": false,
+    "image_tag": "ghcr.io/hawgauto/vllm-htr:v0.2.0",
+    "model_tag": "v0.2.0",
+    "platform_only_publication": true,
+    "runtime_tag": "htr-v0.2.0"
+  },
+  "equivalence": {
+    "cleanup": {
+      "active_gpu_owners_absent": true,
+      "original_leases_released": true,
+      "owned_containers_absent": true,
+      "sidecars_stopped": true,
+      "test_port_released": true
+    },
+    "comparisons": {
+      "m0-fresh-reference": {
+        "all_exact": true,
+        "differences": [],
+        "exact": 26,
+        "total": 26
+      },
+      "m0-fresh-seeded": {
+        "all_exact": true,
+        "differences": [],
+        "exact": 26,
+        "total": 26
+      },
+      "m0-seeded-reference": {
+        "all_exact": true,
+        "differences": [],
+        "exact": 26,
+        "total": 26
+      },
+      "m3-fresh-reference": {
+        "all_exact": true,
+        "differences": [],
+        "exact": 26,
+        "total": 26
+      },
+      "m3-fresh-seeded": {
+        "all_exact": true,
+        "differences": [],
+        "exact": 26,
+        "total": 26
+      },
+      "m3-seeded-reference": {
+        "all_exact": true,
+        "differences": [],
+        "exact": 26,
+        "total": 26
+      }
+    },
+    "evidence_relationship": "Completed predecessor evidence before the temporary-selfcheck lifetime change, not a new 26-output run on the final image.",
+    "m3_fresh_provenance": "The predecessor MTP3 fresh leg was carried into its same-image predecessor comparison; no final-image rerun is implied.",
+    "profile": {
+      "context": 196608,
+      "kv_gib": 6,
+      "max_num_batched_tokens": 12288,
+      "max_num_seqs": 4,
+      "prefix_caching": true,
+      "yarn_factor": null
+    },
+    "raw_speed_csv_sha256": "340d7822f9774421d238d56add432c656b178322d584eb63718b08eea84805ab",
+    "raw_speed_rows": 84,
+    "raw_speed_warmup_rows": 16,
+    "runtime_image_manifest": "sha256:0c31a8266bb71a7cc8698683c9c52ab86ca65c064f3ac0a625be835e698d1238",
+    "runtime_source_commit": "1dc873728b88b53bcc0b54568f43f4d8d504c419",
+    "scope": "Original26 complete solo output arrays per comparison, not26 accuracy problems; concurrent scheduling is a separate scope.",
+    "seed_deltas": {
+      "m0-seeded": {
+        "added": 8,
+        "changed": 0,
+        "removed": 0,
+        "tuning_added": [],
+        "tuning_changed": []
+      },
+      "m3-seeded": {
+        "added": 16,
+        "changed": 0,
+        "removed": 0,
+        "tuning_added": [],
+        "tuning_changed": []
+      }
+    },
+    "startup_seconds": {
+      "m0-fresh": 310.74254250107333,
+      "m0-seeded": 125.4636369929649,
+      "m3-fresh": 380.90176178887486,
+      "m3-seeded": 145.36233209259808
+    },
+    "timing_scope": "Server-prefill, server-decode, client-decode, TTFT and full request wall retained separately. No new general speed-win claim."
+  },
+  "fixed_million_profiles": [
+    {
+      "added_compiler_files": 40,
+      "added_hsaco_files": 5,
+      "aggregate_kv_tokens": 1020123,
+      "build_additional_system_swap_gib": 7.324680328369141,
+      "build_leg_wall_seconds": 501.4777774810791,
+      "build_peak_gtt_gib": 103.59324264526367,
+      "build_whole_leg_min_mem_available_gib": 5.333774566650391,
+      "changed_existing_files": 0,
+      "cold_replay": "PASS",
+      "cold_replay_ready_seconds": 170.42390738613904,
+      "container_memory_cap": null,
+      "context": 1000000,
+      "cudagraph_sizes": [
+        1,
+        2,
+        3,
+        4,
+        5
+      ],
+      "direct_aot_load": true,
+      "equal_share_token_estimate": 1000000,
+      "full_million_prefill_verified": false,
+      "kv_dtype": "BF16",
+      "kv_gib": 27,
+      "max_num_batched_tokens": 12288,
+      "maximum_search": false,
+      "mtp": 3,
+      "new_or_changed_tuning_files": 0,
+      "peak_client_inflight": 1,
+      "prebuilt_seed_blob_shipped": false,
+      "profile_id": "htr-m3-s1-c1000000-y4-7731a15a43a0",
+      "public_build": "PASS",
+      "public_warmup_prompt_tokens": [
+        64,
+        512,
+        2048,
+        8192,
+        12288,
+        16384,
+        32768
+      ],
+      "ready_mem_available_gib": 11.941181182861328,
+      "removed_existing_files": 0,
+      "replay_additional_system_swap_gib": 7.3232574462890625,
+      "replay_peak_gtt_gib": 104.00372695922852,
+      "replay_whole_leg_min_mem_available_gib": 6.066925048828125,
+      "seqs": 1,
+      "short_request_min_mem_available_gib": 11.638919830322266,
+      "short_requests_passed": 1,
+      "yarn_factor": 4
+    },
+    {
+      "added_compiler_files": 16,
+      "added_hsaco_files": 2,
+      "aggregate_kv_tokens": 1126738,
+      "build_additional_system_swap_gib": 7.090000152587891,
+      "build_leg_wall_seconds": 429.83246302604675,
+      "build_peak_gtt_gib": 100.36311340332031,
+      "build_whole_leg_min_mem_available_gib": 10.951675415039062,
+      "changed_existing_files": 0,
+      "cold_replay": "PASS",
+      "cold_replay_ready_seconds": 170.73711213376373,
+      "container_memory_cap": null,
+      "context": 1000000,
+      "cudagraph_sizes": [
+        1
+      ],
+      "direct_aot_load": true,
+      "equal_share_token_estimate": 1000000,
+      "full_million_prefill_verified": false,
+      "kv_dtype": "BF16",
+      "kv_gib": 27,
+      "max_num_batched_tokens": 12288,
+      "maximum_search": false,
+      "mtp": 0,
+      "new_or_changed_tuning_files": 0,
+      "peak_client_inflight": 1,
+      "prebuilt_seed_blob_shipped": false,
+      "profile_id": "htr-m0-s1-c1000000-y4-d69a1e3e5959",
+      "public_build": "PASS",
+      "public_warmup_prompt_tokens": [
+        64,
+        512,
+        2048,
+        8192,
+        12288,
+        16384,
+        32768
+      ],
+      "ready_mem_available_gib": 14.624198913574219,
+      "removed_existing_files": 0,
+      "replay_additional_system_swap_gib": 7.402305603027344,
+      "replay_peak_gtt_gib": 100.3584213256836,
+      "replay_whole_leg_min_mem_available_gib": 11.568050384521484,
+      "seqs": 1,
+      "short_request_min_mem_available_gib": 14.339275360107422,
+      "short_requests_passed": 1,
+      "yarn_factor": 4
+    },
+    {
+      "added_compiler_files": 48,
+      "added_hsaco_files": 6,
+      "aggregate_kv_tokens": 1020123,
+      "build_additional_system_swap_gib": 7.389095306396484,
+      "build_leg_wall_seconds": 553.7503638267517,
+      "build_peak_gtt_gib": 104.0726432800293,
+      "build_whole_leg_min_mem_available_gib": 2.185791015625,
+      "changed_existing_files": 0,
+      "cold_replay": "PASS",
+      "cold_replay_ready_seconds": 200.8206150266342,
+      "container_memory_cap": null,
+      "context": 1000000,
+      "cudagraph_sizes": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        8,
+        10,
+        12,
+        16,
+        20
+      ],
+      "direct_aot_load": true,
+      "equal_share_token_estimate": 255030,
+      "full_million_prefill_verified": false,
+      "kv_dtype": "BF16",
+      "kv_gib": 27,
+      "max_num_batched_tokens": 12288,
+      "maximum_search": false,
+      "mtp": 3,
+      "new_or_changed_tuning_files": 0,
+      "peak_client_inflight": 4,
+      "prebuilt_seed_blob_shipped": false,
+      "profile_id": "htr-m3-s4-c1000000-y4-d744d4d0c28b",
+      "public_build": "PASS",
+      "public_warmup_prompt_tokens": [
+        64,
+        512,
+        2048,
+        8192,
+        12288,
+        16384,
+        32768
+      ],
+      "ready_mem_available_gib": 8.963573455810547,
+      "removed_existing_files": 0,
+      "replay_additional_system_swap_gib": 7.219142913818359,
+      "replay_peak_gtt_gib": 102.69639587402344,
+      "replay_whole_leg_min_mem_available_gib": 8.88460922241211,
+      "seqs": 4,
+      "short_request_min_mem_available_gib": 9.269317626953125,
+      "short_requests_passed": 4,
+      "yarn_factor": 4
+    },
+    {
+      "added_compiler_files": 40,
+      "added_hsaco_files": 5,
+      "aggregate_kv_tokens": 1126738,
+      "build_additional_system_swap_gib": 6.664867401123047,
+      "build_leg_wall_seconds": 486.64724612236023,
+      "build_peak_gtt_gib": 103.72204208374023,
+      "build_whole_leg_min_mem_available_gib": 4.736606597900391,
+      "changed_existing_files": 0,
+      "cold_replay": "PASS",
+      "cold_replay_ready_seconds": 170.43567288294435,
+      "container_memory_cap": null,
+      "context": 1000000,
+      "cudagraph_sizes": [
+        1,
+        2,
+        3,
+        4
+      ],
+      "direct_aot_load": true,
+      "equal_share_token_estimate": 281684,
+      "full_million_prefill_verified": false,
+      "kv_dtype": "BF16",
+      "kv_gib": 27,
+      "max_num_batched_tokens": 12288,
+      "maximum_search": false,
+      "mtp": 0,
+      "new_or_changed_tuning_files": 0,
+      "peak_client_inflight": 4,
+      "prebuilt_seed_blob_shipped": false,
+      "profile_id": "htr-m0-s4-c1000000-y4-22a0b62b3d7f",
+      "public_build": "PASS",
+      "public_warmup_prompt_tokens": [
+        64,
+        512,
+        2048,
+        8192,
+        12288,
+        16384,
+        32768
+      ],
+      "ready_mem_available_gib": 13.517921447753906,
+      "removed_existing_files": 0,
+      "replay_additional_system_swap_gib": 6.330142974853516,
+      "replay_peak_gtt_gib": 99.19497299194336,
+      "replay_whole_leg_min_mem_available_gib": 10.904693603515625,
+      "seqs": 4,
+      "short_request_min_mem_available_gib": 13.481204986572266,
+      "short_requests_passed": 4,
+      "yarn_factor": 4
+    }
+  ],
+  "hardware": "AMD gfx1151 / Strix Halo,128GB-class shared memory",
+  "limitations": [
+    "QSA is approximate sparse attention, not full-attention parity.",
+    "Original equivalence roster is not broad semantic-quality qualification.",
+    "Concurrent scheduling may change generated tokens.",
+    "Image/video execution not qualified.",
+    "Known short-prefill overhead and PLE/I/O tails are not claimed repaired.",
+    "FP8 KV and additional optimization are deferred.",
+    "The fixed1M profiles prove startup, public seed warmups through32768 and short requests, not full-million prefill or retrieval.",
+    "Four slots share one27GiB KV pool, not four independent million-token histories.",
+    "Ready-state scratch saving is not equivalent to peak-traffic memory saving; startup still used substantial swap.",
+    "Predecessor speed and26-output equivalence evidence are explicitly predecessor-scoped; final-image lifetime parity is the18-pair diagnostic.",
+    "First-use and new-shape compilation remain possible; no prebuilt cache archive is distributed."
+  ],
+  "memory_lifetime_fix": {
+    "diagnostic_geometry": {
+      "batch_budget": 12288,
+      "context": 262144,
+      "kv_gib": 8,
+      "seqs": 1,
+      "yarn_factor": 4
+    },
+    "exact_complete_output_pairs": 18,
+    "modes": [
+      {
+        "exact_outputs_and_logprobs": true,
+        "generated_tokens_per_arm": 151,
+        "logprob_pairs": 8,
+        "mtp": 3,
+        "passed": true,
+        "ready_gtt_saved_gib": 4.687503814697266,
+        "requests": 9,
+        "scope": "matched diagnostic pair; not a repeated speed benchmark",
+        "selfcheck_relative_errors_exact": true,
+        "selfchecks_per_arm": 144,
+        "traffic_peak_gtt_saved_gib": 0.0196990966796875
+      },
+      {
+        "exact_outputs_and_logprobs": true,
+        "generated_tokens_per_arm": 155,
+        "logprob_pairs": 8,
+        "mtp": 0,
+        "passed": true,
+        "ready_gtt_saved_gib": 4.687488555908203,
+        "requests": 9,
+        "scope": "matched diagnostic pair; not a repeated speed benchmark",
+        "selfcheck_relative_errors_exact": true,
+        "selfchecks_per_arm": 144,
+        "traffic_peak_gtt_saved_gib": 0.1015167236328125
+      }
+    ],
+    "pairs_with_returned_logprobs": 16,
+    "scope": "One matched diagnostic process per mode and arm; not broad accuracy, full-model bitwise equivalence or a repeated speed benchmark.",
+    "total_passing_moe_selfchecks": 1488
+  },
+  "parameter_count_metadata_correction": {
+    "base_revision": "0242e7126661488084dcf9f2c009393f3a547820",
+    "changed_checkpoint_files": [
+      "model.safetensors.index.json"
+    ],
+    "checkpoint_metadata_byte_delta": 38,
+    "evidence": "evidence/parameter-count.json",
+    "index_total_size_unchanged": true,
+    "index_weight_map_unchanged": true,
+    "logical_total_parameters": 179999981424,
+    "weight_bytes_changed": false
+  },
+  "publication": "NOT_PUBLISHED",
+  "release_version": "v0.2.0",
+  "runtime_image_config_digest": "sha256:23ada3e019fb3c6ceace95270f52060f448aa30dee4c172fa97f01afc0685c7a",
+  "runtime_image_manifest": "sha256:4c3bbfc5f42dad17c1a3bca2a911502aa0670aff1314e87e11bc900eaff491df",
+  "runtime_image_tag": "ghcr.io/hawgauto/vllm-htr:v0.2.0",
+  "runtime_release_tag": "htr-v0.2.0",
+  "runtime_release_tag_note": "Documentation-only successors of the executable source may be included; executable bytes remain unchanged.",
+  "runtime_source_commit": "ad52c7df6d461d653199264f6d5bc216984aea3b",
+  "schema_version": 2,
+  "status": "QUALIFIED_FOR_DECLARED_RELEASE_SCOPE"
+}
