@@ -177,6 +177,7 @@ def configure(args, name):
     base.configure(argparse.Namespace(variant='bf16', mtp=args.mtp, yarn_factor=args.yarn_factor,
                                       context=args.context))
     os.environ.update(json.loads((ROOT / 'runtime-env.json').read_text()))
+    os.environ['HTR_GDN_MTP'] = str(args.mtp)
     for key in RETIRED_BASE_ENV:
         os.environ.pop(key, None)
     cache_root = WORK / 'cache' / name

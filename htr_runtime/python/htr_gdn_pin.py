@@ -1,9 +1,9 @@
 """Source-bound numerical policy for the gfx1151 Qwen GDN norm/gate.
 
-Choose the qualified XBLOCK=1 reduction before native compilation/cache lookup.
+Choose reference-profile tiles (MTP0: XBLOCK=1; MTP3: XBLOCK=4) before
+native compilation/cache lookup.
 The ordinary static launcher and fast path remain unchanged. Serialized kernels
-must carry that same geometry; old seeds fail closed instead of silently loading
-an XBLOCK=16 binary. No kernel arithmetic or compiler binary is rewritten here.
+must carry the selected mode's geometry; incompatible seeds fail closed. No kernel arithmetic or compiler binary is rewritten here.
 """
 import functools
 import hashlib
@@ -17,7 +17,7 @@ SOURCE_SHA256 = "f1b6431679e13cff672efcd5d79b61721822393536c3a85546045e2feea431e
 SIGNATURE = dict(in_ptr0="*bf16", in_ptr1="*bf16", in_ptr2="*bf16",
                  out_ptr1="*bf16", ks0="i64", xnumel="i32",
                  r0_numel="i32", XBLOCK="constexpr")
-POLICY = "gdn-rms-gate-x1-w2-v1"
+POLICY = "gdn-rms-gate-mode-tiles-w2-v2"
 
 
 def _require(condition, field):
@@ -31,6 +31,12 @@ def _log(event, **fields):
         file=sys.stderr, flush=True)
 
 
+def selected_xblock():
+    mode = os.environ.get("HTR_GDN_MTP", "0")
+    _require(mode in ("0", "3"), "HTR_GDN_MTP (expected 0 or 3)")
+    return 4 if mode == "3" else 1
+
+
 def select(fn, configs, triton_meta, inductor_meta):
     """Pin only the exact qualified function/signature; preserve all others."""
     if (inductor_meta or {}).get("kernel_name") != NAME:
@@ -39,7 +45,7 @@ def select(fn, configs, triton_meta, inductor_meta):
              "source")
     _require(triton_meta.get("signature") == SIGNATURE, "signature")
     import triton
-    return [triton.Config({"XBLOCK": 1}, num_warps=2, num_stages=1)]
+    return [triton.Config({"XBLOCK": selected_xblock()}, num_warps=2, num_stages=1)]
 
 
 def validate_result(result):
@@ -47,10 +53,10 @@ def validate_result(result):
     if result.kernel.name != NAME:
         return False
     c = result.config
-    _require(c.kwargs == {"XBLOCK": 1} and c.num_warps == 2
+    _require(c.kwargs == {"XBLOCK": selected_xblock()} and c.num_warps == 2
              and c.num_stages == 1, "geometry (regenerate this runtime's seed)")
     _require(result.compile_meta.get("signature") == SIGNATURE, "signature")
-    _require(result.compile_meta.get("constants", {}).get("XBLOCK") == 1,
+    _require(result.compile_meta.get("constants", {}).get("XBLOCK") == selected_xblock(),
              "constants")
     return True
 
@@ -82,12 +88,12 @@ def install():
             chosen = select(fn, configs, triton_meta, inductor_meta)
             tuner = native(chosen)(fn)
             _require(len(tuner.configs) == 1
-                     and tuner.configs[0].kwargs == {"XBLOCK": 1}
+                     and tuner.configs[0].kwargs == {"XBLOCK": selected_xblock()}
                      and tuner.configs[0].num_warps == 2
                      and tuner.configs[0].num_stages == 1,
                      "post-cache geometry")
             _log("COMPILE", name=NAME, source_sha256=SOURCE_SHA256,
-                 xblock=1, num_warps=2, num_stages=1)
+                 xblock=selected_xblock(), num_warps=2, num_stages=1)
             return tuner
         return decorate
 
@@ -104,10 +110,10 @@ def install():
         binary_sha256 = hashlib.sha256(Path(k.cubin_path).read_bytes()).hexdigest()
         launcher = static(result)
         _require(launcher._is_static and k.function is not None
-                 and launcher.config.kwargs == {"XBLOCK": 1}
+                 and launcher.config.kwargs == {"XBLOCK": selected_xblock()}
                  and launcher.__globals__["runner"].__self__ is k,
                  "native static launcher")
-        _log("LOADED", name=NAME, xblock=1, num_warps=k.num_warps,
+        _log("LOADED", name=NAME, xblock=selected_xblock(), num_warps=k.num_warps,
              shared=k.shared, function=k.function, module=k.module,
              binary_sha256=binary_sha256,
              n_regs=k.n_regs, n_spills=k.n_spills)
@@ -122,5 +128,5 @@ def install():
     th.StaticTritonCompileResult.make_launcher = guarded_static
     th.TritonCompileResult.make_launcher = guarded_other
     th.cached_autotune = cached
-    _log("ACTIVE", source_sha256=SOURCE_SHA256)
+    _log("ACTIVE", source_sha256=SOURCE_SHA256, xblock=selected_xblock())
     return True
