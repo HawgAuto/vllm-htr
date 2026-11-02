@@ -93,21 +93,24 @@ def install():
 
     @functools.wraps(static)
     def guarded_static(result):
-        target = validate_result(result)
+        if not validate_result(result):
+            return static(result)
+        k = result.kernel
+        # Native load_kernel consumes both cubin_raw and cubin_path.
+        # Resolve through the native cache loader, then hash the actual
+        # file it will load BEFORE constructing the ordinary launcher.
+        if not k.cubin_path:
+            result.reload_cubin_path()
+        binary_sha256 = hashlib.sha256(Path(k.cubin_path).read_bytes()).hexdigest()
         launcher = static(result)
-        if target:
-            k = result.kernel
-            _require(launcher._is_static and k.function is not None
-                     and launcher.config.kwargs == {"XBLOCK": 1}
-                     and launcher.__globals__["runner"].__self__ is k,
-                     "native static launcher")
-            raw = k.cubin_raw
-            if raw is None:
-                raw = Path(k.cubin_path).read_bytes()
-            _log("LOADED", name=NAME, xblock=1, num_warps=k.num_warps,
-                 shared=k.shared, function=k.function, module=k.module,
-                 binary_sha256=hashlib.sha256(raw).hexdigest(),
-                 n_regs=k.n_regs, n_spills=k.n_spills)
+        _require(launcher._is_static and k.function is not None
+                 and launcher.config.kwargs == {"XBLOCK": 1}
+                 and launcher.__globals__["runner"].__self__ is k,
+                 "native static launcher")
+        _log("LOADED", name=NAME, xblock=1, num_warps=k.num_warps,
+             shared=k.shared, function=k.function, module=k.module,
+             binary_sha256=binary_sha256,
+             n_regs=k.n_regs, n_spills=k.n_spills)
         return launcher
 
     @functools.wraps(other)
