@@ -1,9 +1,22 @@
 <!-- markdownlint-disable MD001 MD041 -->
 # vLLM HTR
 
+**HTR v0.2.0 — the first serving update.**
+[Versioned release notes](https://github.com/HawgAuto/vllm-htr/releases/tag/htr-v0.2.0) · [Release history and update roadmap](RELEASES.md)
+
+This update integrates TAU v2 attention, partitioned MoE dispatch, per-call dense-prefill dequantization without a persistent BF16 weight copy, reference-bound reduction geometry, and configurable quick-load seeds. Checkpoint weights and quantization are unchanged. BF16 context/capacity limits and exact image qualification belong to the versioned release evidence. The initial v0.1.0 remains available; FP8 KV and deferred tuning are planned for v0.3.0 and are not included here.
+
 A gfx1151/Strix Halo serving fork for Qwen3.8 HTR, integrating HTR kernels, GPTQ8 hyper-connections, SSD-backed PLE, and the QSA1600/MTP3 release profile.
 
-[Build and run vLLM HTR](htr_runtime/README.md) · [Model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [HTR format and quantizer](https://github.com/HawgAuto/HTR)
+[Pull or build and run vLLM HTR](htr_runtime/README.md) · [Model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [HTR format and quantizer](https://github.com/HawgAuto/HTR)
+
+The qualified prebuilt image is public; no GitHub account, token or `docker login` is required:
+
+```sh
+docker pull ghcr.io/hawgauto/vllm-htr:v0.2.0
+```
+
+See the [runtime guide](htr_runtime/README.md#get-the-prebuilt-image) for the immutable image digest, requirements and launch command. Building from source is optional.
 
 This fork preserves upstream vLLM ancestry. Use the HTR-specific Docker recipe and instructions above for this model; the upstream installation instructions below describe upstream vLLM, not this custom runtime. Qualification and publication status are tracked separately from source/build readiness.
 

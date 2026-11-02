@@ -29,5 +29,6 @@
   "E59_PLE_DEV_SO": "/opt/vllm-htr/native-bin/e59_pledev_ext.so",
   "HTR_QSA_TAU": "1",
   "HTR_AUTOTUNE_PIN": "1",
+  "HTR_GDN_XBLOCK1": "1",
   "HTR_MOE_PARTITION4": "1"
 }

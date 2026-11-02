@@ -4,7 +4,10 @@
 #   docker build -f htr_runtime/Dockerfile.release --build-arg RUNTIME=vllm-htr:runtime -t vllm-htr:release .
 ARG RUNTIME=vllm-htr:runtime
 FROM ${RUNTIME}
+ARG VCS_REF
 COPY htr_runtime/ /usr/share/doc/vllm-htr/
 LABEL org.opencontainers.image.title="vLLM HTR" \
       org.opencontainers.image.source="https://github.com/HawgAuto/vllm-htr" \
+      org.opencontainers.image.version="0.2.0" \
+      org.opencontainers.image.revision="${VCS_REF}" \
       org.opencontainers.image.description="vLLM HTR serving runtime for Qwen3.8-Flash-Next-HTR on AMD gfx1151 (Strix Halo)"

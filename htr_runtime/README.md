@@ -1,15 +1,29 @@
 # vLLM HTR runtime
 
+**HTR v0.2.0 — first serving update.** The existing public [v0.1.0 release](https://github.com/HawgAuto/vllm-htr/releases/tag/htr-v0.1.0) remains available; see [release history](../RELEASES.md).
+
 This is the serving runtime for [Qwen3.8-Flash-Next-HTR](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR), based on the image-bound vLLM fork at `322c106f3409df1eeb29d2c14434b389b36c2b43`. It integrates HTR dense and routed-expert operators, GPTQ8 hyper-connection kernels, SSD-backed PLE reads, the TAU v2 QSA attention kernel, and the serving launcher.
 
 The separate [HTR project](https://github.com/HawgAuto/HTR) documents the quantizer and format. This repository supplies their model-serving integration; it does not replace the upstream vLLM project.
 
+## Get the prebuilt image
+
+The versioned release image is distributed publicly. No GitHub account, token or `docker login` is required. Use the immutable manifest recorded in the version's release notes when a digest pin is needed.
+
+```sh
+IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.0
+docker pull "$IMAGE"
+```
+
+Release tags are immutable. The image includes the native extensions; no host compiler or separate native-library download is needed. Continue to [Run](#run), or build from source instead. The older `v0.1.0` and `qsa1600-release-20261028` tags remain unchanged and use their own historical instructions.
+
 ## Build from source
 
-From the repository root:
+This is an optional alternative to the prebuilt image. From the repository root:
 
 ```sh
 docker build --pull=false -f htr_runtime/Dockerfile -t vllm-htr:local .
+IMAGE=vllm-htr:local
 ```
 
 The Dockerfile pins the existing ROCm/PyTorch/vLLM base by digest, compiles all eleven HTR/native extensions and the TAU v2 QSA code object from the included source, and installs the Python runtime. The build needs no GPU. It does not compile against host ROCm or copy private prebuilt libraries from the checkout. `NATIVE-BUILD.json` binds the selected source and Ninja recipes by SHA-256. Recipes retain the accepted math flags: HIPHC decode uses `-ffp-contract=fast`, while HIPHCP prefill uses `-ffp-contract=off`. The TAU v2 code object is built with the exact command recorded in `NATIVE-BUILD.json` and the build fails unless it matches the qualified binary hash. Native compiler work products remain in the build stage, not the serving image.
@@ -35,7 +49,7 @@ docker run --rm --init --pull=never --name vllm-htr \
   -p 127.0.0.1:8000:8000 \
   --mount "type=bind,src=$MODEL,dst=/model,readonly" \
   --mount "type=bind,src=$WORKSPACE,dst=/workspace" \
-  vllm-htr:local
+  "$IMAGE"
 ```
 
 Resolve the correct AMD render node on multi-GPU hosts instead of assuming `renderD128`. Do not co-load another large shared-memory GPU workload. The limits shown leave a reserve on the intended 128 GB machine; they are not a promise that any other workload will fit alongside it.
@@ -46,7 +60,7 @@ For a no-device model/runtime metadata preflight:
 docker run --rm --network none --pull=never \
   --mount "type=bind,src=$MODEL,dst=/model,readonly" \
   --mount "type=bind,src=$WORKSPACE,dst=/workspace" \
-  vllm-htr:local --cpu-check
+  "$IMAGE" --cpu-check
 ```
 
 The API implements the OpenAI-compatible endpoints under `/v1`, with model name `qwen38-htr`. The host port is loopback-only; add an authenticated reverse proxy before any external exposure. The launcher's container bind defaults to `0.0.0.0`; `--host`, `--port`, and `--served-model-name` are supported overrides.
@@ -79,13 +93,13 @@ Levers (launcher flags after the image name):
 
 ## Quick load
 
-Each distinct set of compile-relevant levers (everything above except the KV pool size, host and port) gets its own compile/autotune cache under `/workspace/cache/<profile>`. The first start with a new lever set compiles graphs and tunes kernels; later starts with the same levers load that cache. To do the first start ahead of time, add `--build-seed`: the launcher starts the server, sends warm-up requests across prefill lengths (64 tokens to 32K), stops the server, and writes `<cache>/SEED.json`. Keep `/workspace` on a persistent volume and reuse it.
+Each distinct set of compile-relevant levers (everything above except the KV pool size, host and port), runtime source and HTR version gets its own compile/autotune cache under `/workspace/cache/<profile>`. The first start with a new lever set compiles graphs and tunes kernels; later starts with the same levers load that cache. To do the first start ahead of time, add `--build-seed`: the launcher starts the server, sends warm-up requests across prefill lengths (64 tokens to 32K), stops the server, and writes `<cache>/SEED.json`. Keep `/workspace` on a persistent volume and reuse it.
 
 ## Runtime features
 
 - Dense HTR linears: fused GEMV for decode; for prefill each weight is dequantized to BF16 per call and multiplied with the vendor GEMM. No persistent BF16 weight copy is kept.
 - QSA sparse attention (`htr_qsa`): the release split-K Triton kernel, or the native TAU v2 kernel for prefills with more than 256 rows. TAU v2 is bitwise equal to split-K; the first admitted calls of every process are re-run through split-K and must match bit for bit (`HTR_QSA_TAU=0` disables it).
-- Autotune pin (`HTR_AUTOTUNE_PIN`): fixed Triton configs for the FLA prefill kernels and Inductor deterministic mode, so independent processes run the same kernels.
+- Autotune pin (`HTR_AUTOTUNE_PIN`): fixed Triton configs for the FLA prefill kernels and sticky Inductor deterministic mode. A source/signature-bound GDN norm/gate policy (`HTR_GDN_XBLOCK1`) selects XBLOCK=1 with two warps before compilation and checks serialized native launchers before loading. Determinism alone does not choose reference-equivalent reduction geometry. Incompatible old seeds are rejected; regenerate them with this runtime. Concurrent request scheduling can still change batch composition and outputs.
 - MoE partition4 (`HTR_MOE_PARTITION4`): 5–47-token MoE steps run on 4-row partitions with a parity-preserving plan; arithmetic unchanged.
 - Routed-expert HPF3 prefill, fused decode combine, GPTQ8 hyper-connection kernels, device-side PLE gather, MTP draft filtering.
 
@@ -99,7 +113,7 @@ The target is mixed precision: HTR5 dense projections, HTR4 output/routed-expert
 
 ## Verification status
 
-Source-bound build and CPU checks are separate from physical GPU/model qualification and publication. Local build or import success alone does not establish real serving, performance, or public availability. Final release evidence must identify the tested image and remote source revision; do not treat this source staging README as a completed qualification receipt.
+The existing v0.1.0 runtime has passed final-image text, reasoning, MTP and structured tool-call/result delivery checks; see the [exact-image receipt and its recorded adjudication](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR/blob/v0.1.0/evidence/release-qualification.json). All 63 checkpoint files are complete and hash-verified. The source, prebuilt GHCR image and pinned HaloLoom build base are public. Anonymous access to the unchanged prebuilt manifest and an image layer has been verified. These are existing qualification results, not a new speed/quality benchmark or validation of the upcoming v0.2.0 changes. A local rebuild has its own image identity and does not inherit the prebuilt manifest digest.
 
 Run the installed CPU suite without exposing devices:
 
@@ -109,7 +123,7 @@ docker run --rm --network none --pull=never \
   -e PYTHONPATH=/opt/vllm-htr/python:/opt/vllm-htr \
   -e HTR_MOE2_SO=/opt/vllm-htr/native-bin/htr_moe2.so \
   -e HTR_HPF3_SO=/opt/vllm-htr/native-bin/htr_moe_prefill_v3.so \
-  vllm-htr:local -m unittest discover -s /opt/vllm-htr/tests -v
+  "$IMAGE" -m unittest discover -s /opt/vllm-htr/tests -v
 ```
 
 Upstream notices and licenses are retained. See HTR's acknowledgments for the exlr8 → ExLlamaV3/EXL3 → QTIP lineage and QuIP/GPTQ/LDLQ foundations; see the upstream vLLM documentation for the engine itself.

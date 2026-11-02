@@ -10,7 +10,7 @@ site=Path('/opt/venv/lib/python3.14/site-packages')
 RETIRED=[site/'direct_qsa_union_adapter_v1.py',site/'direct_qsa_union_kernel_v1.py',site/'direct_qsa_union_build_v1.hsaco']
 for p in RETIRED:
     if p.exists():p.unlink()
-for p in (root/'python').glob('*.py'):
+for p in [*(root/'python').glob('*.py'), *(root/'python').glob('*.pth')]:
     shutil.copyfile(p,site/p.name)
 manifest_path=Path('/opt/haloloom/qwen38/data/installed-files.json')
 manifest=json.loads(manifest_path.read_text())

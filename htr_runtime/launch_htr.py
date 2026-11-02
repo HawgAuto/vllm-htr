@@ -110,6 +110,13 @@ def profile(args):
               'yarn_factor': args.yarn_factor, 'max_num_batched_tokens': args.max_num_batched_tokens,
               'cudagraph_sizes': args.sizes, 'prefix_caching': not args.no_prefix_caching}
     runtime = hashlib.sha256((ROOT / 'runtime-env.json').read_bytes() + (ROOT / 'server-argv.json').read_bytes())
+    # Old images/seeds must not bypass a changed numerical or launcher policy.
+    members = [ROOT / 'VERSION', ROOT / 'NATIVE-BUILD.json', ROOT / 'launch_htr.py',
+               *sorted((ROOT / 'python').glob('*.py')),
+               *sorted((ROOT / 'python').glob('*.pth'))]
+    for member in members:
+        if member.is_file():
+            runtime.update(str(member.relative_to(ROOT)).encode() + b'\0' + member.read_bytes())
     key = hashlib.sha256((json.dumps(levers, sort_keys=True) + runtime.hexdigest()).encode()).hexdigest()[:12]
     name = f'htr-m{args.mtp}-s{args.max_num_seqs}-c{args.context}'
     if args.yarn_factor:
@@ -283,7 +290,8 @@ def main():
     n_files, report, sampling = verify_runtime(args)
     seed_file = cache_root / 'SEED.json'
     seed = json.loads(seed_file.read_text()) if seed_file.is_file() else None
-    print(json.dumps({'htr_runtime_files': n_files, 'base_and_model': report, 'sampling': sampling, 'thinking': True,
+    print(json.dumps({'htr_version': (ROOT / 'VERSION').read_text().strip(),
+                      'htr_runtime_files': n_files, 'base_and_model': report, 'sampling': sampling, 'thinking': True,
                       'profile': name, 'levers': levers, 'kv_cache_gib': args.kv_cache_gib,
                       'cache_root': str(cache_root),
                       'seed': {'present': seed is not None, 'tree_sha256': seed and seed['tree_sha256'],
