@@ -28,6 +28,23 @@ The final-image diagnostic matched18 complete output pairs, including16 returned
 
 Checkpoint weights, tokenizer and quantization remain unchanged. Preserved predecessor speed/reference rows are explicitly labeled; they are not final-image timings or a general speedup. Known short-prefill overhead and PLE/I/O tails remain. See the [release evidence and raw rows](https://github.com/HawgAuto/vllm-htr/blob/htr-v0.2.0/htr_runtime/releases/v0.2.0-qualification.md) and [running guide](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR/blob/v0.2.0/docs/RUNNING.md).
 
+## Recommended sampling update — 2026-11-03
+
+The maintained launch commands now select temperature **1.0**, top-p **0.95**,
+top-k **20**, min-p **0**, presence penalty **0** and repetition penalty **1**,
+with thinking unchanged. This promotes the maintainer's preferred live response
+profile. Explicit client values still override these server defaults.
+
+A separately downloaded, checksum-pinned `launch_recommended.py` adds native
+vLLM generation overrides to the identity-checked v0.2.0 launcher and retains all
+runtime/checkpoint validation. The image, original launcher, integrity-bound
+`generation_config.json` files, weights, tokenizer and immutable release tags
+remain unchanged. The original entrypoint keeps its historical 0.7 / 0.8 defaults.
+No new image, requantization, benchmark or Bf16Core GPU qualification is claimed.
+Historical measurements and qualification receipts retain their original sampler
+settings. Follow the maintained running instructions, not the frozen tag's commands,
+to use the new recommendation.
+
 ## v0.3.0 — second update, planned
 
 FP8 KV and the other deferred work: memory attribution, batched-token tuning, the bitwise-preserving short-prefill regression repair, and PLE I/O improvements. Scope and results remain subject to their own acceptance checks; these are plans, not shipped capability or measured gains.

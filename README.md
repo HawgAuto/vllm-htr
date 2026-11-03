@@ -6,6 +6,10 @@
 
 This fork integrates the custom HTR weight format with vLLM's serving engine on gfx1151: packed dense/expert kernels, GPTQ8 hyperconnections, SSD-backed PLE embeddings, sparse attention and MTP3. It is not a stock-vLLM installation or a new model quantization.
 
+## Recommended response profile
+
+Use **temperature 1.0, top-p 0.95, top-k 20, min-p 0, presence penalty 0 and repetition penalty 1**, with thinking unchanged. The [recommended sampling launcher](htr_runtime/launch_recommended.py) applies these defaults to the existing v0.2.0 image while retaining its integrity checks. Follow the [updated run commands](htr_runtime/README.md#get-the-recommended-sampling-launcher). The original image entrypoint/checkpoint defaults remain 0.7 / 0.8 for compatibility; weights, image digest, historical tests and immutable tags are unchanged. This is a maintainer preference, not a new quality or speed claim.
+
 ## Get the tested image
 
 ```sh

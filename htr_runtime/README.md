@@ -30,6 +30,39 @@ The Dockerfile pins the existing ROCm/PyTorch/vLLM base by digest, compiles all 
 
 The generated image includes `native-build-receipt.json` and `installed-files.json`. The launcher checks the installed runtime and native-checkpoint metadata before starting vLLM. Those checks detect drift; they are not signatures against a malicious image publisher.
 
+## Get the recommended sampling launcher
+
+The current recommendation uses **temperature 1.0, top-p 0.95, top-k 20,
+min-p 0, presence penalty 0 and repetition penalty 1**, with thinking still
+enabled. This is the maintainer-selected response profile, not a vendor-default
+claim or a new quality/performance benchmark.
+
+Download this small launcher separately; existing model downloads need no changes:
+
+```sh
+LAUNCHER="$PWD/launch_htr_recommended.py"
+curl --fail --location \
+  https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR/resolve/main/launch_recommended.py \
+  --output "$LAUNCHER"
+printf '%s  %s\n' 'fcc27d10ef3ccb44c77f9a754f91dd65f22ea5033f2bec13fb4b9d316ac9789d' "$LAUNCHER" | sha256sum --check -
+```
+
+The launcher is mounted outside the image's integrity-bound runtime. It checks
+that the original v0.2.0 launcher is unchanged, retains every runtime/checkpoint
+validation, and adds native vLLM `--override-generation-config` defaults. Explicit
+client sampling values still take precedence. It also works with `--cpu-check`,
+`--print-command` and `--build-seed`; warmup requests keep their explicit greedy
+settings. Thinking/template settings, MTP, context and KV are not changed.
+
+**Compatibility:** the immutable image's original entrypoint and checkpoint
+`generation_config.json` files retain temperature 0.7 / top-p 0.8. Do not edit those
+files: the original launcher checks them. The commands below select the new
+launcher, so their effective defaults are 1.0 / 0.95. Omitting that launcher gives
+the historical defaults. No replacement image or prebuilt cache is shipped;
+existing performance and builder/replay results retain their original settings.
+New compilation remains possible; do not treat old timings as measurements of
+this sampling update.
+
 ## Run
 
 Requires Linux, an AMD gfx1151 GPU (Strix Halo), approximately 128 GB shared system memory, Docker with AMD device access, and fast local SSD storage. This profile is not for a 16/24 GB discrete GPU and is not qualified for other GPU architectures. Download the complete model directory, including `experts/`, `draft/`, and `artifact-metadata/`.
@@ -49,7 +82,9 @@ docker run --rm --init --pull=never --name vllm-htr \
   -p 127.0.0.1:8000:8000 \
   --mount "type=bind,src=$MODEL,dst=/model,readonly" \
   --mount "type=bind,src=$WORKSPACE,dst=/workspace" \
-  "$IMAGE"
+  --mount "type=bind,src=$LAUNCHER,dst=/opt/launch_htr_recommended.py,readonly" \
+  --entrypoint /opt/venv/bin/python3 \
+  "$IMAGE" /opt/launch_htr_recommended.py
 ```
 
 Resolve the correct AMD render node on multi-GPU hosts instead of assuming `renderD128`. No Docker memory/swap cap is set in this qualified launch. Do not co-load another large shared-memory workload; reported MemAvailable is an observation, not a reserved budget.
@@ -60,23 +95,25 @@ For a no-device model/runtime metadata preflight:
 docker run --rm --network none --pull=never \
   --mount "type=bind,src=$MODEL,dst=/model,readonly" \
   --mount "type=bind,src=$WORKSPACE,dst=/workspace" \
-  "$IMAGE" --cpu-check
+  --mount "type=bind,src=$LAUNCHER,dst=/opt/launch_htr_recommended.py,readonly" \
+  --entrypoint /opt/venv/bin/python3 \
+  "$IMAGE" /opt/launch_htr_recommended.py --cpu-check
 ```
 
 The API implements the OpenAI-compatible endpoints under `/v1`, with model name `qwen38-htr`. The host port is loopback-only; add an authenticated reverse proxy before any external exposure. The launcher's container bind defaults to `0.0.0.0`; `--host`, `--port`, and `--served-model-name` are supported overrides.
 
 ## Serving profile and levers
 
-Defaults (the release profile):
+Defaults with the recommended sampling launcher:
 
 - MTP speculative decoding with three probabilistic draft tokens.
 - Thinking enabled, with the Qwen3 reasoning parser.
-- Temperature 0.7, top-p 0.8, top-k 20; neutral penalties. These are the selected release settings, not a claim about vendor defaults.
+- Temperature 1.0, top-p 0.95, top-k 20, min-p 0, presence penalty 0 and repetition penalty 1. This maintainer-selected profile overrides the frozen checkpoint defaults; client request values still take precedence.
 - Context 262,144 tokens; BF16 KV pool 8 GiB; one sequence; maximum batched tokens 12,288.
 - Prefix caching and `align` Mamba state caching retained.
 - `FULL_AND_PIECEWISE` graph mode; capture sizes 1–5. No eager-mode substitute.
 
-Levers (launcher flags after the image name):
+Levers (flags after `/opt/launch_htr_recommended.py` in the commands above):
 
 | Flag | Default | Notes |
 |---|---|---|
@@ -139,17 +176,17 @@ These were **uncapped GPU-container launches**: no Docker `--memory`/`--memory-s
 
 ### Choose a long-profile configuration
 
-In the complete Docker launch command above, replace its final `"$IMAGE"` line with the selected line below. Do not add the old108GiB container cap:
+In the complete Docker launch command above, replace its final `"$IMAGE" /opt/launch_htr_recommended.py` line with the selected line below. Do not add the old108GiB container cap:
 
 ```sh
 # MTP3, 1 slot(s)
-"$IMAGE" --mtp 3 --max-num-seqs 1 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
+"$IMAGE" /opt/launch_htr_recommended.py --mtp 3 --max-num-seqs 1 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
 # MTP0, 1 slot(s)
-"$IMAGE" --mtp 0 --max-num-seqs 1 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
+"$IMAGE" /opt/launch_htr_recommended.py --mtp 0 --max-num-seqs 1 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
 # MTP3, 4 slot(s)
-"$IMAGE" --mtp 3 --max-num-seqs 4 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
+"$IMAGE" /opt/launch_htr_recommended.py --mtp 3 --max-num-seqs 4 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
 # MTP0, 4 slot(s)
-"$IMAGE" --mtp 0 --max-num-seqs 4 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
+"$IMAGE" /opt/launch_htr_recommended.py --mtp 0 --max-num-seqs 4 --context 1000000 --yarn-factor 4 --kv-cache-gib 27 --max-num-batched-tokens 12288
 ```
 
 Append `--build-seed` to the chosen line for its one-time public warmup pass, then start again without that flag using the same writable workspace. Profiles are independently namespaced. Changing a compile-relevant lever selects another cache.
