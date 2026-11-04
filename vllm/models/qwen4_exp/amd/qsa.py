@@ -59,6 +59,15 @@ from .indexer_qsa import QSAIndexer
 
 
 import os as _gl_os
+_KV8_ENABLED = _gl_os.environ.get("HTR_KV8_ENABLE", "0") == "1"
+_KV4_ENABLED = _gl_os.environ.get("HTR_KV4_ENABLE", "0") == "1"
+
+def _kv4_mode(mode):
+    return _KV4_ENABLED and mode == "int4_per_token_head"
+
+def _kv8_mode(mode):
+    return _KV8_ENABLED and mode == "int8_per_token_head"
+
 _GL_GATE_LATE = _gl_os.environ.get("DIRECT_QSA_GATE_LATE") == "1"
 _GF_ON = _gl_os.environ.get('DIRECT_QSA_GATE_FUSE') == '1'   # nb2-gatefuse-v1 (static, trace-time)
 _GL_OUT_TAIL = _gl_os.environ.get("DIRECT_QSA_OUT_TAILZERO") == "1"
@@ -74,7 +83,28 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
     """FullAttentionSpec backend used by the merged QSA owner."""
 
     supported_dtypes: ClassVar[list[torch.dtype]] = [torch.bfloat16]
-    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"]
+    supported_kv_cache_dtypes: ClassVar[list[CacheDType]] = ["auto", "bfloat16"] + (["int8_per_token_head"] if _KV8_ENABLED else []) + (["int4_per_token_head"] if _KV4_ENABLED else [])
+
+    @classmethod
+    def supports_kv_cache_dtype(cls, kv_cache_dtype):
+        if _kv8_mode(kv_cache_dtype) or _kv4_mode(kv_cache_dtype):
+            return True
+        return super().supports_kv_cache_dtype(kv_cache_dtype)
+
+    @classmethod
+    def customize_spec(cls, spec):
+        from vllm.v1.kv_cache_interface import KVQuantMode
+        if _KV4_ENABLED and spec.kv_quant_mode == KVQuantMode.INT4_PER_TOKEN_HEAD:
+            if spec.dtype != torch.uint8 or spec.head_size != 256 or spec.num_kv_heads != 2:
+                raise ValueError("HTR INT4 main KV requires TP1 head256 KV2")
+            from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+            return TritonAttentionBackend.customize_spec(spec)
+        if _KV8_ENABLED and spec.kv_quant_mode == KVQuantMode.INT8_PER_TOKEN_HEAD:
+            if spec.dtype != torch.int8 or spec.head_size != 256 or spec.num_kv_heads != 2:
+                raise ValueError("HTR INT8 main KV is qualified only for TP1 head256 KV2")
+            from vllm.v1.attention.backends.triton_attn import TritonAttentionBackend
+            return TritonAttentionBackend.customize_spec(spec)
+        return super().customize_spec(spec)
 
     @staticmethod
     def get_name() -> str:
@@ -114,12 +144,25 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # produced exclusively by forward_qsa's paged Triton sparse kernel, so
         # requiring the unrelated dense flash_attn_varlen_func rejects ROCm
         # installations that have every operation this owner actually calls.
-        super().__init__(*args, **kwargs)
+        wanted = kwargs.get("kv_cache_dtype", args[6] if len(args) > 6 else None)
+        if _kv8_mode(wanted) or _kv4_mode(wanted):
+            # Reuse metadata fields, not FlashAttention's dense quantized reader.
+            parent_args, parent_kwargs = list(args), dict(kwargs)
+            if len(parent_args) > 6:
+                parent_args[6] = "bfloat16"
+            else:
+                parent_kwargs["kv_cache_dtype"] = "bfloat16"
+            super().__init__(*parent_args, **parent_kwargs)
+            self.kv_cache_dtype = wanted
+            if (self.num_heads, self.num_kv_heads, self.head_size) != (24, 2, 256):
+                raise NotImplementedError("HTR INT8 main KV currently requires TP1 Q24/KV2/D256")
+        else:
+            super().__init__(*args, **kwargs)
         if self.dcp_world_size != 1:
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "bfloat16"):
+        if self.kv_cache_dtype not in ("auto", "bfloat16") and not (_kv8_mode(self.kv_cache_dtype) or _kv4_mode(self.kv_cache_dtype)):
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
         self.supports_quant_query_input = False
 
@@ -134,6 +177,14 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # QSA's Triton attention needs the native HIP KV scatter, not the
         # separately guarded dense flash-attn varlen package. Preserve the
         # parent paged-cache layout and slot-mapping semantics exactly.
+        if _kv4_mode(self.kv_cache_dtype):
+            from htr_qsa_kv4 import write
+            write(kv_cache, key, value, slot_mapping)
+            return
+        if _kv8_mode(self.kv_cache_dtype):
+            from htr_qsa_kv8 import write
+            write(kv_cache, key, value, slot_mapping)
+            return
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         reshape_and_cache_flash(
             key,
@@ -182,6 +233,16 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
+        if _kv4_mode(self.kv_cache_dtype):
+            from htr_qsa_kv4 import attention
+            attention(query[:num_tokens], kv_cache, logical_indices,
+                      attn_metadata.block_table, token_to_req, output[:num_tokens])
+            return output
+        if _kv8_mode(self.kv_cache_dtype):
+            from htr_qsa_kv8 import attention
+            attention(query[:num_tokens], kv_cache, logical_indices,
+                      attn_metadata.block_table, token_to_req, output[:num_tokens])
+            return output
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
@@ -225,7 +286,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype != torch.bfloat16:
             raise NotImplementedError("Qwen4Exp QSA currently requires BF16")
-        if cache_config.cache_dtype not in ("auto", "bfloat16"):
+        if cache_config.cache_dtype not in ("auto", "bfloat16") and not (_kv8_mode(cache_config.cache_dtype) or _kv4_mode(cache_config.cache_dtype)):
             raise NotImplementedError("Qwen4Exp QSA requires a BF16 main KV cache")
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -310,7 +371,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != torch.bfloat16:
+        if self.kv_cache_torch_dtype != torch.bfloat16 and not ((_kv8_mode(self.kv_cache_dtype) and self.kv_cache_torch_dtype == torch.int8) or (_kv4_mode(self.kv_cache_dtype) and self.kv_cache_torch_dtype == torch.uint8)):
             raise NotImplementedError("Qwen4Exp QSA requires BF16 cache storage")
         self.kv_sharing_target_layer_name = None
         self.kv_cache = torch.tensor([])

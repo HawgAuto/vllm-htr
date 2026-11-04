@@ -1,0 +1,114 @@
+{
+  "release": "v0.2.1",
+  "model_variant": "Htr5Core",
+  "weight_changes": false,
+  "native_names": {
+    "int8_per_token_head": "Scaled signed 8-bit per-token-per-head main K/V with inline FP32 scales",
+    "int4_per_token_head": "RHT-rotated scalar 4-bit per-token-per-head main K/V with packed nibbles and inline scale/zero-point metadata"
+  },
+  "unchanged_precision": [
+    "recurrent state",
+    "sparse-attention indexer"
+  ],
+  "profiles": [
+    {
+      "dtype": "int8_per_token_head",
+      "label": "Scaled 8-bit per-token/head KV",
+      "mtp": 0,
+      "context": 2000000,
+      "yarn": 8,
+      "kv_gib": 27.75
+    },
+    {
+      "dtype": "int8_per_token_head",
+      "label": "Scaled 8-bit per-token/head KV",
+      "mtp": 3,
+      "context": 2000000,
+      "yarn": 8,
+      "kv_gib": 27.75
+    },
+    {
+      "dtype": "int4_per_token_head",
+      "label": "Rotated 4-bit per-token/head KV",
+      "mtp": 0,
+      "context": 4000000,
+      "yarn": 16,
+      "kv_gib": 26.875
+    },
+    {
+      "dtype": "int4_per_token_head",
+      "label": "Rotated 4-bit per-token/head KV",
+      "mtp": 3,
+      "context": 3000000,
+      "yarn": 16,
+      "kv_gib": 22.375
+    }
+  ],
+  "capacity_scope": "Configured allocation, API readiness and bounded generation passed. Single sequence, 2048-token prefill chunks.",
+  "quality_scope": "Teacher-forced top-choice-set agreement versus the same Htr5Core model with BF16 KV; 495 scored positions on a repeated paragraph, at context32768 and2GiB KV. Disagreement is the measured prediction change, not broad answer-accuracy loss.",
+  "quality_image": "sha256:fc39b66ca47c1d31c3bfef7983dd6fc79c0684add74f81beb725744ee8c7fb99",
+  "quality_source_audit_sha256": "49eba30c805e212eab68803006656806897a19fef6ee3c08d40b63a69efddfe9",
+  "quality": [
+    {
+      "kv_cache_dtype": "int8_per_token_head",
+      "mtp": 0,
+      "positions": 495,
+      "equal_top1_sets": 486,
+      "overlapping_top1_sets": 494,
+      "agreement_percent": 98.18181818181819,
+      "disagreement_percent": 1.8181818181818181,
+      "tie_aware_agreement_percent": 99.79797979797979,
+      "mean_abs_logprob_delta": 0.023167814777565757,
+      "mean_nll_delta": 0.003621749290369974
+    },
+    {
+      "kv_cache_dtype": "int4_per_token_head",
+      "mtp": 0,
+      "positions": 495,
+      "equal_top1_sets": 486,
+      "overlapping_top1_sets": 492,
+      "agreement_percent": 98.18181818181819,
+      "disagreement_percent": 1.8181818181818181,
+      "tie_aware_agreement_percent": 99.39393939393939,
+      "mean_abs_logprob_delta": 0.02367716678106585,
+      "mean_nll_delta": -0.0065083270124595095
+    },
+    {
+      "kv_cache_dtype": "int8_per_token_head",
+      "mtp": 3,
+      "positions": 495,
+      "equal_top1_sets": 489,
+      "overlapping_top1_sets": 494,
+      "agreement_percent": 98.78787878787878,
+      "disagreement_percent": 1.2121212121212122,
+      "tie_aware_agreement_percent": 99.79797979797979,
+      "mean_abs_logprob_delta": 0.019578019075159048,
+      "mean_nll_delta": 0.0017734957961606872
+    },
+    {
+      "kv_cache_dtype": "int4_per_token_head",
+      "mtp": 3,
+      "positions": 495,
+      "equal_top1_sets": 487,
+      "overlapping_top1_sets": 493,
+      "agreement_percent": 98.38383838383838,
+      "disagreement_percent": 1.6161616161616161,
+      "tie_aware_agreement_percent": 99.5959595959596,
+      "mean_abs_logprob_delta": 0.028115368032175788,
+      "mean_nll_delta": 0.0030807386057897864
+    }
+  ],
+  "fused_d256": "Retained exact-arithmetic single-kernel FP32 butterfly; original quality rows precede this bitwise-preserving optimization.",
+  "native_rebuild": {
+    "original_sha256": {
+      "8": "59f479423dd8a44a93ef6904b1cc209dedb7655c7315d78c16cdad880ba6014f",
+      "4": "2d4dee4c56a3ea0fc8e58fd5a32d4fe4062e7d0c864193f9b9b2cf768b6cc852"
+    },
+    "release_sha256": {
+      "4": "cf3597834cae448fb6f7f15b827152f5847fd76b130140a7c924ef92ba98ba69",
+      "8": "f5fac9f0c0424d1b4856e24431a50ca6b45d1011ac884baf31d49b95362f5def"
+    },
+    "difference": "deterministic HIP compilation-unit symbol identity; executable, kernel descriptors and other substantive ELF sections unchanged"
+  },
+  "delivery_status": "pending_final_image_gate"
+}

@@ -1,0 +1,27 @@
+ARG BASE=ghcr.io/hawgauto/vllm-htr@sha256:4c3bbfc5f42dad17c1a3bca2a911502aa0670aff1314e87e11bc900eaff491df
+FROM ${BASE}
+USER root
+COPY htr_runtime/VERSION /opt/vllm-htr/VERSION
+COPY htr_runtime/install_quantized_kv.py /opt/vllm-htr/install_quantized_kv.py
+COPY htr_runtime/launch_quantized.py /opt/vllm-htr/launch_quantized.py
+COPY htr_runtime/launch_recommended.py /opt/vllm-htr/launch_recommended.py
+COPY htr_runtime/native-source/qsa_tau/qsa_tau_kv4.hip /opt/vllm-htr/native-source/qsa_tau/qsa_tau_kv4.hip
+COPY htr_runtime/native-source/qsa_tau/qsa_tau_kv8.hip /opt/vllm-htr/native-source/qsa_tau/qsa_tau_kv8.hip
+COPY htr_runtime/python/htr_capacity_api.py /opt/vllm-htr/python/htr_capacity_api.py
+COPY htr_runtime/python/htr_capacity_rope.py /opt/vllm-htr/python/htr_capacity_rope.py
+COPY htr_runtime/python/htr_d256_kernel.py /opt/vllm-htr/python/htr_d256_kernel.py
+COPY htr_runtime/python/htr_d256_rht.py /opt/vllm-htr/python/htr_d256_rht.py
+COPY htr_runtime/python/htr_kv4.py /opt/vllm-htr/python/htr_kv4.py
+COPY htr_runtime/python/htr_kv8.py /opt/vllm-htr/python/htr_kv8.py
+COPY htr_runtime/python/htr_qsa_kv4.py /opt/vllm-htr/python/htr_qsa_kv4.py
+COPY htr_runtime/python/htr_qsa_kv4_ops.py /opt/vllm-htr/python/htr_qsa_kv4_ops.py
+COPY htr_runtime/python/htr_qsa_kv8.py /opt/vllm-htr/python/htr_qsa_kv8.py
+COPY htr_runtime/python/htr_qsa_kv8_ops.py /opt/vllm-htr/python/htr_qsa_kv8_ops.py
+COPY htr_runtime/quantized-kv-source.json /opt/vllm-htr/quantized-kv-source.json
+COPY vllm/models/qwen4_exp/amd/qsa.py /opt/venv/lib/python3.14/site-packages/vllm/models/qwen4_exp/amd/qsa.py
+RUN /opt/venv/bin/python3 /opt/vllm-htr/install_quantized_kv.py
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.version="0.2.1" org.opencontainers.image.source="https://github.com/HawgAuto/vllm-htr" org.opencontainers.image.revision="${SOURCE_REVISION}"
+USER 1000:1000
+WORKDIR /workspace
+ENTRYPOINT ["/opt/venv/bin/python3", "/opt/vllm-htr/launch_quantized.py"]

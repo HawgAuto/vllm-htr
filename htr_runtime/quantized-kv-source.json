@@ -1,0 +1,38 @@
+{
+  "base_manifest": "sha256:4c3bbfc5f42dad17c1a3bca2a911502aa0670aff1314e87e11bc900eaff491df",
+  "base_version": "v0.2.0",
+  "native_cuid": {
+    "4": "2e6fdfd773dc2189",
+    "8": "947ba6fd224fd605"
+  },
+  "native_rebuild_note": "Pinned HIP CUID makes source builds path-independent; .text, kernel descriptors, notes, and all non-symbol ELF data equal the qualified objects. Only CUID symbol strings and derived hash tables differ. Rebuilt files are separately hash-bound and delivery-tested.",
+  "native_sha256": {
+    "4": "cf3597834cae448fb6f7f15b827152f5847fd76b130140a7c924ef92ba98ba69",
+    "8": "f5fac9f0c0424d1b4856e24431a50ca6b45d1011ac884baf31d49b95362f5def"
+  },
+  "owner_sha256": "16c7d2e3d2d5313a63fd269e327f6c580c2833b9fe5502eab0920799a0a0cb1d",
+  "parent_owner_sha256": "80b03f05d919c972ce7bb48a7eef2177d22b113bab2ff6f6ed8f79248aa777d3",
+  "qualified_native_sha256": {
+    "4": "2d4dee4c56a3ea0fc8e58fd5a32d4fe4062e7d0c864193f9b9b2cf768b6cc852",
+    "8": "59f479423dd8a44a93ef6904b1cc209dedb7655c7315d78c16cdad880ba6014f"
+  },
+  "runtime_sources": {
+    "VERSION": "71015c979ccb0fc8a0be7ca0ae83046ab045cdc2c8faa09fb2f0f7e440f9b4a6",
+    "install_quantized_kv.py": "f1fc379a874c5e8356237293a1a1a6361dc96b09a0a14976a2162cd417056b20",
+    "launch_quantized.py": "cb510b16c536fba3cb13f7260e45f08e99cfdd8127c58d738c7e25a81c6e9fda",
+    "launch_recommended.py": "fcc27d10ef3ccb44c77f9a754f91dd65f22ea5033f2bec13fb4b9d316ac9789d",
+    "native-source/qsa_tau/qsa_tau_kv4.hip": "0d6df67d32206700c2f7c1a65969df43fef051e53c03d6a822d6dc58fe94db0b",
+    "native-source/qsa_tau/qsa_tau_kv8.hip": "6a2e13fe6caa4e55d2eb69cc7c63840f08c16117c23b8a5d58ef78e09ce57627",
+    "python/htr_capacity_api.py": "980bf3c0df1fca7b2625819689aa6a556f5e25d48b3dc92c476ef13928aa2bad",
+    "python/htr_capacity_rope.py": "3429acfee041421af9bbcf430c9ba16a6a6aadebbd295c7916b2d1f7697c971d",
+    "python/htr_d256_kernel.py": "0add1532da54f7bda516359076413a037155ea3fe2a4b63410881bc1afbe27e7",
+    "python/htr_d256_rht.py": "76f4dd7ccb8b267aa0631a59c2ebc8016004d72254a1c704ed56ff64db6fe696",
+    "python/htr_kv4.py": "807b1617feec7f6fd21dc991310eefdd363f21f93fdd06fd883645cd2786fffb",
+    "python/htr_kv8.py": "a589487cda1ffe6edd003137c7fb47fd93a25643ff8b9922b47d68af88d54c0c",
+    "python/htr_qsa_kv4.py": "c4ef1b29a34b9cfeb862d79dc82b183312e2e3cd6eb2f72e78f07749b3918809",
+    "python/htr_qsa_kv4_ops.py": "efe5e081605e0a9ec94b7928e1e2f10608d149d8651a292ddbf8304a936d9ad2",
+    "python/htr_qsa_kv8.py": "f29f030f54d350ff9d33d66812b903242aec5ba53b5e0bc5b8d957bd76712c0c",
+    "python/htr_qsa_kv8_ops.py": "bfcd51e243948114e90347b4006774f085046e49b4379e7972adf267dd5d100e"
+  },
+  "schema": "vllm-htr.quantized-kv.v0.2.1"
+}
