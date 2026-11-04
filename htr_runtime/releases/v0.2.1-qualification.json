@@ -110,5 +110,57 @@
     },
     "difference": "deterministic HIP compilation-unit symbol identity; executable, kernel descriptors and other substantive ELF sections unchanged"
   },
-  "delivery_status": "pending_final_image_gate"
+  "delivery_status": "PASS",
+  "runtime_image": "ghcr.io/hawgauto/vllm-htr@sha256:dde8c3ea80e5d0a56e9143894a12622d0c236bab1f6d3d8a10e4ab911c836afb",
+  "runtime_source_commit": "d836d40e6deb59e07c50b0db1eb343408278a187",
+  "delivery": [
+    {
+      "kv_cache_dtype": "int8_per_token_head",
+      "mtp": 3,
+      "context": 2000000,
+      "kv_pool_gib": 27.75,
+      "allocator_reported_tokens": 2006191,
+      "requests": 9,
+      "functional_checks_passed": 6,
+      "native_kv_checks": 8,
+      "mtp_draft_tokens": 324.0,
+      "image_environment_exact": true,
+      "native_image_entrypoint": true,
+      "tool_round_trip": true,
+      "fused_d256_counters": [],
+      "raw_result_sha256": "9e97c12a78a6b5efcb245e097dc2cce3364545b057a11e7a9db8a5544a37020c",
+      "source": "final v0.2.1 public-shaped image delivery; normal prefix caching"
+    },
+    {
+      "kv_cache_dtype": "int4_per_token_head",
+      "mtp": 3,
+      "context": 3000000,
+      "kv_pool_gib": 22.375,
+      "allocator_reported_tokens": 3003080,
+      "requests": 9,
+      "functional_checks_passed": 6,
+      "native_kv_checks": 8,
+      "mtp_draft_tokens": 312.0,
+      "image_environment_exact": true,
+      "native_image_entrypoint": true,
+      "tool_round_trip": true,
+      "fused_d256_counters": [
+        {
+          "forward": 1389,
+          "inverse": 463,
+          "fallback": 0
+        }
+      ],
+      "raw_result_sha256": "c8c117209a0e1b3acd7ca0df402df21c1c5922d42aaac25709b0d87ca7331d0d",
+      "source": "final v0.2.1 public-shaped image delivery; normal prefix caching"
+    }
+  ],
+  "cpu_tests": {
+    "run": 96,
+    "failures": 0,
+    "errors": 0,
+    "historical_version_test_skipped": 1
+  },
+  "installed_checkpoint_preflights": 4,
+  "cleanup_verified": true
 }

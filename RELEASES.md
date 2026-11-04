@@ -1,5 +1,26 @@
 # vLLM HTR release history
 
+## v0.2.1 — quantized KV and 2M / 3M / 4M context
+
+Scaled8-bit per-token/head KV (`int8_per_token_head`) supports2M with MTP0 or MTP3. RHT-rotated4-bit per-token/head KV (`int4_per_token_head`) supports4M with MTP0 or3M with MTP3. The retained fusedD256 rotation, native KV selfchecks and source-bound cache profiles are included. Preferred sampling is built into the image; weights and older release tags remain unchanged.
+
+| KV cache | MTP | Max context | YaRN | KV pool |
+|---|---:|---:|---:|---:|
+| Scaled 8-bit per-token/head KV (`int8_per_token_head`) | 0 | **2,000,000** | ×8 | 27.75 GiB |
+| Scaled 8-bit per-token/head KV (`int8_per_token_head`) | 3 | **2,000,000** | ×8 | 27.75 GiB |
+| Rotated 4-bit per-token/head KV (`int4_per_token_head`) | 0 | **4,000,000** | ×16 | 26.875 GiB |
+| Rotated 4-bit per-token/head KV (`int4_per_token_head`) | 3 | **3,000,000** | ×16 | 22.375 GiB |
+
+| KV cache | MTP | BF16 prediction agreement | Prediction disagreement | Tie-aware agreement |
+|---|---:|---:|---:|---:|
+| Scaled 8-bit | 0 | **98.18%** (486/495) | **1.82%** | 99.80% |
+| Rotated 4-bit | 0 | **98.18%** (486/495) | **1.82%** | 99.39% |
+| Scaled 8-bit | 3 | **98.79%** (489/495) | **1.21%** | 99.80% |
+| Rotated 4-bit | 3 | **98.38%** (487/495) | **1.62%** | 99.60% |
+
+Accuracy figures are495-position teacher-forced BF16-KV prediction agreement, not broad task accuracy. [Profile/accuracy details](htr_runtime/docs/QUANTIZED-KV.md). Executable source `d836d40e6deb59e07c50b0db1eb343408278a187`; image `ghcr.io/hawgauto/vllm-htr@sha256:dde8c3ea80e5d0a56e9143894a12622d0c236bab1f6d3d8a10e4ab911c836afb`; GitHub tag `htr-v0.2.1`; model tag `v0.2.1`. The four profiles are capacity-qualified by load/readiness/generation.
+
+
 HTR serving-release versions are shared with the [Qwen3.8-Flash-Next-HTR model card](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR). They are independent of upstream vLLM and the separate HTR quantizer's version numbers.
 
 ## v0.1.0 — initial release
