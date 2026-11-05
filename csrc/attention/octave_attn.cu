@@ -759,6 +759,7 @@ __global__ void __launch_bounds__(256) window_attn_kernel(
   __shared__ int s_entry[kMaxWindowHits];
   __shared__ float s_score[8][kMaxWindowHits];
   __shared__ int s_count;
+  __shared__ int s_group_hits[8];
   const int qi = blockIdx.x, kvh = blockIdx.y;
   const int tid = threadIdx.x, w = tid >> 5, lane = tid & 31;
   const int hpk = hq / hkv;
@@ -766,27 +767,45 @@ __global__ void __launch_bounds__(256) window_attn_kernel(
   __syncthreads();
   const int req = q_to_req[qi];
   const int p = positions[qi];
-  if (req >= 0 && req < num_reqs) {
-    for (int j = tid; j < topk; j += 256) {
+  const bool live = req >= 0 && req < num_reqs;
+  // HTR research: ordered compaction. The upstream atomicAdd slot claim made
+  // the order of s_entry (and so the softmax / PV summation order below)
+  // depend on wave scheduling: run-to-run drift with the exact window on.
+  // Hits now keep their top-k index order (ballot + popcount per 32-lane
+  // group, group prefix in LDS), so the result is bitwise repeatable.
+  for (int base = 0; base < topk; base += 256) {
+    const int j = base + tid;
+    int e = -1;
+    if (live && j < topk) {
       const int t = indices[qi * sidx + j];
       const int d = p - t;
-      if (t < 0 || d < 0 || (d >= kWindow && t >= kSinks)) continue;
-      const int lb = t / block_size;
-      if (lb >= max_blocks) continue;
-      const int pb = block_table[req * max_blocks + lb];
-      if (pb < 0 || pb >= num_phys_blocks) continue;
-      const int slot = pb * block_size + (t - lb * block_size);
-      int e = -1;
-      if (d < kWindow && wtags[slot & wmask] == slot)
-        e = slot & wmask;
-      else if (t < kSinks && stags[slot & smask] == slot)
-        e = (slot & smask) | (1 << 30);
-      if (e < 0) continue;
-      const int k = atomicAdd(&s_count, 1);
-      if (k < kMaxWindowHits) s_entry[k] = e;
+      const int lb = t >= 0 ? t / block_size : -1;
+      if (t >= 0 && d >= 0 && (d < kWindow || t < kSinks) && lb < max_blocks) {
+        const int pb = block_table[req * max_blocks + lb];
+        if (pb >= 0 && pb < num_phys_blocks) {
+          const int slot = pb * block_size + (t - lb * block_size);
+          if (d < kWindow && wtags[slot & wmask] == slot)
+            e = slot & wmask;
+          else if (t < kSinks && stags[slot & smask] == slot)
+            e = (slot & smask) | (1 << 30);
+        }
+      }
     }
+    const unsigned long long vote = __ballot(e >= 0);
+    const unsigned group = (unsigned)(vote >> (__lane_id() & ~31));
+    if (lane == 0) s_group_hits[w] = __popc(group);
+    __syncthreads();
+    int k = s_count + __popc(group & ((1u << lane) - 1u));
+    for (int g = 0; g < w; ++g) k += s_group_hits[g];
+    if (e >= 0 && k < kMaxWindowHits) s_entry[k] = e;
+    __syncthreads();
+    if (tid == 0) {
+      int total = 0;
+      for (int g = 0; g < 8; ++g) total += s_group_hits[g];
+      s_count += total;
+    }
+    __syncthreads();
   }
-  __syncthreads();
   const int n = min(s_count, kMaxWindowHits);
   const float sl2 = sm_scale * 1.4426950408889634f;
   for (int g = w; g < hpk; g += 8) {
