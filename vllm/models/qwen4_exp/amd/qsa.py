@@ -97,6 +97,46 @@ _GL_GATE_LATE = _gl_os.environ.get("DIRECT_QSA_GATE_LATE") == "1"
 _GF_ON = _gl_os.environ.get('DIRECT_QSA_GATE_FUSE') == '1'   # nb2-gatefuse-v1 (static, trace-time)
 _GL_OUT_TAIL = _gl_os.environ.get("DIRECT_QSA_OUT_TAILZERO") == "1"
 
+# RESEARCH (research/v033-octave-kv): upstream octave_decode_sparse takes GQA groups <= 8
+# (WMMA tile hpk * QG <= 32, window kernel hq / hkv <= 8); HTR TP1 Qwen3.8 is Q24/KV2 = 12.
+_OCTAVE_MAX_GROUP = 8
+
+
+def _octave_head_split(
+    num_heads: int, num_kv_heads: int, device
+) -> list[torch.Tensor] | None:
+    """None when the upstream op takes the GQA group as is; else, for the fewest equal
+    sub-groups of size <= 8, the query-head ids of each pass (every KV head keeps its own
+    contiguous run of sub-group heads, so the kernel's head -> kv-head map is unchanged)."""
+    group = num_heads // num_kv_heads
+    if group <= _OCTAVE_MAX_GROUP:
+        return None
+    n = next(n for n in range(2, group + 1) if group % n == 0 and group // n <= _OCTAVE_MAX_GROUP)
+    sub = group // n
+    return [
+        torch.tensor([h * group + s * sub + j for h in range(num_kv_heads) for j in range(sub)],
+                     dtype=torch.long, device=device)
+        for s in range(n)
+    ]
+
+
+def _octave_decode_sparse(out, query, cache, block_table, q_to_req, indices, mid_o, k_signs,
+                          v_signs, scale, splits, fmt, *window, head_split=None):
+    """upstream torch.ops._C.octave_decode_sparse, run per head subset when the GQA group
+    exceeds what the kernel takes. Attention is independent per query head and the sparse
+    indices are per token, so the passes compute exactly the per-head upstream result."""
+    op = torch.ops._C.octave_decode_sparse
+    if head_split is None:
+        op(out, query, cache, block_table, q_to_req, indices, mid_o, k_signs, v_signs, scale,
+           splits, fmt, *window)
+        return
+    for heads in head_split:
+        q = query.index_select(1, heads)
+        o = torch.empty_like(q)
+        op(o, q, cache, block_table, q_to_req, indices, mid_o[:, : heads.numel()], k_signs,
+           v_signs, scale, splits, fmt, *window)
+        out.index_copy_(1, heads, o)
+
 
 def _octave_mid_o_capacity(vllm_config: VllmConfig) -> int:
     """Query rows times splits the Octave split-KV partials hold: every split
@@ -257,6 +297,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 vllm_config.attention_config.tq_max_kv_splits_for_cuda_graph
             )
             self._octave_capacity = _octave_mid_o_capacity(vllm_config)
+            self._octave_split: tuple[torch.device, list[torch.Tensor] | None] | None = None
             self._octave_positions: torch.Tensor | None = None
             device = torch.device("cuda", torch.accelerator.current_device_index())
             dtype = vllm_config.model_config.dtype
@@ -409,7 +450,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if self.octave_fmt is not None:
             assert self._octave_positions is not None
             signs, mid_o, splits = self._octave_buffers(num_tokens, query.device)
-            torch.ops._C.octave_decode_sparse(
+            if self._octave_split is None or self._octave_split[0] != query.device:
+                self._octave_split = (query.device, _octave_head_split(
+                    self.num_heads, self.num_kv_heads, query.device))
+            _octave_decode_sparse(
                 output[:num_tokens],
                 query[:num_tokens],
                 kv_cache,
@@ -427,6 +471,7 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 self._wtags,
                 self._stab,
                 self._stags,
+                head_split=self._octave_split[1],
             )
             return output
         key_cache, value_cache = kv_cache.transpose(1, 2).split(self.head_size, dim=-1)
