@@ -219,8 +219,10 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         # requiring the unrelated dense flash_attn_varlen_func rejects ROCm
         # installations that have every operation this owner actually calls.
         wanted = kwargs.get("kv_cache_dtype", args[6] if len(args) > 6 else None)
-        if _kv8_mode(wanted) or _kv4_mode(wanted):
-            # Reuse metadata fields, not FlashAttention's dense quantized reader.
+        if _kv8_mode(wanted) or _kv4_mode(wanted) or wanted in _OCTAVE_CACHE_DTYPES:
+            # Reuse metadata fields, not FlashAttention's dense quantized reader. RESEARCH
+            # (research/v033-octave-kv): Octave too -- the parent's quantized-KV guard is
+            # CUDA sm90/sm100/XPU-only, so upstream #59774 octave_* QSA raised on every ROCm GPU.
             parent_args, parent_kwargs = list(args), dict(kwargs)
             if len(parent_args) > 6:
                 parent_args[6] = "bfloat16"
@@ -228,8 +230,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 parent_kwargs["kv_cache_dtype"] = "bfloat16"
             super().__init__(*parent_args, **parent_kwargs)
             self.kv_cache_dtype = wanted
-            if (self.num_heads, self.num_kv_heads, self.head_size) != (24, 2, 256):
-                raise NotImplementedError("HTR INT8 main KV currently requires TP1 Q24/KV2/D256")
+            if wanted not in _OCTAVE_CACHE_DTYPES and (self.num_heads, self.num_kv_heads, self.head_size) != (24, 2, 256):
+                raise NotImplementedError("HTR quantized main KV requires TP1 Q24/KV2/D256")
         else:
             super().__init__(*args, **kwargs)
         if self.dcp_world_size != 1:
