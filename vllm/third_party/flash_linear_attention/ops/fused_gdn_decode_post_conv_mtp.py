@@ -18,6 +18,16 @@ import torch
 
 from vllm.triton_utils import tl, triton
 from vllm.utils.platform_utils import num_compute_units
+import functools
+from vllm.platforms import current_platform
+
+
+@functools.cache
+def _is_wave32_rocm(device_index: int | None) -> bool:
+    if not current_platform.is_rocm():
+        return False
+    idx = torch.cuda.current_device() if device_index is None else device_index
+    return torch.cuda.get_device_properties(idx).warp_size == 32
 
 
 @triton.jit
@@ -182,6 +192,14 @@ def fused_gdn_decode_post_conv_mtp_triton(
     # (tuned on MI300X and MI350X).
     heads, num_cus = num_requests * HV, num_compute_units(out.device.index)
     BV = 32 if heads < num_cus else 64 if heads <= 4 * num_cus else V
+    update_warps, norm_warps = 4, 2
+    if _is_wave32_rocm(out.device.index):
+        # HTR gfx1151 (RDNA3.5, wave32, 20 CUs): bit-exact sweep at HV=48,
+        # V=128, T=4 found BV=64 best at one request and BV=32 above, with
+        # 8 warps (the same lane count upstream gets from 4 wave64 warps).
+        # -9.4%/-5.3%/-7.4%/-10.4%/-3.7% kernel time at 1/2/3/4/8 requests.
+        BV = 64 if num_requests == 1 else 32
+        update_warps, norm_warps = 8, 1
     sum_sq = torch.empty(
         (out.shape[0], HV, V // BV), dtype=torch.float32, device=out.device
     )
@@ -209,7 +227,7 @@ def fused_gdn_decode_post_conv_mtp_triton(
         K=K,
         V=V,
         BV=BV,
-        num_warps=4,
+        num_warps=update_warps,
     )
     _gdn_mtp_gated_rmsnorm_kernel[(num_requests, HV, state_indices.shape[1])](
         out,
@@ -223,6 +241,6 @@ def fused_gdn_decode_post_conv_mtp_triton(
         V=V,
         NV=V // BV,
         SIGMOID_GATE=output_gate_activation == "sigmoid",
-        num_warps=2,
+        num_warps=norm_warps,
     )
     return out
