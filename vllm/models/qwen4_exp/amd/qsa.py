@@ -70,19 +70,18 @@ _KV8_ENABLED = _gl_os.environ.get("HTR_KV8_ENABLE", "0") == "1"
 _KV4_ENABLED = _gl_os.environ.get("HTR_KV4_ENABLE", "0") == "1"
 
 def _kv4_mode(mode):
-    return _KV4_ENABLED and mode == "int4_per_token_head"
+    return mode == "int4_per_token_head"
 
 def _kv8_mode(mode):
-    return _KV8_ENABLED and mode == "int8_per_token_head"
+    return mode == "int8_per_token_head"
 
 _OCTAVE_CACHE_DTYPES: tuple[CacheDType, ...] = (
     "octave_k3v4",
     "octave_k3v3",
     "octave_k3v3_compact",
 )
-_HTR_CACHE_DTYPES: tuple[CacheDType, ...] = tuple(
-    (["int8_per_token_head"] if _KV8_ENABLED else [])
-    + (["int4_per_token_head"] if _KV4_ENABLED else [])
+_HTR_CACHE_DTYPES: tuple[CacheDType, ...] = (
+    "int8_per_token_head", "int4_per_token_head",
 )
 # Packed formats are written by do_kv_cache_update, never by the fused BF16 prepare.
 _PACKED_CACHE_DTYPES: tuple[CacheDType, ...] = (*_OCTAVE_CACHE_DTYPES, *_HTR_CACHE_DTYPES)

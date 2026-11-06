@@ -438,7 +438,8 @@ def make_arg_parser(parser: FlexibleArgumentParser) -> FlexibleArgumentParser:
     parser = FrontendArgs.add_cli_args(parser)
     parser = AsyncEngineArgs.add_cli_args(parser)
 
-    return parser
+    from htr_native_policy import parser_defaults
+    return parser_defaults(parser)
 
 
 def validate_parsed_serve_args(args: argparse.Namespace):

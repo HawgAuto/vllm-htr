@@ -1,0 +1,10 @@
+ARG BASE=ghcr.io/hawgauto/vllm-htr:v0.2.1
+FROM ${BASE}
+USER root
+COPY source /payload/source
+COPY native /payload/native
+COPY changed.json /payload/changed.json
+RUN /opt/venv/bin/python3 /payload/source/htr_runtime/experimental/ple_row_cache/build.py && /opt/venv/bin/python3 /payload/source/htr_runtime/install_native_policy.py
+USER 1000:1000
+WORKDIR /workspace
+ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]

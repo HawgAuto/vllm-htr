@@ -2083,6 +2083,8 @@ class EngineArgs:
 
         NOTE: If VllmConfig is incompatible, we raise an error.
         """
+        from htr_native_policy import prepare_engine
+        prepare_engine(self)
         current_platform.pre_register_and_update()
 
         device_config = DeviceConfig(device=cast(Device, current_platform.device_type))
