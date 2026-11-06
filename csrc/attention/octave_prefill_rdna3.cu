@@ -36,7 +36,7 @@
 
   #include "octave_format.cuh"
 
-  #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__)
+  #if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1100__) && !defined(__gfx1151__)
     #define OCTAVE_PREFILL_STUB
   #endif
 
@@ -744,11 +744,11 @@ void octave_prefill(torch::Tensor out, torch::Tensor q, torch::Tensor k,
   static const int arch = [] {
     const std::string name =
         at::cuda::getCurrentDeviceProperties()->gcnArchName;
-    if (name.rfind("gfx1100", 0) == 0) return 0;
+    if (name.rfind("gfx1100", 0) == 0 || name.rfind("gfx1151", 0) == 0) return 0;
     if (name.rfind("gfx942", 0) == 0) return 1;
     return -1;
   }();
-  TORCH_CHECK(arch >= 0, "octave_prefill: gfx1100 or gfx942 only");
+  TORCH_CHECK(arch >= 0, "octave_prefill: gfx1100, gfx1151 or gfx942 only");
   const int num_seqs = seq_lens.size(0);
   if (num_seqs == 0 || q.size(0) == 0) return;
   const at::cuda::OptionalCUDAGuard guard(device_of(q));
