@@ -1,5 +1,13 @@
 # vLLM HTR release history
 
+## v0.2.2 — combined native runtime, Octave KV and bounded PLE
+
+Ordinary `vllm serve` now supplies the accepted sampler/draft improvements, wave32 GDN, bit-exact QSA preparation and default-on exact HIP draft filter. Three optional Octave KV formats add native gfx1151 kernels and deterministic compaction, with a masked-unused-slot NaN repair. Optional bounded PLE hot-row caching is off by default. Sampling, KV/context budgets, concurrency and prefill settings remain native user controls; checkpoint sampling replaces the predecessor's forced response profile. MTP0 and MTP3 remain available.
+
+Executable source `9a4917f41101926c8cb23d630018b8e5e4aec44c`; image `ghcr.io/hawgauto/vllm-htr@sha256:034898ebd182a240fa403ad5ea24bea3f647d933571e43420a27daf9af079d1c`; image alias `v0.2.2`; runtime tag `htr-v0.2.2`; model-card tag `v0.2.2`. Documentation-only release commits do not change these executable bytes. No weights, tokenizer/configuration or historical tags change.
+
+The integration matrix passed18 configurations (16 new-image,2 inherited controls),324 requests and90 reconstructed SSE streams, including five exact matched parity pairs. This is Htr5Core/single-sequence/configured32768-context/2GiB-KV qualification; earlier million-context, concurrency and quality measurements retain their original image scope. EOS-enabled prose probes reached their128-token cap; tool-result turns stopped normally. Persistent compiler-cache reuse is retained; no prebuilt seed is shipped and new request shapes may compile. See the current native guide and versioned qualification evidence.
+
 ## v0.2.1 — quantized KV and 2M / 3M / 4M context
 
 Scaled8-bit per-token/head KV (`int8_per_token_head`) supports2M with MTP0 or MTP3. RHT-rotated4-bit per-token/head KV (`int4_per_token_head`) supports4M with MTP0 or3M with MTP3. The retained fusedD256 rotation, native KV selfchecks and source-bound cache profiles are included. Preferred sampling is built into the image; weights and older release tags remain unchanged.

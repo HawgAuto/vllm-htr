@@ -1,4 +1,4 @@
-# vLLM HTR runtime — v0.2.2 candidate
+# vLLM HTR runtime — v0.2.2
 
 [Model and download](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Native serving guide](docs/native-serving.md) · [Older BF16 compatibility guide](docs/RUNNING-v0.2.0.md)
 
@@ -8,8 +8,7 @@ This successor keeps the accepted sampler/draft improvements, wave32 GDN and
 bit-exact QSA preparation. It adds all three optional Octave KV formats with
 native gfx1151 support and ordered window compaction, optional bounded PLE
 hot-row caching, and the accepted exact HIP draft filter (enabled by default).
-No model weights change. Qualification status is recorded separately; the
-historical results below belong to v0.2.1 and are not new measurements.
+No model weights change. [Completed v0.2.2 qualification](releases/v0.2.2/README.md) records the bounded matrix and delivery evidence; the historical results below belong to v0.2.1 and are not new measurements.
 
 The entrypoint is now ordinary `vllm serve`: pass `/model` and native vLLM
 arguments, not the historical launcher-only `--mtp` or `--context` aliases.

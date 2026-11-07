@@ -1,0 +1,17 @@
+{
+  "status": "PASS_PUBLIC_COMMAND_DELIVERY",
+  "image": "sha256:034898ebd182a240fa403ad5ea24bea3f647d933571e43420a27daf9af079d1c",
+  "public_command_sha256": "19d77ead8fe647bfc185dd9d2b7357974ffc9a6303502e0fb43e483eb2c61466",
+  "ready_seconds": 450.68352879583836,
+  "nonstream_requests": 13,
+  "streams_reconstructed": 5,
+  "tool_round_trip": true,
+  "environment_equals_image": true,
+  "bridge_loopback_port": "127.0.0.1:8000",
+  "registry_unchanged": true,
+  "owned_cleanup_verified": true,
+  "result_sha256": "2d5273cbd606502170076f444064dffd72806007299e260c7ed62b2ea1658af5",
+  "normal_sampling_finish": "length",
+  "source_commit": "9a4917f41101926c8cb23d630018b8e5e4aec44c",
+  "scope": "One additional exact public-command delivery run, separate from the 18-configuration integration matrix."
+}
