@@ -40,6 +40,48 @@ refusal and is not proof that an arbitrary configuration fits or has passed
 quality/performance testing. Invalid configuration or incompatible numerical
 modes are still rejected.
 
+## Optimized draft filter and source build
+
+The exact HIP draft filter is enabled by default (`HTR_Q38F=on`) through the
+native plugin allowlist. Set `HTR_Q38F=off` to use the original Torch filter.
+Its qualified fast path is gfx1151, the pinned Torch/HIP build, vocabulary
+248320, KC64, BF16/FP32 logits and one through eight rows. Unsupported shapes
+fall back to the original operator; MTP0 does not call the draft filter.
+`HTR_Q38F=verify` is an explicit diagnostic shadow mode, not a performance mode.
+
+The image is source-built over the pinned v0.2.1 runtime, including real gfx1151
+Octave kernels, the bounded PLE cache, and a byte-identical build of the accepted
+filter. Compilation and model-weight storage are different: retaining compiled
+programs does not create persistent unpacked model-weight copies.
+
+## Start the combined image
+
+```sh
+IMAGE=vllm-htr:v0.2.2
+MODEL="$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"
+WORKSPACE="$PWD/htr-cache/Htr5Core-v022"
+mkdir -p "$WORKSPACE"
+docker run --rm --init --pull=never --name vllm-htr \
+  --device /dev/kfd --device /dev/dri/renderD128 \
+  --group-add "$(stat -c %g /dev/kfd)" \
+  --group-add "$(stat -c %g /dev/dri/renderD128)" \
+  --pids-limit 8192 --shm-size 16g --ulimit core=0 \
+  --security-opt no-new-privileges:true \
+  -p 127.0.0.1:8000:8000 \
+  --mount "type=bind,src=$MODEL,dst=/model,readonly" \
+  --mount "type=bind,src=$WORKSPACE,dst=/workspace" \
+  "$IMAGE" /model --host 0.0.0.0 --port 8000 \
+  --max-model-len 32768 --max-num-seqs 1 \
+  --max-num-batched-tokens 2048 --kv-cache-memory-bytes 2147483648
+```
+
+This command uses BF16 KV, MTP3 and the checkpoint's sampling defaults. Add
+`--speculative-config null` for MTP0, or choose any listed KV dtype. Use native
+`--config your-config.yaml` for saved options. To enable a 16 MiB PLE cache,
+place `-e HTR_PLE_ROW_CACHE_BYTES=16777216` before the image name. Warm the
+selected configuration once and reuse its workspace; new shapes may compile.
+Only completed qualification receipts establish the tested envelope.
+
 ## Configuration reuse / quickload
 
 There is no new quickload subsystem. Save the native arguments or YAML you want,

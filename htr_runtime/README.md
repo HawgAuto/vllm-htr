@@ -1,6 +1,40 @@
-# vLLM HTR runtime — v0.2.1
+# vLLM HTR runtime — v0.2.2 candidate
 
-[Model and download](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Older BF16 compatibility guide](docs/RUNNING-v0.2.0.md)
+[Model and download](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Native serving guide](docs/native-serving.md) · [Older BF16 compatibility guide](docs/RUNNING-v0.2.0.md)
+
+## v0.2.2: combined native runtime
+
+This successor keeps the accepted sampler/draft improvements, wave32 GDN and
+bit-exact QSA preparation. It adds all three optional Octave KV formats with
+native gfx1151 support and ordered window compaction, optional bounded PLE
+hot-row caching, and the accepted exact HIP draft filter (enabled by default).
+No model weights change. Qualification status is recorded separately; the
+historical results below belong to v0.2.1 and are not new measurements.
+
+The entrypoint is now ordinary `vllm serve`: pass `/model` and native vLLM
+arguments, not the historical launcher-only `--mtp` or `--context` aliases.
+Sampling, KV budget/format, concurrency, prefill budget and context are user
+controls. Keep a persistent workspace for compile-cache reuse. See the
+[native guide](docs/native-serving.md) for copyable commands, configuration
+files, PLE controls and the HIP off-switch.
+
+Build from a clean committed checkout using the pinned v0.2.1 base image:
+
+```sh
+python htr_runtime/build_combined.py --output "$PWD/../htr-v022-build" \
+  --tag vllm-htr:v0.2.2
+```
+
+The builder fetches only its pinned Triton source dependency if a verified local
+`--triton-kernels` directory is not supplied, exports the exact Git tree, builds
+the native gfx1151 core without GPU access, source-builds the PLE/filter payload,
+and binds the resulting image. Run the CPU suite with the checkout mounted at
+`/source`: `/opt/venv/bin/python3 /source/htr_runtime/tests/run_native.py`.
+The dependency snapshot is used only by CMake; the parent runtime's installed
+Triton package is not replaced. Old regression files remain byte-preserved,
+with explicit successor tests for intentional version/plugin-policy changes.
+
+## Historical v0.2.1 documentation and measurements
 
 # v0.2.1 — 2M, 3M and 4M context profiles
 

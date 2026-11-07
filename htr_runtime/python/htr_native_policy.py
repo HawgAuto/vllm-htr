@@ -27,7 +27,7 @@ def environment_defaults(env=None, *, root=ROOT, base_defaults=None):
     defaults = dict(base_defaults)
     defaults.update(json.loads((root/'runtime-env.json').read_text()))
     defaults.update(DIRECT_W8A16='0', VLLM_ALLOW_LONG_MAX_MODEL_LEN='0',
-                    VLLM_PLUGINS='htr,htr_moe,gp8hc,q38spec,htr_autotune_pin')
+                    VLLM_PLUGINS='htr,htr_moe,gp8hc,q38spec,htr_autotune_pin,htr_q38f')
     for key, value in defaults.items():
         if key.startswith('DIRECT_QSA_UNION_') or key.startswith('DIRECT_QSA_NATIVE_'):
             continue

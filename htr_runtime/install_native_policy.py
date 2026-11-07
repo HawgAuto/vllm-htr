@@ -38,6 +38,14 @@ bindings={str(SITE/p):sha(SITE/p) for p in changed if p.startswith('vllm/') and 
 bindings[str(old_so[0])]=sha(old_so[0])
 for p in [SITE/'htr_native_policy.py',SITE/'00_htr_native_defaults.pth']:
     bindings[str(p)]=sha(p)
+# Include source-bound plugins/native libraries in compile-cache identity too.
+for tree in (ROOT/'python', ROOT/'native-bin'):
+    for p in sorted(tree.rglob('*')):
+        if p.is_file() and '__pycache__' not in p.parts:
+            bindings[str(p)] = sha(p)
+ple = ROOT/'experimental/ple_row_cache/libple_row_cache.so'
+assert ple.is_file(), 'bounded PLE cache missing'
+bindings[str(ple)] = sha(ple)
 (ROOT/'native-policy-bindings.json').write_text(json.dumps(bindings,indent=2)+'\n')
 revision=hashlib.sha256(json.dumps(bindings,sort_keys=True).encode()).hexdigest()
 (ROOT/'NATIVE-POLICY-REVISION').write_text(revision+'\n')

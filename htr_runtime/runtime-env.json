@@ -30,5 +30,7 @@
   "HTR_QSA_TAU": "1",
   "HTR_AUTOTUNE_PIN": "1",
   "HTR_GDN_XBLOCK1": "1",
-  "HTR_MOE_PARTITION4": "1"
+  "HTR_MOE_PARTITION4": "1",
+  "HTR_Q38F": "on",
+  "HTR_PLE_ROW_CACHE_BYTES": "0"
 }
