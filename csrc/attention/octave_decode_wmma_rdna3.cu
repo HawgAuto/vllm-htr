@@ -494,8 +494,13 @@ __global__ __launch_bounds__(64 * NSB) void decode_wmma(
                                ? 0.0f
                                : __builtin_amdgcn_exp2f(sc[e + 1] - mn);
           lsum += p0 + p1;
-          const _Float16 h0 = (_Float16)(p0 * v0 * PSCALE);
-          const _Float16 h1 = (_Float16)(p1 * v1 * PSCALE);
+          // Masked sparse entries read the unused slot-zero placeholder.
+          // Its scale may contain NaN/Inf; zero probability alone is not
+          // sufficient because 0 * NaN poisons every PV accumulator.
+          const _Float16 h0 = p0 == 0.0f ? (_Float16)0.0f
+                                        : (_Float16)(p0 * v0 * PSCALE);
+          const _Float16 h1 = p1 == 0.0f ? (_Float16)0.0f
+                                        : (_Float16)(p1 * v1 * PSCALE);
           psum += (float)h0 + (float)h1;
           pd[e >> 1] = __builtin_bit_cast(uint32_t, (h2v){h0, h1});
         }
