@@ -2,6 +2,8 @@
 import os
 import torch
 from . import wire
+from . import dense_wmma
+DENSE_WMMA = dense_wmma.enabled()
 
 _EXT = None
 CB = wire.cbscale()
@@ -75,6 +77,8 @@ def _linear_impl(x2, qweight, scales, su, sv, bias):
     mt, nt = qweight.shape[0], qweight.shape[1]
     if M == 0:
         return x2.new_empty((0, mt * 16))
+    if DENSE_WMMA and dense_wmma.eligible(M, mt, nt, qweight.shape[2] // 8, x2.dtype):
+        return dense_wmma.linear(E, x2, qweight, scales, su, sv, bias, CB, counters(x2.device))
     if M <= GEMV_MAX_M and x2.dtype in (torch.bfloat16, torch.float16) and use_fused(mt * 16, nt * 16, M):
         return E.gemv_fused(qweight, x2, su, sv, scales, CB, bias, counters(x2.device), fused_nsplit(mt * 16, nt * 16))
     if GEMV_MAX_M < M <= GEMV_LOOP_MAX and EPI and x2.dtype in (torch.bfloat16, torch.float16, torch.float32):

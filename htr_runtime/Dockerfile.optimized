@@ -1,0 +1,14 @@
+ARG BASE=ghcr.io/hawgauto/vllm-htr@sha256:034898ebd182a240fa403ad5ea24bea3f647d933571e43420a27daf9af079d1c
+FROM ${BASE}
+USER root
+COPY source/htr_runtime /payload/htr_runtime
+COPY native /payload/native
+RUN /opt/venv/bin/python3 /payload/htr_runtime/install_optimized.py
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.version="0.2.3" \
+      org.opencontainers.image.source="https://github.com/HawgAuto/vllm-htr" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.description="HTR optimized serving with grouped MoE, selected dense WMMA, asynchronous PLE and repaired quantized-KV bindings"
+USER 1000:1000
+WORKDIR /workspace
+ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]

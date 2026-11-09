@@ -1,4 +1,32 @@
-# vLLM HTR — v0.2.2
+# vLLM HTR — v0.2.3
+
+Native HTR serving for **AMD Strix Halo / gfx1151**, now with the retained
+concurrency stack: **grouped MoE**, **selected dense WMMA**, and **expanded
+asynchronous PLE**. This update also repairs the stale quantized-KV binding
+manifest that could block the INT8/INT4 compatibility launcher. Model weights,
+quantization, supported KV formats and sampling defaults are unchanged.
+
+[Run v0.2.3](htr_runtime/docs/optimized-serving.md) · [Htr5Core model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Release history](RELEASES.md)
+
+```sh
+docker pull ghcr.io/hawgauto/vllm-htr:v0.2.3
+```
+
+Use native vLLM flags to choose KV dtype/budget, concurrency, context and MTP.
+The new paths are on by default with guarded fallback and explicit disable
+controls. PLE hot-row caching remains off. No persistent unpacked-weight shadow
+or mandatory downloaded compile seed is introduced.
+
+The retained stack was selected through cumulative model screens, not by adding
+isolated speedups together. High-concurrency wins do not imply a single-stream
+speedup, broad accuracy or newly validated maximum context. The historical
+throughput targets remain unmet. Rejected candidates and unfinished concurrency
+work are excluded. Detailed release evidence is published with the release.
+
+The following v0.2.2 and earlier sections retain their original measurements,
+image pins and qualification scope; use the current guide above for v0.2.3.
+
+## Preserved v0.2.2 release
 
 Native `vllm serve` for the HTR Qwen3.8 runtime on **AMD Strix Halo / gfx1151**. This serving update combines the accepted kernels, optional Octave KV and bounded PLE caching without changing checkpoint weights.
 

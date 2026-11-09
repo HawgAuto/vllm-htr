@@ -261,3 +261,5 @@ def register():
     install()
     from . import partition4
     partition4.register()
+    from . import grouped
+    grouped.register()

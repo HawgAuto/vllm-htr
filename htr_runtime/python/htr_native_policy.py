@@ -22,6 +22,17 @@ NATIVE_CONTEXT = 262144
 
 def environment_defaults(env=None, *, root=ROOT, base_defaults=None):
     env = os.environ if env is None else env
+    # Record explicit overrides before filling defaults; child engines inherit
+    # this provenance so an automatic value can follow the parsed MTP mode.
+    if 'HTR_PLE_ASYNC_MAXN_SOURCE' not in env:
+        if 'HTR_PLE_ASYNC_MAXN' in env:
+            env['HTR_PLE_ASYNC_MAXN_SOURCE'] = 'user'
+        elif 'E59_PLE_DEV_MAXN' in env:
+            env['HTR_PLE_ASYNC_MAXN'] = env['E59_PLE_DEV_MAXN']
+            env['HTR_PLE_ASYNC_MAXN_SOURCE'] = 'legacy-user'
+        else:
+            env['HTR_PLE_ASYNC_MAXN_SOURCE'] = 'default'
+            env['HTR_PLE_ASYNC_MAXN'] = 'auto'
     if base_defaults is None:
         base_defaults = json.loads(Path('/opt/haloloom/qwen38/data/runtime-env.json').read_text())
     defaults = dict(base_defaults)
@@ -36,6 +47,23 @@ def environment_defaults(env=None, *, root=ROOT, base_defaults=None):
     if budget or env.get('HTR_PLE_CACHE_OBSERVE','0')=='1':
         env['DIRECT_PLE_NATIVE_LIB']=str(root/'experimental/ple_row_cache/libple_row_cache.so')
     return env
+
+
+def resolve_ple_maxn(mtp, env):
+    """Resolve the selected async-PLE envelope from native engine settings."""
+    if mtp not in (0, 3):
+        raise ValueError('HTR PLE defaults require MTP0 or MTP3')
+    source = env.get('HTR_PLE_ASYNC_MAXN_SOURCE', 'default')
+    value = env.get('HTR_PLE_ASYNC_MAXN', 'auto')
+    if source == 'default' or value == 'auto':
+        maximum = 32 if mtp == 0 else 16
+    else:
+        maximum = int(value)
+        if maximum < 0:
+            raise ValueError('PLE async row limit must be nonnegative')
+    env['HTR_PLE_ASYNC_MAXN'] = str(maximum)
+    env['E59_PLE_DEV_MAXN'] = str(maximum)
+    return maximum
 
 
 def canonical(value):
@@ -120,6 +148,7 @@ def prepare_engine(args):
         if not isinstance(value,int) or value < 1: raise ValueError(name+' must be positive')
     dtype = args.kv_cache_dtype
     os.environ['HTR_GDN_MTP']=str(mtp)
+    ple_maxn = resolve_ple_maxn(mtp, os.environ)
     os.environ['HTR_KV8_ENABLE']='1' if dtype=='int8_per_token_head' else '0'
     os.environ['HTR_KV4_ENABLE']='1' if dtype=='int4_per_token_head' else '0'
     os.environ['HTR_RHT_D256']='triton' if dtype=='int4_per_token_head' else 'pytorch'
@@ -142,7 +171,7 @@ def prepare_engine(args):
         'max_num_batched_tokens','kv_cache_dtype','kv_cache_memory_bytes',
         'enable_prefix_caching','compilation_config','speculative_config','hf_overrides',
         'tensor_parallel_size','pipeline_parallel_size','generation_config','override_generation_config')}
-    bound_env={key:value for key,value in os.environ.items() if key.startswith(('HTR_','DIRECT_','GP8HC_','E53_','E59_','E92_','Q38SPEC_')) and key!='HTR_RUNTIME_CACHE_ROOT'}
+    bound_env={key:value for key,value in os.environ.items() if key.startswith(('HTR_','DIRECT_','GP8HC_','E53_','E59_','E92_','Q38SPEC_')) and key not in ('HTR_RUNTIME_CACHE_ROOT','HTR_PLE_ASYNC_MAXN_SOURCE')}
     revision=(ROOT/'NATIVE-POLICY-REVISION').read_text().strip()
     identity=cache_identity(config,bound_env,revision)
     cache_root=Path(os.environ.get('HTR_CACHE_HOME','/workspace/cache'))/('htr-native-'+identity)
@@ -173,4 +202,4 @@ def prepare_engine(args):
     # Envelope is information, not an admission policy.
     if seqs>1 or chunk!=12288 or context>1048576 or dtype.startswith('octave_'):
         print('HTR_QUALIFICATION_ADVISORY '+json.dumps({'qualification_claim':False,'context':context,'seqs':seqs,'chunk':chunk,'kv':dtype}),flush=True)
-    print('HTR_RUNTIME_CONFIG '+json.dumps({'profile':identity,'mtp':mtp,'kv_cache_dtype':dtype,'context':context,'max_num_seqs':seqs,'max_num_batched_tokens':chunk,'ple_cache_bytes':budget}),flush=True)
+    print('HTR_RUNTIME_CONFIG '+json.dumps({'profile':identity,'mtp':mtp,'kv_cache_dtype':dtype,'context':context,'max_num_seqs':seqs,'max_num_batched_tokens':chunk,'ple_cache_bytes':budget,'ple_async_maxn':ple_maxn,'ple_async_maxn_source':os.environ.get('HTR_PLE_ASYNC_MAXN_SOURCE','default')}),flush=True)
