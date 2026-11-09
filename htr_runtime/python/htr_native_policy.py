@@ -66,6 +66,19 @@ def resolve_ple_maxn(mtp, env):
     return maximum
 
 
+def bind_ple_maxn(maximum, modules=None):
+    """Bind parsed policy before fork or in-process engine initialization."""
+    if modules is None:
+        import sys
+        modules = sys.modules
+    ple = modules.get('e59_ple_dev')
+    if ple is None or ple.MAXN == maximum:
+        return
+    if ple._B or ple._S['pending'] is not None:
+        raise ValueError('Cannot change the PLE row limit after initialization')
+    setattr(ple, 'MAXN', maximum)
+
+
 def canonical(value):
     if dataclasses.is_dataclass(value): return canonical(dataclasses.asdict(value))
     if isinstance(value, enum.Enum): return canonical(value.value)
@@ -149,6 +162,7 @@ def prepare_engine(args):
     dtype = args.kv_cache_dtype
     os.environ['HTR_GDN_MTP']=str(mtp)
     ple_maxn = resolve_ple_maxn(mtp, os.environ)
+    bind_ple_maxn(ple_maxn)
     os.environ['HTR_KV8_ENABLE']='1' if dtype=='int8_per_token_head' else '0'
     os.environ['HTR_KV4_ENABLE']='1' if dtype=='int4_per_token_head' else '0'
     os.environ['HTR_RHT_D256']='triton' if dtype=='int4_per_token_head' else 'pytorch'

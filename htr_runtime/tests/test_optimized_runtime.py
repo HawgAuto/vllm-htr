@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import tempfile
+from types import SimpleNamespace
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -77,6 +78,26 @@ class OptimizedRuntime(unittest.TestCase):
         self.resolve(0, env)
         self.policy.environment_defaults(env, root=ROOT, base_defaults={})
         self.assertEqual(self.resolve(3, env), 16)
+
+    def test_preimported_ple_module_receives_resolved_limit(self):
+        for maximum in (0, 16, 32, 64):
+            ple = SimpleNamespace(MAXN=4, _B={}, _S={'pending': None})
+            self.policy.bind_ple_maxn(maximum, {'e59_ple_dev': ple})
+            self.assertEqual(ple.MAXN, maximum)
+
+    def test_ple_limit_cannot_resize_live_buffers(self):
+        for buffers, pending in [({'ctrl': 123}, None), ({}, object())]:
+            ple = SimpleNamespace(MAXN=4, _B=buffers, _S={'pending': pending})
+            with self.assertRaises(ValueError):
+                self.policy.bind_ple_maxn(32, {'e59_ple_dev': ple})
+            self.assertEqual(ple.MAXN, 4)
+            self.policy.bind_ple_maxn(4, {'e59_ple_dev': ple})
+            self.assertEqual(ple.MAXN, 4)
+
+    def test_binding_does_not_import_ple_in_compiler_children(self):
+        modules = {}
+        self.policy.bind_ple_maxn(32, modules)
+        self.assertEqual(modules, {})
 
     def test_grouped_payload_is_folded_and_default_on(self):
         p = ROOT/'python/htr_moe_serve/grouped.py'
