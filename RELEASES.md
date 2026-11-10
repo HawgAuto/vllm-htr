@@ -1,5 +1,14 @@
 # vLLM HTR release history
 
+## v0.2.3 — optimized concurrency stack and KV startup repair
+
+Default-on grouped MoE, selected packed dense WMMA and expanded asynchronous PLE are folded into the native runtime. PLE limits follow MTP0/MTP3 settings; hot-row caching remains off. The INT8/INT4 compatibility binding repair corrects stale hashes without changing KV arithmetic or removing integrity checks. Unsupported shapes retain the original route and explicit controls remain available.
+
+Executable source `ff9897df3d5b5405af6ee2353a10b0fcd8b92394`; image `ghcr.io/hawgauto/vllm-htr@sha256:417cd5d14ce241128379614de7dc128bbc4f236b8c0f3853d6d91c5c4d84b221`; image alias `v0.2.3`; runtime tag `htr-v0.2.3`; model metadata tag `v0.2.3`. Checkpoint weights, tokenizer/configuration and historical releases remain unchanged. Documentation-only successors do not replace the qualified executable bytes.
+
+[Versioned release evidence](htr_runtime/releases/v0.2.3/QUALIFICATION.json) gives the installed-image scope. The MTP0 short Lisbon continuation and returned logprobs match the already-selected winner in both repeats; whole-model bitwise identity to v0.2.2 and broad task accuracy are not claimed. High-concurrency selection does not establish universal or single-stream speedups; historical throughput targets remain unmet. No prebuilt compiler seed is shipped and new shapes may compile.
+
+
 ## v0.2.2 — combined native runtime, Octave KV and bounded PLE
 
 Ordinary `vllm serve` now supplies the accepted sampler/draft improvements, wave32 GDN, bit-exact QSA preparation and default-on exact HIP draft filter. Three optional Octave KV formats add native gfx1151 kernels and deterministic compaction, with a masked-unused-slot NaN repair. Optional bounded PLE hot-row caching is off by default. Sampling, KV/context budgets, concurrency and prefill settings remain native user controls; checkpoint sampling replaces the predecessor's forced response profile. MTP0 and MTP3 remain available.

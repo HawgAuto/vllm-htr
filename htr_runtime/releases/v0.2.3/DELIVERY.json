@@ -1,0 +1,16 @@
+{
+  "status": "PASS_PUBLIC_COMMAND_DELIVERY",
+  "image": "sha256:417cd5d14ce241128379614de7dc128bbc4f236b8c0f3853d6d91c5c4d84b221",
+  "source_commit": "ff9897df3d5b5405af6ee2353a10b0fcd8b92394",
+  "environment_exact": true,
+  "entrypoint_exact": true,
+  "docker_bridge_loopback_port": 8000,
+  "readonly_model": true,
+  "public_command_sha256": "a4c6078f4f64ea44630b295ce27ff741cab4c26643224f6b2c6f651be398a74a",
+  "nonstream_requests": 13,
+  "SSE_streams": 5,
+  "tool_call_pass": true,
+  "tool_result_pass": true,
+  "cleanup_pass": true,
+  "cache_scope": "fresh final-image workspace; not a matched cold-start/quickload benchmark"
+}

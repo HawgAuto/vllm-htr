@@ -1,13 +1,13 @@
 # vLLM HTR runtime — v0.2.3
 
-[Model and download](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Native serving guide](docs/native-serving.md) · [Older BF16 compatibility guide](docs/RUNNING-v0.2.0.md)
+[Model and download](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Native serving guide](docs/optimized-serving.md) · [Older BF16 compatibility guide](docs/RUNNING-v0.2.0.md)
 
 ## v0.2.3: selected concurrency stack and KV startup repair
 
 Grouped MoE planning, selected dense WMMA and mode-dependent asynchronous PLE
 are runtime defaults. The quantized-KV compatibility manifest is repaired;
 weights and sampling defaults remain unchanged. Explicit user overrides win.
-[Current launch and source-build guide](docs/optimized-serving.md).
+[Current launch and source-build guide](docs/optimized-serving.md) · [Final-image qualification](releases/v0.2.3/README.md).
 
 The sections below preserve v0.2.2 and older release history and measurements;
 they are not new v0.2.3 performance or capacity claims.

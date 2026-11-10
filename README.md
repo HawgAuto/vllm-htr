@@ -21,7 +21,7 @@ The retained stack was selected through cumulative model screens, not by adding
 isolated speedups together. High-concurrency wins do not imply a single-stream
 speedup, broad accuracy or newly validated maximum context. The historical
 throughput targets remain unmet. Rejected candidates and unfinished concurrency
-work are excluded. Detailed release evidence is published with the release.
+work are excluded. [Final-image qualification and raw timing rows](htr_runtime/releases/v0.2.3/README.md) document the exact exercised scope.
 
 The following v0.2.2 and earlier sections retain their original measurements,
 image pins and qualification scope; use the current guide above for v0.2.3.
