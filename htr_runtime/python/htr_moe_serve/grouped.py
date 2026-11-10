@@ -92,6 +92,14 @@ def install(R):
     original=R.forward;P=Proxy(R,original)
     def forward(ar,x,ids,w):
         T=x.shape[0]
+        # Some backends warm only smaller live batches before capture, whose
+        # dummy router rows are padding. Qualify admitted shapes from actual
+        # larger eager prefixes before returning the unchanged native result.
+        if (T>max(D.CANDIDATE_ROWS) and ar['_kf']==4
+                and not torch.cuda.is_current_stream_capturing()
+                and (P.BPS_GU,P.BPS_DN,P.FENCE_RA,P.FUSE,P.V2_MIN,P._htr_partition4)==(5,1,1,True,48,True)):
+            metadata(ar,x,ids,w)
+            prime_smaller(P,ar,x,ids,w)
         if T not in D.CANDIDATE_ROWS or ar['_kf']!=4:return original(ar,x,ids,w)
         if (P.BPS_GU,P.BPS_DN,P.FENCE_RA,P.FUSE,P.V2_MIN,P._htr_partition4)!=(5,1,1,True,48,True):
             raise RuntimeError('Grouped MoE split/partition4 contract')
