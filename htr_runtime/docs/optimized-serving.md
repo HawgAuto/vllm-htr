@@ -31,6 +31,7 @@ set -euo pipefail
 IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.3-coldstart.1
 MODEL=${MODEL:-"$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"}
 WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v023"}
+mkdir -p "$WORKSPACE"
 exec docker run --rm --init --pull=never --name vllm-htr \
   --device /dev/kfd --device /dev/dri/renderD128 \
   --group-add "$(stat -c %g /dev/kfd)" \
