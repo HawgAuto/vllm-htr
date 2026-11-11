@@ -35,7 +35,8 @@ IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.1
 docker pull "$IMAGE"
 MODEL="$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"
 WORKSPACE="$PWD/htr-cache/Htr5Core-v021"
-mkdir -p "$WORKSPACE"
+mkdir -p "$WORKSPACE/tmp"
+# The first start compiles a module and needs $WORKSPACE/tmp to exist; the v0.2.3 image does not create it in time.
 htr() {
   docker run --rm --init --pull=never --name vllm-htr \
     --device /dev/kfd --device /dev/dri/renderD128 \
