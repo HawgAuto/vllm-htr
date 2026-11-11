@@ -1,5 +1,17 @@
 # vLLM HTR release history
 
+## v0.2.3-coldstart.1 — cold start from an empty workspace
+
+v0.2.3 plus the cold-start fix: `htr_native_policy.environment_defaults()` now creates `TMPDIR` and the cache roots, so the first start no longer needs `mkdir -p "$WORKSPACE/tmp"` before `docker run`.
+
+Image `ghcr.io/hawgauto/vllm-htr@sha256:7b7a4688671d945c439c0f934611598975f6fbe67459ca36897b824c17e424a3`; image alias `v0.2.3-coldstart.1`; source commit `879fc13d99a0dea2f05ffce0bc93f11b38e8d490` (= main after `b885a03a56`, i.e. the `htr-v0.2.3` tag plus this fix); same recipe and base as v0.2.3. The `v0.2.3` tag and image are unchanged.
+
+Checked with one cold start on the AMD Strix Halo iGPU from a completely empty workspace using the documented start command and no `mkdir` workaround: healthy after 659 s (11 min 0 s) from container start, one chat request answered (HTTP 200, `42`), clean shutdown, zero `unable to make temporary file`, `Traceback` or `ERROR` lines in either stream; the aiter JIT build completed in 133.1 s and produced a `.so` byte-identical (`65a82a1363c1…`) to the production artifact. `/workspace/tmp` and `/workspace/cache` were created at +0.1 s, before the compile.
+
+Known differences to v0.2.3 (verified against the v0.2.3 image, 411268 paths before / 411284 after — 16 added, 0 removed, 18 changed, provenance-checked byte for byte against source `879fc13d99`): 117 of 120 image layers are shared and the 3 differing layers are the release's own `COPY`/`COPY`/`RUN` positions; the content changes are the fix, its unit test, the v0.2.3 release-note files and the install records; 410 files are mode 664 instead of 644 with identical content (build-environment artifact: 664 build context, `shutil.copytree`); `NATIVE-POLICY-REVISION` changed `6d95ec40…` → `6c1cc60a…` because the revision hash covers the fixed policy file; and `/payload/source/htr_runtime/python/htr_native_policy.py` still holds the older base-image policy file, which is not imported — `import htr_native_policy` resolves to the fixed `/opt/vllm-htr/python` copy. Entrypoint, user, working directory and all 51 environment values are identical to v0.2.3; only the `org.opencontainers.image.revision` label differs.
+
+v0.2.3 performance and capacity qualification was not re-run on this image and no new performance claim is made; the v0.2.3 numbers remain measurements of the v0.2.3 executable bytes.
+
 ## v0.2.3 — optimized concurrency stack and KV startup repair
 
 Default-on grouped MoE, selected packed dense WMMA and expanded asynchronous PLE are folded into the native runtime. PLE limits follow MTP0/MTP3 settings; hot-row caching remains off. The INT8/INT4 compatibility binding repair corrects stale hashes without changing KV arithmetic or removing integrity checks. Unsupported shapes retain the original route and explicit controls remain available.

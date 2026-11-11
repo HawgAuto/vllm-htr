@@ -9,8 +9,10 @@ quantization, supported KV formats and sampling defaults are unchanged.
 [Run v0.2.3](htr_runtime/docs/optimized-serving.md) · [Htr5Core model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Release history](RELEASES.md)
 
 ```sh
-docker pull ghcr.io/hawgauto/vllm-htr:v0.2.3
+docker pull ghcr.io/hawgauto/vllm-htr:v0.2.3-coldstart.1
 ```
+
+This image is v0.2.3 plus the cold-start fix; the v0.2.3 qualification measurements were made on the v0.2.3 image and were not re-run.
 
 Use native vLLM flags to choose KV dtype/budget, concurrency, context and MTP.
 The new paths are on by default with guarded fallback and explicit disable

@@ -28,11 +28,9 @@ sampling, context, KV budget, concurrency and speculation flags remain native:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.3
+IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.3-coldstart.1
 MODEL=${MODEL:-"$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"}
 WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v023"}
-mkdir -p "$WORKSPACE/tmp"
-# The first start compiles a module and needs $WORKSPACE/tmp to exist; the v0.2.3 image does not create it in time.
 exec docker run --rm --init --pull=never --name vllm-htr \
   --device /dev/kfd --device /dev/dri/renderD128 \
   --group-add "$(stat -c %g /dev/kfd)" \
@@ -82,7 +80,8 @@ python3 htr_runtime/build_optimized.py \
 
 The builder requires a clean committed tree, the pinned public v0.2.2 base and
 Docker. It rebuilds the selected dense extension from source using the original
-Ninja recipe and requires byte identity with the qualified native artifact.
+Ninja recipe and requires byte identity with the qualified native artifact. The
+cold-start fix is commit 879fc13d99a0 on main, after the htr-v0.2.3 tag.
 All other native libraries are inherited unchanged from the pinned base. It
 checks source/native/base/KV manifest consistency before admitting the image.
 No host ROCm compiler or GPU access is needed for the build. The historical

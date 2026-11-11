@@ -73,7 +73,7 @@ IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:034898ebd182a240fa403ad5ea24bea3f647d9335
 MODEL=${MODEL:-"$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"}
 WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v022"}
 mkdir -p "$WORKSPACE/tmp"
-# The first start compiles a module and needs $WORKSPACE/tmp to exist; the v0.2.3 image does not create it in time.
+# The first start compiles a module and needs $WORKSPACE/tmp to exist; this pinned v0.2.2 image does not create the directory in time.
 exec docker run --rm --init --pull=never --name vllm-htr \
   --device /dev/kfd --device /dev/dri/renderD128 \
   --group-add "$(stat -c %g /dev/kfd)" \

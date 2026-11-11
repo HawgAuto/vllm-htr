@@ -71,7 +71,7 @@ Requires Linux, an AMD gfx1151 GPU (Strix Halo), approximately 128 GB shared sys
 MODEL=/absolute/path/to/Qwen3.8-Flash-Next-HTR
 WORKSPACE=/absolute/path/to/writable-htr-workspace
 mkdir -p "$WORKSPACE/tmp"
-# The first start compiles a module and needs $WORKSPACE/tmp to exist; the v0.2.3 image does not create it in time.
+# The first start compiles a module and needs $WORKSPACE/tmp to exist; this pinned v0.2.0 image does not create the directory in time.
 # The image runs as UID 1000; this directory must be writable by that UID.
 docker run --rm --init --pull=never --name vllm-htr \
   --device /dev/kfd --device /dev/dri/renderD128 \
