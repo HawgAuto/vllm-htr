@@ -18,6 +18,24 @@ class NativePolicy(unittest.TestCase):
         self.assertEqual(env['HTR_PLE_ROW_CACHE_BYTES'], '123456')
         self.assertEqual(env['HTR_QSA_TAU'], '1')
 
+    def test_defaults_materialize_tmpdir_and_cache_roots(self):
+        with tempfile.TemporaryDirectory() as base:
+            base = Path(base)
+            env = {'TMPDIR': str(base/'tmp'), 'AITER_JIT_DIR': str(base/'cache/aiter-jit'),
+                   'XDG_CACHE_HOME': str(base/'cache/xdg')}
+            policy.environment_defaults(env, root=ROOT, base_defaults={})
+            for key in ('TMPDIR', 'AITER_JIT_DIR', 'XDG_CACHE_HOME'):
+                self.assertTrue(Path(env[key]).is_dir(), key)
+            # An existing directory is left alone and does not raise.
+            policy.environment_defaults(env, root=ROOT, base_defaults={})
+            self.assertTrue((base/'tmp').is_dir())
+            # A path that cannot be created does not abort start-up.
+            blocker = base/'file'
+            blocker.write_text('')
+            env = {'TMPDIR': str(base/'tmp'), 'AITER_JIT_DIR': str(blocker/'aiter-jit')}
+            policy.environment_defaults(env, root=ROOT, base_defaults={})
+            self.assertFalse((blocker/'aiter-jit').exists())
+
     def test_identity_separates_configuration(self):
         config = {'kv_cache_dtype': 'auto', 'max_num_seqs': 1, 'max_num_batched_tokens': 2048}
         a = policy.cache_identity(config, {'HTR_PLE_ROW_CACHE_BYTES':'0'}, 'rev1')

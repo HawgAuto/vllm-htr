@@ -43,6 +43,16 @@ def environment_defaults(env=None, *, root=ROOT, base_defaults=None):
         if key.startswith('DIRECT_QSA_UNION_') or key.startswith('DIRECT_QSA_NATIVE_'):
             continue
         env.setdefault(key, str(value))
+    # Toolchains consume these paths before prepare_engine() creates them (the
+    # aiter JIT build runs while vLLM parses argv), so materialize the roots here
+    # and give a cold workspace a usable TMPDIR and cache from the first child on.
+    for key in ('TMPDIR',) + CACHE_KEYS:
+        value = env.get(key)
+        if value:
+            try:
+                Path(value).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
     budget=ple_budget(int(env.get('HTR_PLE_ROW_CACHE_BYTES','0')))
     if budget or env.get('HTR_PLE_CACHE_OBSERVE','0')=='1':
         env['DIRECT_PLE_NATIVE_LIB']=str(root/'experimental/ple_row_cache/libple_row_cache.so')
