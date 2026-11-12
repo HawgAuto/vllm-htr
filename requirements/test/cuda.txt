@@ -800,7 +800,7 @@ pluggy==1.5.0
     # via
     #   pytest
     #   pytest-cov
-polars==1.29.0
+polars==2.0.0
     # via mteb
 pooch==1.8.2
     # via librosa
