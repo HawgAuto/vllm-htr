@@ -1,0 +1,4393 @@
+{
+  "schema": "htr-v024-selected-stack-evidence-v1",
+  "scope": "Historical selected-stack screens; not timings rerun on the final packaged image",
+  "performance_config": {
+    "mtp": 3,
+    "max_num_seqs": 4,
+    "max_model_len": 40960,
+    "arms": 3,
+    "visits_per_arm": 2,
+    "order": "shipped, K6+E59, K6+E59+WMMA9, reversed"
+  },
+  "realistic_rows": [
+    {
+      "visit": "v01-s-shipped-r1",
+      "arm": "s-shipped",
+      "concurrency": 1,
+      "requests": 24,
+      "window_s": 140.373,
+      "out_tokens": 4768,
+      "agg_tps": 33.967,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 47.7629,
+        "p90": 56.2022,
+        "max": 58.817,
+        "mean": 46.325467
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.421745,
+        "p90": 5.384986,
+        "max": 9.96386,
+        "mean": 1.638366
+      },
+      "itl_chunk_s": {
+        "n": 1577,
+        "p50": 0.063044,
+        "p90": 0.066255,
+        "max": 0.205759,
+        "mean": 0.063795
+      },
+      "acceptance": {
+        "drafts": 1577.0,
+        "draft_tokens": 4731.0,
+        "accepted_tokens": 3190.0,
+        "accept_rate": 0.6743,
+        "mean_accept_len": 3.0228,
+        "per_position": {
+          "0": 0.832,
+          "1": 0.6646,
+          "2": 0.5263
+        }
+      }
+    },
+    {
+      "visit": "v01-s-shipped-r1",
+      "arm": "s-shipped",
+      "concurrency": 2,
+      "requests": 24,
+      "window_s": 104.867,
+      "out_tokens": 4826,
+      "agg_tps": 46.02,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 30.4074,
+        "p90": 34.9783,
+        "max": 44.8337,
+        "mean": 29.6714
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.44323,
+        "p90": 4.919526,
+        "max": 5.634356,
+        "mean": 1.596744
+      },
+      "itl_chunk_s": {
+        "n": 1564,
+        "p50": 0.102722,
+        "p90": 0.108526,
+        "max": 0.376107,
+        "mean": 0.102029
+      },
+      "acceptance": {
+        "drafts": 1564.0,
+        "draft_tokens": 4692.0,
+        "accepted_tokens": 3254.0,
+        "accept_rate": 0.6935,
+        "mean_accept_len": 3.0806,
+        "per_position": {
+          "0": 0.8363,
+          "1": 0.6867,
+          "2": 0.5575
+        }
+      }
+    },
+    {
+      "visit": "v01-s-shipped-r1",
+      "arm": "s-shipped",
+      "concurrency": 3,
+      "requests": 24,
+      "window_s": 109.244,
+      "out_tokens": 4996,
+      "agg_tps": 45.733,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 21.2477,
+        "p90": 24.1101,
+        "max": 29.7729,
+        "mean": 20.047829
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.461937,
+        "p90": 8.352405,
+        "max": 8.357311,
+        "mean": 2.094578
+      },
+      "itl_chunk_s": {
+        "n": 1615,
+        "p50": 0.155533,
+        "p90": 0.164465,
+        "max": 0.61626,
+        "mean": 0.162629
+      },
+      "acceptance": {
+        "drafts": 1615.0,
+        "draft_tokens": 4845.0,
+        "accepted_tokens": 3375.0,
+        "accept_rate": 0.6966,
+        "mean_accept_len": 3.0898,
+        "per_position": {
+          "0": 0.8335,
+          "1": 0.6923,
+          "2": 0.5641
+        }
+      }
+    },
+    {
+      "visit": "v01-s-shipped-r1",
+      "arm": "s-shipped",
+      "concurrency": 4,
+      "requests": 24,
+      "window_s": 96.724,
+      "out_tokens": 4897,
+      "agg_tps": 50.629,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 19.6745,
+        "p90": 31.6194,
+        "max": 34.4899,
+        "mean": 21.836821
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.584893,
+        "p90": 8.290578,
+        "max": 8.295459,
+        "mean": 2.191652
+      },
+      "itl_chunk_s": {
+        "n": 1582,
+        "p50": 0.167201,
+        "p90": 0.187679,
+        "max": 0.541196,
+        "mean": 0.153214
+      },
+      "acceptance": {
+        "drafts": 1582.0,
+        "draft_tokens": 4746.0,
+        "accepted_tokens": 3310.0,
+        "accept_rate": 0.6974,
+        "mean_accept_len": 3.0923,
+        "per_position": {
+          "0": 0.8331,
+          "1": 0.6915,
+          "2": 0.5676
+        }
+      }
+    },
+    {
+      "visit": "v02-k-k6w-e59-r1",
+      "arm": "k-k6w-e59",
+      "concurrency": 1,
+      "requests": 24,
+      "window_s": 141.963,
+      "out_tokens": 4958,
+      "agg_tps": 34.924,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 53.3467,
+        "p90": 61.0508,
+        "max": 63.432,
+        "mean": 50.624175
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.441361,
+        "p90": 5.571549,
+        "max": 11.628231,
+        "mean": 1.939498
+      },
+      "itl_chunk_s": {
+        "n": 1592,
+        "p50": 0.058286,
+        "p90": 0.061137,
+        "max": 0.416643,
+        "mean": 0.059648
+      },
+      "acceptance": {
+        "drafts": 1592.0,
+        "draft_tokens": 4776.0,
+        "accepted_tokens": 3362.0,
+        "accept_rate": 0.7039,
+        "mean_accept_len": 3.1118,
+        "per_position": {
+          "0": 0.8367,
+          "1": 0.6953,
+          "2": 0.5798
+        }
+      }
+    },
+    {
+      "visit": "v02-k-k6w-e59-r1",
+      "arm": "k-k6w-e59",
+      "concurrency": 2,
+      "requests": 24,
+      "window_s": 104.119,
+      "out_tokens": 4772,
+      "agg_tps": 45.832,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 30.8814,
+        "p90": 35.2968,
+        "max": 42.5416,
+        "mean": 29.701817
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.679859,
+        "p90": 5.194533,
+        "max": 5.778381,
+        "mean": 1.773894
+      },
+      "itl_chunk_s": {
+        "n": 1540,
+        "p50": 0.102075,
+        "p90": 0.107751,
+        "max": 0.344096,
+        "mean": 0.101928
+      },
+      "acceptance": {
+        "drafts": 1540.0,
+        "draft_tokens": 4620.0,
+        "accepted_tokens": 3226.0,
+        "accept_rate": 0.6983,
+        "mean_accept_len": 3.0948,
+        "per_position": {
+          "0": 0.8409,
+          "1": 0.6935,
+          "2": 0.5604
+        }
+      }
+    },
+    {
+      "visit": "v02-k-k6w-e59-r1",
+      "arm": "k-k6w-e59",
+      "concurrency": 3,
+      "requests": 24,
+      "window_s": 108.162,
+      "out_tokens": 4974,
+      "agg_tps": 45.986,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 19.3744,
+        "p90": 23.2709,
+        "max": 25.8869,
+        "mean": 19.344575
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.460902,
+        "p90": 7.820941,
+        "max": 7.825252,
+        "mean": 2.026581
+      },
+      "itl_chunk_s": {
+        "n": 1611,
+        "p50": 0.155658,
+        "p90": 0.173577,
+        "max": 0.627568,
+        "mean": 0.161868
+      },
+      "acceptance": {
+        "drafts": 1611.0,
+        "draft_tokens": 4833.0,
+        "accepted_tokens": 3355.0,
+        "accept_rate": 0.6942,
+        "mean_accept_len": 3.0826,
+        "per_position": {
+          "0": 0.833,
+          "1": 0.6884,
+          "2": 0.5612
+        }
+      }
+    },
+    {
+      "visit": "v02-k-k6w-e59-r1",
+      "arm": "k-k6w-e59",
+      "concurrency": 4,
+      "requests": 24,
+      "window_s": 100.467,
+      "out_tokens": 4934,
+      "agg_tps": 49.11,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 18.7001,
+        "p90": 31.598,
+        "max": 34.5049,
+        "mean": 21.680008
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.808581,
+        "p90": 8.238916,
+        "max": 8.243557,
+        "mean": 2.482775
+      },
+      "itl_chunk_s": {
+        "n": 1596,
+        "p50": 0.173962,
+        "p90": 0.189489,
+        "max": 0.642053,
+        "mean": 0.157378
+      },
+      "acceptance": {
+        "drafts": 1596.0,
+        "draft_tokens": 4788.0,
+        "accepted_tokens": 3336.0,
+        "accept_rate": 0.6967,
+        "mean_accept_len": 3.0902,
+        "per_position": {
+          "0": 0.8371,
+          "1": 0.6905,
+          "2": 0.5626
+        }
+      }
+    },
+    {
+      "visit": "v03-kw-k6w-e59-wmma9-r1",
+      "arm": "kw-k6w-e59-wmma9",
+      "concurrency": 1,
+      "requests": 24,
+      "window_s": 139.65,
+      "out_tokens": 4958,
+      "agg_tps": 35.503,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 54.0098,
+        "p90": 61.2582,
+        "max": 63.452,
+        "mean": 51.557879
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.450948,
+        "p90": 5.555769,
+        "max": 11.441578,
+        "mean": 1.921398
+      },
+      "itl_chunk_s": {
+        "n": 1592,
+        "p50": 0.058108,
+        "p90": 0.060348,
+        "max": 0.204972,
+        "mean": 0.058458
+      },
+      "acceptance": {
+        "drafts": 1592.0,
+        "draft_tokens": 4776.0,
+        "accepted_tokens": 3362.0,
+        "accept_rate": 0.7039,
+        "mean_accept_len": 3.1118,
+        "per_position": {
+          "0": 0.8367,
+          "1": 0.6953,
+          "2": 0.5798
+        }
+      }
+    },
+    {
+      "visit": "v03-kw-k6w-e59-wmma9-r1",
+      "arm": "kw-k6w-e59-wmma9",
+      "concurrency": 2,
+      "requests": 24,
+      "window_s": 103.075,
+      "out_tokens": 4772,
+      "agg_tps": 46.296,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 31.677,
+        "p90": 35.3743,
+        "max": 42.6144,
+        "mean": 30.191987
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.728163,
+        "p90": 5.197139,
+        "max": 5.620512,
+        "mean": 1.770092
+      },
+      "itl_chunk_s": {
+        "n": 1563,
+        "p50": 0.101549,
+        "p90": 0.10619,
+        "max": 0.341222,
+        "mean": 0.09908
+      },
+      "acceptance": {
+        "drafts": 1563.0,
+        "draft_tokens": 4689.0,
+        "accepted_tokens": 3202.0,
+        "accept_rate": 0.6829,
+        "mean_accept_len": 3.0486,
+        "per_position": {
+          "0": 0.8279,
+          "1": 0.6756,
+          "2": 0.5451
+        }
+      }
+    },
+    {
+      "visit": "v03-kw-k6w-e59-wmma9-r1",
+      "arm": "kw-k6w-e59-wmma9",
+      "concurrency": 3,
+      "requests": 24,
+      "window_s": 101.415,
+      "out_tokens": 5016,
+      "agg_tps": 49.46,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 21.8302,
+        "p90": 24.3274,
+        "max": 30.5041,
+        "mean": 21.538758
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.706523,
+        "p90": 7.84501,
+        "max": 7.850183,
+        "mean": 2.110678
+      },
+      "itl_chunk_s": {
+        "n": 1612,
+        "p50": 0.153861,
+        "p90": 0.159677,
+        "max": 0.499605,
+        "mean": 0.148953
+      },
+      "acceptance": {
+        "drafts": 1612.0,
+        "draft_tokens": 4836.0,
+        "accepted_tokens": 3397.0,
+        "accept_rate": 0.7024,
+        "mean_accept_len": 3.1073,
+        "per_position": {
+          "0": 0.8406,
+          "1": 0.701,
+          "2": 0.5658
+        }
+      }
+    },
+    {
+      "visit": "v03-kw-k6w-e59-wmma9-r1",
+      "arm": "kw-k6w-e59-wmma9",
+      "concurrency": 4,
+      "requests": 24,
+      "window_s": 95.765,
+      "out_tokens": 4955,
+      "agg_tps": 51.741,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 19.7627,
+        "p90": 31.7947,
+        "max": 34.5046,
+        "mean": 22.279233
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.82926,
+        "p90": 8.187156,
+        "max": 8.190464,
+        "mean": 2.421129
+      },
+      "itl_chunk_s": {
+        "n": 1603,
+        "p50": 0.173847,
+        "p90": 0.187485,
+        "max": 0.53951,
+        "mean": 0.148219
+      },
+      "acceptance": {
+        "drafts": 1603.0,
+        "draft_tokens": 4809.0,
+        "accepted_tokens": 3348.0,
+        "accept_rate": 0.6962,
+        "mean_accept_len": 3.0886,
+        "per_position": {
+          "0": 0.8365,
+          "1": 0.6918,
+          "2": 0.5602
+        }
+      }
+    },
+    {
+      "visit": "v04-kw-k6w-e59-wmma9-r2",
+      "arm": "kw-k6w-e59-wmma9",
+      "concurrency": 1,
+      "requests": 24,
+      "window_s": 132.887,
+      "out_tokens": 4958,
+      "agg_tps": 37.31,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 53.6442,
+        "p90": 60.846,
+        "max": 63.0122,
+        "mean": 51.212208
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.407049,
+        "p90": 5.374516,
+        "max": 9.48746,
+        "mean": 1.615375
+      },
+      "itl_chunk_s": {
+        "n": 1592,
+        "p50": 0.058352,
+        "p90": 0.060706,
+        "max": 0.205087,
+        "mean": 0.058822
+      },
+      "acceptance": {
+        "drafts": 1592.0,
+        "draft_tokens": 4776.0,
+        "accepted_tokens": 3362.0,
+        "accept_rate": 0.7039,
+        "mean_accept_len": 3.1118,
+        "per_position": {
+          "0": 0.8367,
+          "1": 0.6953,
+          "2": 0.5798
+        }
+      }
+    },
+    {
+      "visit": "v04-kw-k6w-e59-wmma9-r2",
+      "arm": "kw-k6w-e59-wmma9",
+      "concurrency": 2,
+      "requests": 24,
+      "window_s": 100.486,
+      "out_tokens": 4863,
+      "agg_tps": 48.395,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 31.4671,
+        "p90": 35.348,
+        "max": 52.2011,
+        "mean": 30.723125
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.438441,
+        "p90": 4.880131,
+        "max": 5.132434,
+        "mean": 1.537117
+      },
+      "itl_chunk_s": {
+        "n": 1555,
+        "p50": 0.101941,
+        "p90": 0.106952,
+        "max": 0.342083,
+        "mean": 0.099666
+      },
+      "acceptance": {
+        "drafts": 1555.0,
+        "draft_tokens": 4665.0,
+        "accepted_tokens": 3297.0,
+        "accept_rate": 0.7068,
+        "mean_accept_len": 3.1203,
+        "per_position": {
+          "0": 0.8457,
+          "1": 0.7055,
+          "2": 0.5691
+        }
+      }
+    },
+    {
+      "visit": "v04-kw-k6w-e59-wmma9-r2",
+      "arm": "kw-k6w-e59-wmma9",
+      "concurrency": 3,
+      "requests": 24,
+      "window_s": 99.655,
+      "out_tokens": 4984,
+      "agg_tps": 50.013,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 21.811,
+        "p90": 24.0626,
+        "max": 33.2596,
+        "mean": 21.841554
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.472565,
+        "p90": 7.607366,
+        "max": 7.612033,
+        "mean": 2.028871
+      },
+      "itl_chunk_s": {
+        "n": 1594,
+        "p50": 0.153624,
+        "p90": 0.159382,
+        "max": 0.505452,
+        "mean": 0.147635
+      },
+      "acceptance": {
+        "drafts": 1594.0,
+        "draft_tokens": 4782.0,
+        "accepted_tokens": 3383.0,
+        "accept_rate": 0.7074,
+        "mean_accept_len": 3.1223,
+        "per_position": {
+          "0": 0.8494,
+          "1": 0.7026,
+          "2": 0.5703
+        }
+      }
+    },
+    {
+      "visit": "v04-kw-k6w-e59-wmma9-r2",
+      "arm": "kw-k6w-e59-wmma9",
+      "concurrency": 4,
+      "requests": 24,
+      "window_s": 94.791,
+      "out_tokens": 4945,
+      "agg_tps": 52.167,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 19.922,
+        "p90": 31.9112,
+        "max": 34.4945,
+        "mean": 22.512362
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.510995,
+        "p90": 8.965611,
+        "max": 8.967117,
+        "mean": 2.266617
+      },
+      "itl_chunk_s": {
+        "n": 1602,
+        "p50": 0.172508,
+        "p90": 0.185912,
+        "max": 0.543743,
+        "mean": 0.147392
+      },
+      "acceptance": {
+        "drafts": 1602.0,
+        "draft_tokens": 4806.0,
+        "accepted_tokens": 3334.0,
+        "accept_rate": 0.6937,
+        "mean_accept_len": 3.0811,
+        "per_position": {
+          "0": 0.8383,
+          "1": 0.6916,
+          "2": 0.5512
+        }
+      }
+    },
+    {
+      "visit": "v05-k-k6w-e59-r2",
+      "arm": "k-k6w-e59",
+      "concurrency": 1,
+      "requests": 24,
+      "window_s": 132.885,
+      "out_tokens": 4958,
+      "agg_tps": 37.31,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 53.5502,
+        "p90": 60.5604,
+        "max": 63.3283,
+        "mean": 51.222938
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.40542,
+        "p90": 5.386033,
+        "max": 9.47859,
+        "mean": 1.614812
+      },
+      "itl_chunk_s": {
+        "n": 1592,
+        "p50": 0.05832,
+        "p90": 0.060729,
+        "max": 0.203523,
+        "mean": 0.058837
+      },
+      "acceptance": {
+        "drafts": 1592.0,
+        "draft_tokens": 4776.0,
+        "accepted_tokens": 3362.0,
+        "accept_rate": 0.7039,
+        "mean_accept_len": 3.1118,
+        "per_position": {
+          "0": 0.8367,
+          "1": 0.6953,
+          "2": 0.5798
+        }
+      }
+    },
+    {
+      "visit": "v05-k-k6w-e59-r2",
+      "arm": "k-k6w-e59",
+      "concurrency": 2,
+      "requests": 24,
+      "window_s": 101.55,
+      "out_tokens": 4863,
+      "agg_tps": 47.888,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 31.5396,
+        "p90": 35.1885,
+        "max": 52.3486,
+        "mean": 30.591225
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.456405,
+        "p90": 4.884682,
+        "max": 5.13018,
+        "mean": 1.564445
+      },
+      "itl_chunk_s": {
+        "n": 1570,
+        "p50": 0.102067,
+        "p90": 0.106964,
+        "max": 0.343015,
+        "mean": 0.099279
+      },
+      "acceptance": {
+        "drafts": 1570.0,
+        "draft_tokens": 4710.0,
+        "accepted_tokens": 3283.0,
+        "accept_rate": 0.697,
+        "mean_accept_len": 3.0911,
+        "per_position": {
+          "0": 0.8427,
+          "1": 0.6936,
+          "2": 0.5548
+        }
+      }
+    },
+    {
+      "visit": "v05-k-k6w-e59-r2",
+      "arm": "k-k6w-e59",
+      "concurrency": 3,
+      "requests": 24,
+      "window_s": 99.983,
+      "out_tokens": 4974,
+      "agg_tps": 49.748,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 21.7768,
+        "p90": 24.228,
+        "max": 34.2657,
+        "mean": 21.620208
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.46297,
+        "p90": 7.631296,
+        "max": 7.635979,
+        "mean": 1.99679
+      },
+      "itl_chunk_s": {
+        "n": 1594,
+        "p50": 0.154872,
+        "p90": 0.160435,
+        "max": 0.499703,
+        "mean": 0.148737
+      },
+      "acceptance": {
+        "drafts": 1594.0,
+        "draft_tokens": 4782.0,
+        "accepted_tokens": 3374.0,
+        "accept_rate": 0.7056,
+        "mean_accept_len": 3.1167,
+        "per_position": {
+          "0": 0.8394,
+          "1": 0.7014,
+          "2": 0.5759
+        }
+      }
+    },
+    {
+      "visit": "v05-k-k6w-e59-r2",
+      "arm": "k-k6w-e59",
+      "concurrency": 4,
+      "requests": 24,
+      "window_s": 95.684,
+      "out_tokens": 4904,
+      "agg_tps": 51.252,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 19.3861,
+        "p90": 31.765,
+        "max": 34.475,
+        "mean": 22.332658
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.67989,
+        "p90": 8.823778,
+        "max": 8.825987,
+        "mean": 2.315472
+      },
+      "itl_chunk_s": {
+        "n": 1594,
+        "p50": 0.167752,
+        "p90": 0.188061,
+        "max": 0.542047,
+        "mean": 0.14754
+      },
+      "acceptance": {
+        "drafts": 1594.0,
+        "draft_tokens": 4782.0,
+        "accepted_tokens": 3303.0,
+        "accept_rate": 0.6907,
+        "mean_accept_len": 3.0721,
+        "per_position": {
+          "0": 0.835,
+          "1": 0.6882,
+          "2": 0.5489
+        }
+      }
+    },
+    {
+      "visit": "v06-s-shipped-r2",
+      "arm": "s-shipped",
+      "concurrency": 1,
+      "requests": 24,
+      "window_s": 139.417,
+      "out_tokens": 4768,
+      "agg_tps": 34.2,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 48.4369,
+        "p90": 55.3236,
+        "max": 58.1366,
+        "mean": 46.383917
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.408539,
+        "p90": 5.391619,
+        "max": 9.467848,
+        "mean": 1.613209
+      },
+      "itl_chunk_s": {
+        "n": 1577,
+        "p50": 0.063099,
+        "p90": 0.065984,
+        "max": 0.206168,
+        "mean": 0.063566
+      },
+      "acceptance": {
+        "drafts": 1577.0,
+        "draft_tokens": 4731.0,
+        "accepted_tokens": 3190.0,
+        "accept_rate": 0.6743,
+        "mean_accept_len": 3.0228,
+        "per_position": {
+          "0": 0.832,
+          "1": 0.6646,
+          "2": 0.5263
+        }
+      }
+    },
+    {
+      "visit": "v06-s-shipped-r2",
+      "arm": "s-shipped",
+      "concurrency": 2,
+      "requests": 24,
+      "window_s": 102.637,
+      "out_tokens": 4826,
+      "agg_tps": 47.02,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 31.733,
+        "p90": 34.9807,
+        "max": 44.8317,
+        "mean": 30.210317
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.689791,
+        "p90": 4.929884,
+        "max": 5.146389,
+        "mean": 1.608032
+      },
+      "itl_chunk_s": {
+        "n": 1568,
+        "p50": 0.101945,
+        "p90": 0.106884,
+        "max": 0.340958,
+        "mean": 0.099472
+      },
+      "acceptance": {
+        "drafts": 1568.0,
+        "draft_tokens": 4704.0,
+        "accepted_tokens": 3251.0,
+        "accept_rate": 0.6911,
+        "mean_accept_len": 3.0733,
+        "per_position": {
+          "0": 0.831,
+          "1": 0.6862,
+          "2": 0.5561
+        }
+      }
+    },
+    {
+      "visit": "v06-s-shipped-r2",
+      "arm": "s-shipped",
+      "concurrency": 3,
+      "requests": 24,
+      "window_s": 100.843,
+      "out_tokens": 4991,
+      "agg_tps": 49.493,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 21.6378,
+        "p90": 24.2299,
+        "max": 29.657,
+        "mean": 21.407562
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.465254,
+        "p90": 7.630202,
+        "max": 7.636958,
+        "mean": 2.006306
+      },
+      "itl_chunk_s": {
+        "n": 1600,
+        "p50": 0.154884,
+        "p90": 0.160751,
+        "max": 0.507907,
+        "mean": 0.149414
+      },
+      "acceptance": {
+        "drafts": 1600.0,
+        "draft_tokens": 4800.0,
+        "accepted_tokens": 3381.0,
+        "accept_rate": 0.7044,
+        "mean_accept_len": 3.1131,
+        "per_position": {
+          "0": 0.84,
+          "1": 0.7012,
+          "2": 0.5719
+        }
+      }
+    },
+    {
+      "visit": "v06-s-shipped-r2",
+      "arm": "s-shipped",
+      "concurrency": 4,
+      "requests": 24,
+      "window_s": 95.114,
+      "out_tokens": 4974,
+      "agg_tps": 52.295,
+      "per_stream_tps": {
+        "n": 24,
+        "p50": 19.5841,
+        "p90": 31.806,
+        "max": 34.4732,
+        "mean": 22.354496
+      },
+      "ttft_s": {
+        "n": 24,
+        "p50": 0.513049,
+        "p90": 8.789238,
+        "max": 8.789767,
+        "mean": 2.238721
+      },
+      "itl_chunk_s": {
+        "n": 1604,
+        "p50": 0.174187,
+        "p90": 0.186073,
+        "max": 0.546138,
+        "mean": 0.14816
+      },
+      "acceptance": {
+        "drafts": 1604.0,
+        "draft_tokens": 4812.0,
+        "accepted_tokens": 3363.0,
+        "accept_rate": 0.6989,
+        "mean_accept_len": 3.0966,
+        "per_position": {
+          "0": 0.8354,
+          "1": 0.6933,
+          "2": 0.5679
+        }
+      }
+    }
+  ],
+  "steady_rows_original_markdown": [
+    "| s-shipped | L1 conc-m3-c1 ctx100 mt512 seqs4 | conc-m3-c1 | c=1 | 2 | 48.05 | 47.51 | 48.59 | 53.64 | 0.504 | 0 |",
+    "| s-shipped | L1 conc-m3-c2 ctx100 mt512 seqs4 | conc-m3-c2 | c=2 | 2 | 60.34 | 58.60 | 62.09 | 34.52 | 0.626 | 0 |",
+    "| s-shipped | L1 conc-m3-c3 ctx100 mt512 seqs4 | conc-m3-c3 | c=3 | 2 | 61.31 | 58.97 | 63.64 | 23.13 | 0.742 | 0 |",
+    "| s-shipped | L1 conc-m3-c4 ctx100 mt512 seqs4 | conc-m3-c4 | c=4 | 2 | 68.29 | 65.21 | 71.36 | 19.32 | 0.835 | 0 |",
+    "| k-k6w-e59 | L1 conc-m3-c1 ctx100 mt512 seqs4 | conc-m3-c1 | c=1 | 2 | 56.36 | 56.34 | 56.39 | 61.44 | 0.498 | 0 |",
+    "| k-k6w-e59 | L1 conc-m3-c2 ctx100 mt512 seqs4 | conc-m3-c2 | c=2 | 2 | 60.21 | 58.14 | 62.27 | 34.61 | 0.607 | 0 |",
+    "| k-k6w-e59 | L1 conc-m3-c3 ctx100 mt512 seqs4 | conc-m3-c3 | c=3 | 2 | 59.38 | 57.40 | 61.36 | 23.27 | 0.755 | 0 |",
+    "| k-k6w-e59 | L1 conc-m3-c4 ctx100 mt512 seqs4 | conc-m3-c4 | c=4 | 2 | 70.63 | 70.23 | 71.03 | 19.52 | 0.827 | 0 |",
+    "| kw-k6w-e59-wmma9 | L1 conc-m3-c1 ctx100 mt512 seqs4 | conc-m3-c1 | c=1 | 2 | 55.35 | 54.36 | 56.34 | 60.93 | 0.497 | 0 |",
+    "| kw-k6w-e59-wmma9 | L1 conc-m3-c2 ctx100 mt512 seqs4 | conc-m3-c2 | c=2 | 2 | 56.96 | 51.66 | 62.27 | 34.05 | 0.786 | 0 |",
+    "| kw-k6w-e59-wmma9 | L1 conc-m3-c3 ctx100 mt512 seqs4 | conc-m3-c3 | c=3 | 2 | 62.80 | 62.71 | 62.89 | 23.53 | 0.743 | 0 |",
+    "| kw-k6w-e59-wmma9 | L1 conc-m3-c4 ctx100 mt512 seqs4 | conc-m3-c4 | c=4 | 2 | 71.11 | 71.06 | 71.17 | 19.42 | 0.808 | 0 |",
+    "| s-shipped | L1 conc-m3-c1 ctx100 mt512 seqs4 | c=1 | 18 | 0.09 | 0.26 | 0.071 | 0.50 | 8.81 | 0 |",
+    "| s-shipped | L1 conc-m3-c2 ctx100 mt512 seqs4 | c=2 | 24 | 0.39 | 0.58 | 0.146 | 0.63 | 14.96 | 0 |",
+    "| s-shipped | L1 conc-m3-c3 ctx100 mt512 seqs4 | c=3 | 25 | 0.44 | 0.58 | 0.353 | 0.75 | 22.30 | 0 |",
+    "| s-shipped | L1 conc-m3-c4 ctx100 mt512 seqs4 | c=4 | 29 | 0.50 | 0.65 | 0.476 | 0.83 | 26.56 | 0 |",
+    "| k-k6w-e59 | L1 conc-m3-c1 ctx100 mt512 seqs4 | c=1 | 22 | 0.09 | 0.18 | 0.065 | 0.50 | 7.94 | 0 |",
+    "| k-k6w-e59 | L1 conc-m3-c2 ctx100 mt512 seqs4 | c=2 | 23 | 0.38 | 0.53 | 0.154 | 0.61 | 15.54 | 0 |",
+    "| k-k6w-e59 | L1 conc-m3-c3 ctx100 mt512 seqs4 | c=3 | 25 | 0.44 | 0.75 | 0.341 | 0.76 | 22.27 | 0 |",
+    "| k-k6w-e59 | L1 conc-m3-c4 ctx100 mt512 seqs4 | c=4 | 30 | 0.50 | 0.52 | 0.481 | 0.83 | 25.88 | 0 |",
+    "| kw-k6w-e59-wmma9 | L1 conc-m3-c1 ctx100 mt512 seqs4 | c=1 | 21 | 0.09 | 0.12 | 0.065 | 0.50 | 8.06 | 0 |",
+    "| kw-k6w-e59-wmma9 | L1 conc-m3-c2 ctx100 mt512 seqs4 | c=2 | 23 | 0.40 | 0.86 | 0.153 | 0.65 | 15.44 | 0 |",
+    "| kw-k6w-e59-wmma9 | L1 conc-m3-c3 ctx100 mt512 seqs4 | c=3 | 26 | 0.45 | 0.46 | 0.329 | 0.74 | 22.42 | 0 |",
+    "| kw-k6w-e59-wmma9 | L1 conc-m3-c4 ctx100 mt512 seqs4 | c=4 | 28 | 0.50 | 0.52 | 0.483 | 0.81 | 26.35 | 0 |"
+  ],
+  "quality_config": {
+    "mtp": 3,
+    "max_num_seqs": 4,
+    "max_model_len": 262144,
+    "kv_dtype": "int8_per_token_head",
+    "ple_hot_row_bytes": 2147483648
+  },
+  "quality": [
+    {
+      "arm": "s-shipped",
+      "suite": "HumanEval+",
+      "run": "20261116T220748",
+      "passed": 159,
+      "total": 164,
+      "summary": {
+        "accuracyPct": 96.95,
+        "avgLatencyMs": 42226,
+        "correct": 159,
+        "dataset": "humaneval-plus",
+        "declaredModel": "",
+        "effectiveModel": "",
+        "errors": 0,
+        "k": 1,
+        "nSamples": 1,
+        "passAt1": 0.9695121951219512,
+        "passAtK": 0.9695121951219512,
+        "quantFormat": "",
+        "quantization": "",
+        "questions": 164,
+        "scored": 164,
+        "scoring": "code_execution",
+        "shardIndex": 12,
+        "temperature": 1
+      },
+      "rows": [
+        {
+          "question_id": "humaneval-plus:HumanEval/135",
+          "pass": true,
+          "latencyMs": 15566,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/134",
+          "pass": true,
+          "latencyMs": 188960,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/26",
+          "pass": true,
+          "latencyMs": 7455,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/6",
+          "pass": true,
+          "latencyMs": 9305,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/17",
+          "pass": true,
+          "latencyMs": 7134,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/43",
+          "pass": true,
+          "latencyMs": 7650,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/48",
+          "pass": true,
+          "latencyMs": 4815,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/109",
+          "pass": true,
+          "latencyMs": 29819,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/53",
+          "pass": true,
+          "latencyMs": 7181,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/146",
+          "pass": true,
+          "latencyMs": 13394,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/110",
+          "pass": true,
+          "latencyMs": 18351,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/11",
+          "pass": true,
+          "latencyMs": 73600,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/114",
+          "pass": true,
+          "latencyMs": 14700,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/85",
+          "pass": true,
+          "latencyMs": 5259,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/148",
+          "pass": true,
+          "latencyMs": 9361,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/30",
+          "pass": true,
+          "latencyMs": 4893,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/122",
+          "pass": true,
+          "latencyMs": 10203,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/69",
+          "pass": true,
+          "latencyMs": 9034,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/34",
+          "pass": true,
+          "latencyMs": 6984,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/0",
+          "pass": true,
+          "latencyMs": 13160,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/37",
+          "pass": true,
+          "latencyMs": 4584,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/103",
+          "pass": true,
+          "latencyMs": 34298,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/125",
+          "pass": true,
+          "latencyMs": 25823,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/27",
+          "pass": true,
+          "latencyMs": 2985,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/68",
+          "pass": true,
+          "latencyMs": 5182,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/72",
+          "pass": true,
+          "latencyMs": 2818,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/128",
+          "pass": true,
+          "latencyMs": 7763,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/44",
+          "pass": true,
+          "latencyMs": 6887,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/90",
+          "pass": true,
+          "latencyMs": 7121,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/119",
+          "pass": true,
+          "latencyMs": 36205,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/64",
+          "pass": true,
+          "latencyMs": 11324,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/126",
+          "pass": true,
+          "latencyMs": 17201,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/9",
+          "pass": true,
+          "latencyMs": 7328,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/46",
+          "pass": true,
+          "latencyMs": 24078,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/131",
+          "pass": true,
+          "latencyMs": 6787,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/112",
+          "pass": true,
+          "latencyMs": 3705,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/152",
+          "pass": true,
+          "latencyMs": 4503,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/87",
+          "pass": true,
+          "latencyMs": 20877,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/42",
+          "pass": true,
+          "latencyMs": 4490,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/143",
+          "pass": true,
+          "latencyMs": 19736,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/94",
+          "pass": true,
+          "latencyMs": 18145,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/57",
+          "pass": true,
+          "latencyMs": 6055,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/124",
+          "pass": true,
+          "latencyMs": 20831,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/52",
+          "pass": true,
+          "latencyMs": 3822,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/86",
+          "pass": true,
+          "latencyMs": 12690,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/100",
+          "pass": true,
+          "latencyMs": 7236,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/71",
+          "pass": true,
+          "latencyMs": 25180,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/153",
+          "pass": true,
+          "latencyMs": 13579,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/137",
+          "pass": true,
+          "latencyMs": 15998,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/140",
+          "pass": true,
+          "latencyMs": 32268,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/59",
+          "pass": true,
+          "latencyMs": 8654,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/12",
+          "pass": true,
+          "latencyMs": 7600,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/70",
+          "pass": true,
+          "latencyMs": 9212,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/1",
+          "pass": true,
+          "latencyMs": 8537,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/80",
+          "pass": true,
+          "latencyMs": 6375,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/83",
+          "pass": true,
+          "latencyMs": 24079,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/35",
+          "pass": true,
+          "latencyMs": 5134,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/113",
+          "pass": true,
+          "latencyMs": 9036,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/139",
+          "pass": true,
+          "latencyMs": 11562,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/158",
+          "pass": true,
+          "latencyMs": 15108,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/75",
+          "pass": true,
+          "latencyMs": 195595,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/18",
+          "pass": true,
+          "latencyMs": 14187,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/77",
+          "pass": true,
+          "latencyMs": 31956,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/136",
+          "pass": true,
+          "latencyMs": 8329,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/16",
+          "pass": true,
+          "latencyMs": 4275,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/13",
+          "pass": true,
+          "latencyMs": 5207,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/15",
+          "pass": true,
+          "latencyMs": 8421,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/19",
+          "pass": true,
+          "latencyMs": 8708,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/60",
+          "pass": true,
+          "latencyMs": 4229,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/76",
+          "pass": true,
+          "latencyMs": 661353,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/45",
+          "pass": true,
+          "latencyMs": 3228,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/116",
+          "pass": true,
+          "latencyMs": 10828,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/107",
+          "pass": true,
+          "latencyMs": 9463,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/98",
+          "pass": true,
+          "latencyMs": 8129,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/67",
+          "pass": true,
+          "latencyMs": 10452,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/155",
+          "pass": true,
+          "latencyMs": 7939,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/54",
+          "pass": true,
+          "latencyMs": 9669,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/79",
+          "pass": true,
+          "latencyMs": 6750,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/141",
+          "pass": true,
+          "latencyMs": 13485,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/111",
+          "pass": true,
+          "latencyMs": 6989,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/51",
+          "pass": true,
+          "latencyMs": 5123,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/145",
+          "pass": false,
+          "latencyMs": 1058859,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/81",
+          "pass": true,
+          "latencyMs": 48703,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/138",
+          "pass": true,
+          "latencyMs": 6571,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/133",
+          "pass": true,
+          "latencyMs": 12108,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/106",
+          "pass": true,
+          "latencyMs": 20180,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/33",
+          "pass": true,
+          "latencyMs": 4589,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/91",
+          "pass": true,
+          "latencyMs": 30069,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/65",
+          "pass": true,
+          "latencyMs": 15793,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/25",
+          "pass": true,
+          "latencyMs": 13040,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/88",
+          "pass": true,
+          "latencyMs": 7190,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/115",
+          "pass": true,
+          "latencyMs": 12490,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/4",
+          "pass": true,
+          "latencyMs": 7542,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/74",
+          "pass": true,
+          "latencyMs": 4124,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/101",
+          "pass": true,
+          "latencyMs": 7515,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/14",
+          "pass": true,
+          "latencyMs": 3551,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/49",
+          "pass": true,
+          "latencyMs": 8644,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/142",
+          "pass": true,
+          "latencyMs": 13419,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/104",
+          "pass": true,
+          "latencyMs": 7431,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/55",
+          "pass": true,
+          "latencyMs": 6110,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/157",
+          "pass": true,
+          "latencyMs": 22525,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/10",
+          "pass": true,
+          "latencyMs": 233091,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/127",
+          "pass": true,
+          "latencyMs": 20199,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/58",
+          "pass": true,
+          "latencyMs": 7098,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/39",
+          "pass": true,
+          "latencyMs": 530646,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/24",
+          "pass": true,
+          "latencyMs": 17278,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/102",
+          "pass": true,
+          "latencyMs": 6464,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/108",
+          "pass": true,
+          "latencyMs": 18935,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/23",
+          "pass": true,
+          "latencyMs": 2967,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/130",
+          "pass": true,
+          "latencyMs": 48932,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/121",
+          "pass": true,
+          "latencyMs": 5506,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/73",
+          "pass": true,
+          "latencyMs": 6368,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/89",
+          "pass": true,
+          "latencyMs": 12846,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/28",
+          "pass": true,
+          "latencyMs": 5417,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/84",
+          "pass": true,
+          "latencyMs": 5592,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/62",
+          "pass": true,
+          "latencyMs": 4761,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/120",
+          "pass": true,
+          "latencyMs": 10965,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/163",
+          "pass": true,
+          "latencyMs": 68318,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/149",
+          "pass": true,
+          "latencyMs": 5736,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/21",
+          "pass": true,
+          "latencyMs": 12726,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/129",
+          "pass": true,
+          "latencyMs": 223445,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/47",
+          "pass": true,
+          "latencyMs": 5306,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/7",
+          "pass": true,
+          "latencyMs": 4432,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/118",
+          "pass": true,
+          "latencyMs": 15656,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/50",
+          "pass": true,
+          "latencyMs": 9612,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/56",
+          "pass": true,
+          "latencyMs": 24163,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/41",
+          "pass": true,
+          "latencyMs": 6025,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/61",
+          "pass": true,
+          "latencyMs": 5494,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/5",
+          "pass": true,
+          "latencyMs": 8708,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/132",
+          "pass": true,
+          "latencyMs": 644342,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/38",
+          "pass": true,
+          "latencyMs": 15473,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/150",
+          "pass": true,
+          "latencyMs": 5634,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/78",
+          "pass": true,
+          "latencyMs": 6126,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/160",
+          "pass": true,
+          "latencyMs": 14022,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/123",
+          "pass": true,
+          "latencyMs": 10003,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/154",
+          "pass": false,
+          "latencyMs": 52027,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/40",
+          "pass": true,
+          "latencyMs": 11657,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/32",
+          "pass": false,
+          "latencyMs": 1200123,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/20",
+          "pass": true,
+          "latencyMs": 9076,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/147",
+          "pass": true,
+          "latencyMs": 21214,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/93",
+          "pass": false,
+          "latencyMs": 40577,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/97",
+          "pass": true,
+          "latencyMs": 5972,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/29",
+          "pass": true,
+          "latencyMs": 3645,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/144",
+          "pass": true,
+          "latencyMs": 18528,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/162",
+          "pass": true,
+          "latencyMs": 4677,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/82",
+          "pass": true,
+          "latencyMs": 9212,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/8",
+          "pass": true,
+          "latencyMs": 12057,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/31",
+          "pass": true,
+          "latencyMs": 8218,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/22",
+          "pass": true,
+          "latencyMs": 3779,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/159",
+          "pass": true,
+          "latencyMs": 3093,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/92",
+          "pass": true,
+          "latencyMs": 17553,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/99",
+          "pass": false,
+          "latencyMs": 13530,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/66",
+          "pass": true,
+          "latencyMs": 13104,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/2",
+          "pass": true,
+          "latencyMs": 4809,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/3",
+          "pass": true,
+          "latencyMs": 4185,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/96",
+          "pass": true,
+          "latencyMs": 20306,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/156",
+          "pass": true,
+          "latencyMs": 9385,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/95",
+          "pass": true,
+          "latencyMs": 19472,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/117",
+          "pass": true,
+          "latencyMs": 17951,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/151",
+          "pass": true,
+          "latencyMs": 4499,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/36",
+          "pass": true,
+          "latencyMs": 10778,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/63",
+          "pass": true,
+          "latencyMs": 24445,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/105",
+          "pass": true,
+          "latencyMs": 8900,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/161",
+          "pass": true,
+          "latencyMs": 13730,
+          "error": ""
+        }
+      ],
+      "harness_note": "Both full 164-item native results retained; outer bridge later refused duplicate generation. No new inference was used to recreate these scores."
+    },
+    {
+      "arm": "kw-k6w-e59-wmma9",
+      "suite": "HumanEval+",
+      "run": "20261116T220748",
+      "passed": 162,
+      "total": 164,
+      "summary": {
+        "accuracyPct": 98.78,
+        "avgLatencyMs": 40184,
+        "correct": 162,
+        "dataset": "humaneval-plus",
+        "declaredModel": "",
+        "effectiveModel": "",
+        "errors": 0,
+        "k": 1,
+        "nSamples": 1,
+        "passAt1": 0.9878048780487805,
+        "passAtK": 0.9878048780487805,
+        "quantFormat": "",
+        "quantization": "",
+        "questions": 164,
+        "scored": 164,
+        "scoring": "code_execution",
+        "shardIndex": 12,
+        "temperature": 1
+      },
+      "rows": [
+        {
+          "question_id": "humaneval-plus:HumanEval/135",
+          "pass": true,
+          "latencyMs": 16544,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/134",
+          "pass": true,
+          "latencyMs": 32475,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/26",
+          "pass": true,
+          "latencyMs": 3692,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/6",
+          "pass": true,
+          "latencyMs": 9262,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/17",
+          "pass": true,
+          "latencyMs": 5998,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/43",
+          "pass": true,
+          "latencyMs": 9061,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/48",
+          "pass": true,
+          "latencyMs": 3850,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/109",
+          "pass": true,
+          "latencyMs": 26259,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/53",
+          "pass": true,
+          "latencyMs": 9436,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/146",
+          "pass": true,
+          "latencyMs": 19389,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/110",
+          "pass": true,
+          "latencyMs": 45909,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/11",
+          "pass": true,
+          "latencyMs": 22336,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/114",
+          "pass": true,
+          "latencyMs": 13281,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/85",
+          "pass": true,
+          "latencyMs": 4279,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/148",
+          "pass": true,
+          "latencyMs": 13379,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/30",
+          "pass": true,
+          "latencyMs": 4090,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/122",
+          "pass": true,
+          "latencyMs": 7029,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/69",
+          "pass": true,
+          "latencyMs": 10134,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/34",
+          "pass": true,
+          "latencyMs": 5024,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/0",
+          "pass": true,
+          "latencyMs": 10632,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/37",
+          "pass": true,
+          "latencyMs": 10698,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/103",
+          "pass": true,
+          "latencyMs": 50030,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/125",
+          "pass": true,
+          "latencyMs": 25215,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/27",
+          "pass": true,
+          "latencyMs": 4513,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/68",
+          "pass": true,
+          "latencyMs": 12724,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/72",
+          "pass": true,
+          "latencyMs": 6329,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/128",
+          "pass": true,
+          "latencyMs": 5991,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/44",
+          "pass": true,
+          "latencyMs": 11301,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/90",
+          "pass": true,
+          "latencyMs": 19100,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/119",
+          "pass": true,
+          "latencyMs": 9264,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/64",
+          "pass": true,
+          "latencyMs": 12037,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/126",
+          "pass": true,
+          "latencyMs": 25883,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/9",
+          "pass": true,
+          "latencyMs": 11560,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/46",
+          "pass": true,
+          "latencyMs": 22266,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/131",
+          "pass": true,
+          "latencyMs": 7360,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/112",
+          "pass": true,
+          "latencyMs": 6003,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/152",
+          "pass": true,
+          "latencyMs": 3456,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/87",
+          "pass": true,
+          "latencyMs": 11753,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/42",
+          "pass": true,
+          "latencyMs": 3989,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/143",
+          "pass": true,
+          "latencyMs": 10966,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/94",
+          "pass": true,
+          "latencyMs": 22153,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/57",
+          "pass": true,
+          "latencyMs": 6214,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/124",
+          "pass": true,
+          "latencyMs": 26038,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/52",
+          "pass": true,
+          "latencyMs": 3554,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/86",
+          "pass": true,
+          "latencyMs": 12579,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/100",
+          "pass": true,
+          "latencyMs": 6246,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/71",
+          "pass": true,
+          "latencyMs": 10564,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/153",
+          "pass": true,
+          "latencyMs": 17609,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/137",
+          "pass": true,
+          "latencyMs": 10105,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/140",
+          "pass": true,
+          "latencyMs": 17236,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/59",
+          "pass": true,
+          "latencyMs": 8204,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/12",
+          "pass": true,
+          "latencyMs": 10135,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/70",
+          "pass": true,
+          "latencyMs": 9417,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/1",
+          "pass": true,
+          "latencyMs": 9371,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/80",
+          "pass": true,
+          "latencyMs": 5790,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/83",
+          "pass": true,
+          "latencyMs": 30845,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/35",
+          "pass": true,
+          "latencyMs": 5027,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/113",
+          "pass": true,
+          "latencyMs": 20802,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/139",
+          "pass": true,
+          "latencyMs": 11318,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/158",
+          "pass": true,
+          "latencyMs": 13051,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/75",
+          "pass": true,
+          "latencyMs": 44168,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/18",
+          "pass": true,
+          "latencyMs": 7479,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/77",
+          "pass": true,
+          "latencyMs": 40327,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/136",
+          "pass": true,
+          "latencyMs": 7028,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/16",
+          "pass": true,
+          "latencyMs": 5561,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/13",
+          "pass": true,
+          "latencyMs": 3778,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/15",
+          "pass": true,
+          "latencyMs": 7815,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/19",
+          "pass": true,
+          "latencyMs": 5404,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/60",
+          "pass": true,
+          "latencyMs": 3992,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/76",
+          "pass": true,
+          "latencyMs": 432113,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/45",
+          "pass": true,
+          "latencyMs": 4058,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/116",
+          "pass": true,
+          "latencyMs": 10099,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/107",
+          "pass": true,
+          "latencyMs": 5958,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/98",
+          "pass": true,
+          "latencyMs": 6045,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/67",
+          "pass": true,
+          "latencyMs": 10994,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/155",
+          "pass": true,
+          "latencyMs": 6717,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/54",
+          "pass": true,
+          "latencyMs": 8171,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/79",
+          "pass": true,
+          "latencyMs": 6104,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/141",
+          "pass": true,
+          "latencyMs": 20946,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/111",
+          "pass": true,
+          "latencyMs": 12711,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/51",
+          "pass": true,
+          "latencyMs": 5304,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/145",
+          "pass": true,
+          "latencyMs": 1010729,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/81",
+          "pass": true,
+          "latencyMs": 21061,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/138",
+          "pass": true,
+          "latencyMs": 7161,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/133",
+          "pass": true,
+          "latencyMs": 10515,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/106",
+          "pass": true,
+          "latencyMs": 12500,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/33",
+          "pass": true,
+          "latencyMs": 10483,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/91",
+          "pass": true,
+          "latencyMs": 15626,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/65",
+          "pass": true,
+          "latencyMs": 28253,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/25",
+          "pass": true,
+          "latencyMs": 7319,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/88",
+          "pass": true,
+          "latencyMs": 10989,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/115",
+          "pass": true,
+          "latencyMs": 13883,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/4",
+          "pass": true,
+          "latencyMs": 8198,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/74",
+          "pass": true,
+          "latencyMs": 6624,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/101",
+          "pass": true,
+          "latencyMs": 6311,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/14",
+          "pass": true,
+          "latencyMs": 3059,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/49",
+          "pass": true,
+          "latencyMs": 6575,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/142",
+          "pass": true,
+          "latencyMs": 12166,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/104",
+          "pass": true,
+          "latencyMs": 42471,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/55",
+          "pass": true,
+          "latencyMs": 4787,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/157",
+          "pass": false,
+          "latencyMs": 1200134,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/10",
+          "pass": true,
+          "latencyMs": 16339,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/127",
+          "pass": true,
+          "latencyMs": 15298,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/58",
+          "pass": true,
+          "latencyMs": 4752,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/39",
+          "pass": true,
+          "latencyMs": 221994,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/24",
+          "pass": true,
+          "latencyMs": 31323,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/102",
+          "pass": true,
+          "latencyMs": 5286,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/108",
+          "pass": true,
+          "latencyMs": 18373,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/23",
+          "pass": true,
+          "latencyMs": 3418,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/130",
+          "pass": true,
+          "latencyMs": 48808,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/121",
+          "pass": true,
+          "latencyMs": 6706,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/73",
+          "pass": true,
+          "latencyMs": 3848,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/89",
+          "pass": true,
+          "latencyMs": 11143,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/28",
+          "pass": true,
+          "latencyMs": 4117,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/84",
+          "pass": true,
+          "latencyMs": 7379,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/62",
+          "pass": true,
+          "latencyMs": 5161,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/120",
+          "pass": true,
+          "latencyMs": 10424,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/163",
+          "pass": true,
+          "latencyMs": 15276,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/149",
+          "pass": true,
+          "latencyMs": 6705,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/21",
+          "pass": true,
+          "latencyMs": 9194,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/129",
+          "pass": true,
+          "latencyMs": 203873,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/47",
+          "pass": true,
+          "latencyMs": 10676,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/7",
+          "pass": true,
+          "latencyMs": 4789,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/118",
+          "pass": true,
+          "latencyMs": 9115,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/50",
+          "pass": true,
+          "latencyMs": 10156,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/56",
+          "pass": true,
+          "latencyMs": 8123,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/41",
+          "pass": true,
+          "latencyMs": 14007,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/61",
+          "pass": true,
+          "latencyMs": 6691,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/5",
+          "pass": true,
+          "latencyMs": 6487,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/132",
+          "pass": true,
+          "latencyMs": 284934,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/38",
+          "pass": true,
+          "latencyMs": 10274,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/150",
+          "pass": true,
+          "latencyMs": 5474,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/78",
+          "pass": true,
+          "latencyMs": 3621,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/160",
+          "pass": true,
+          "latencyMs": 21867,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/123",
+          "pass": true,
+          "latencyMs": 10383,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/154",
+          "pass": true,
+          "latencyMs": 8338,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/40",
+          "pass": true,
+          "latencyMs": 19794,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/32",
+          "pass": false,
+          "latencyMs": 1200114,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/20",
+          "pass": true,
+          "latencyMs": 12880,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/147",
+          "pass": true,
+          "latencyMs": 94276,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/93",
+          "pass": true,
+          "latencyMs": 31147,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/97",
+          "pass": true,
+          "latencyMs": 3239,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/29",
+          "pass": true,
+          "latencyMs": 5082,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/144",
+          "pass": true,
+          "latencyMs": 6452,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/162",
+          "pass": true,
+          "latencyMs": 5736,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/82",
+          "pass": true,
+          "latencyMs": 8350,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/8",
+          "pass": true,
+          "latencyMs": 6258,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/31",
+          "pass": true,
+          "latencyMs": 6123,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/22",
+          "pass": true,
+          "latencyMs": 5461,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/159",
+          "pass": true,
+          "latencyMs": 3085,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/92",
+          "pass": true,
+          "latencyMs": 13249,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/99",
+          "pass": true,
+          "latencyMs": 43935,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/66",
+          "pass": true,
+          "latencyMs": 7763,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/2",
+          "pass": true,
+          "latencyMs": 6589,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/3",
+          "pass": true,
+          "latencyMs": 6579,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/96",
+          "pass": true,
+          "latencyMs": 61579,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/156",
+          "pass": true,
+          "latencyMs": 8684,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/95",
+          "pass": true,
+          "latencyMs": 13104,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/117",
+          "pass": true,
+          "latencyMs": 17279,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/151",
+          "pass": true,
+          "latencyMs": 5891,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/36",
+          "pass": true,
+          "latencyMs": 8001,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/63",
+          "pass": true,
+          "latencyMs": 13624,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/105",
+          "pass": true,
+          "latencyMs": 9913,
+          "error": ""
+        },
+        {
+          "question_id": "humaneval-plus:HumanEval/161",
+          "pass": true,
+          "latencyMs": 9287,
+          "error": ""
+        }
+      ],
+      "harness_note": "Both full 164-item native results retained; outer bridge later refused duplicate generation. No new inference was used to recreate these scores."
+    },
+    {
+      "arm": "s-shipped",
+      "run": "20261117T085053",
+      "protocol": {
+        "model": "qwen38-htr",
+        "sampling": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 42
+        },
+        "thinking": true,
+        "reasoning_effort": "xhigh",
+        "real_inference": true
+      },
+      "tooleval": {
+        "edition": "2.8.1+htrsemantic1",
+        "exit_code": 0,
+        "status": "completed",
+        "points": 125,
+        "maximum": 138,
+        "percent": 90.57971014492753,
+        "infrastructure_failures_counted_as_zero": [],
+        "native_points": 125,
+        "native_maximum": 138,
+        "rounded_native_score": 91,
+        "wall_seconds": 1933.044352531433,
+        "statuses": {
+          "pass": 59,
+          "partial": 7,
+          "fail": 3
+        },
+        "failure_kinds": {
+          "wrong_args": 3
+        },
+        "safety_warnings": [],
+        "deadline_s": 1200.0,
+        "deadline_cut_requests": []
+      },
+      "hermes20": {
+        "edition": "hermesagent20-local-v3",
+        "cases": 20,
+        "case_timeout_s": 1800,
+        "points": 1850,
+        "maximum": 2000,
+        "percent": 92.5,
+        "full_score_cases": 18,
+        "statuses": {
+          "pass": 18,
+          "fail": 2
+        },
+        "client_timeouts": [],
+        "summed_case_wall_seconds": 1064.962,
+        "wall_seconds": 1066.3864328861237,
+        "requests": 111,
+        "transport_failures": 0,
+        "thinking_observed": true
+      },
+      "he_repeat": {
+        "spec": {
+          "HumanEval/157": [
+            42,
+            42,
+            1,
+            2,
+            3
+          ]
+        },
+        "deadline_s": 1200.0,
+        "probes": 5,
+        "passed": 5,
+        "timeouts": [],
+        "rows": [
+          {
+            "tag": "HumanEval_157-s42-r0",
+            "status": "complete",
+            "elapsed_s": 23.72980809211731,
+            "finish_reason": "stop",
+            "stream_events": 324,
+            "passed": true,
+            "completion_tokens": 935,
+            "reasoning_tail_zlib_ratio": 0.426,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s42-r1",
+            "status": "complete",
+            "elapsed_s": 22.67125415802002,
+            "finish_reason": "stop",
+            "stream_events": 324,
+            "passed": true,
+            "completion_tokens": 935,
+            "reasoning_tail_zlib_ratio": 0.426,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s1-r2",
+            "status": "complete",
+            "elapsed_s": 17.15970468521118,
+            "finish_reason": "stop",
+            "stream_events": 231,
+            "passed": true,
+            "completion_tokens": 680,
+            "reasoning_tail_zlib_ratio": 0.4814,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s2-r3",
+            "status": "complete",
+            "elapsed_s": 22.950342178344727,
+            "finish_reason": "stop",
+            "stream_events": 321,
+            "passed": true,
+            "completion_tokens": 898,
+            "reasoning_tail_zlib_ratio": 0.4743,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s3-r4",
+            "status": "complete",
+            "elapsed_s": 270.9604318141937,
+            "finish_reason": "stop",
+            "stream_events": 3798,
+            "passed": true,
+            "completion_tokens": 10845,
+            "reasoning_tail_zlib_ratio": 0.3362,
+            "reasoning_tail_period": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "kw-k6w-e59-wmma9",
+      "run": "20261117T085053",
+      "protocol": {
+        "model": "qwen38-htr",
+        "sampling": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 42
+        },
+        "thinking": true,
+        "reasoning_effort": "xhigh",
+        "real_inference": true
+      },
+      "tooleval": {
+        "edition": "2.8.1+htrsemantic1",
+        "exit_code": 0,
+        "status": "completed",
+        "points": 125,
+        "maximum": 138,
+        "percent": 90.57971014492753,
+        "infrastructure_failures_counted_as_zero": [],
+        "native_points": 125,
+        "native_maximum": 138,
+        "rounded_native_score": 91,
+        "wall_seconds": 1848.7607033252716,
+        "statuses": {
+          "pass": 59,
+          "fail": 3,
+          "partial": 7
+        },
+        "failure_kinds": {
+          "wrong_args": 3
+        },
+        "safety_warnings": [],
+        "deadline_s": 1200.0,
+        "deadline_cut_requests": []
+      },
+      "hermes20": {
+        "edition": "hermesagent20-local-v3",
+        "cases": 20,
+        "case_timeout_s": 1800,
+        "points": 1950,
+        "maximum": 2000,
+        "percent": 97.5,
+        "full_score_cases": 19,
+        "statuses": {
+          "pass": 19,
+          "fail": 1
+        },
+        "client_timeouts": [],
+        "summed_case_wall_seconds": 1029.837,
+        "wall_seconds": 1031.271494626999,
+        "requests": 106,
+        "transport_failures": 0,
+        "thinking_observed": true
+      },
+      "he_repeat": {
+        "spec": {
+          "HumanEval/157": [
+            42,
+            42,
+            1,
+            2,
+            3
+          ]
+        },
+        "deadline_s": 1200.0,
+        "probes": 5,
+        "passed": 3,
+        "timeouts": [
+          "HumanEval_157-s42-r0",
+          "HumanEval_157-s42-r1"
+        ],
+        "rows": [
+          {
+            "tag": "HumanEval_157-s42-r0",
+            "status": "timeout",
+            "elapsed_s": 1200.0153675079346,
+            "finish_reason": null,
+            "stream_events": 19924,
+            "passed": false,
+            "completion_tokens": null,
+            "reasoning_tail_zlib_ratio": 0.0022,
+            "reasoning_tail_period": 1
+          },
+          {
+            "tag": "HumanEval_157-s42-r1",
+            "status": "timeout",
+            "elapsed_s": 1200.0500378608704,
+            "finish_reason": null,
+            "stream_events": 19813,
+            "passed": false,
+            "completion_tokens": null,
+            "reasoning_tail_zlib_ratio": 0.0022,
+            "reasoning_tail_period": 1
+          },
+          {
+            "tag": "HumanEval_157-s1-r2",
+            "status": "complete",
+            "elapsed_s": 511.67156958580017,
+            "finish_reason": "stop",
+            "stream_events": 7823,
+            "passed": true,
+            "completion_tokens": 22211,
+            "reasoning_tail_zlib_ratio": 0.3402,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s2-r3",
+            "status": "complete",
+            "elapsed_s": 12.091026782989502,
+            "finish_reason": "stop",
+            "stream_events": 177,
+            "passed": true,
+            "completion_tokens": 547,
+            "reasoning_tail_zlib_ratio": 0.5217,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s3-r4",
+            "status": "complete",
+            "elapsed_s": 187.90562343597412,
+            "finish_reason": "stop",
+            "stream_events": 2875,
+            "passed": true,
+            "completion_tokens": 7918,
+            "reasoning_tail_zlib_ratio": 0.3316,
+            "reasoning_tail_period": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "s-shipped",
+      "run": "20261117T165801",
+      "protocol": {
+        "model": "qwen38-htr",
+        "sampling": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 42
+        },
+        "thinking": true,
+        "reasoning_effort": "xhigh",
+        "real_inference": true
+      },
+      "he_repeat": {
+        "spec": {
+          "HumanEval/157": [
+            101,
+            102,
+            103,
+            104,
+            105,
+            106,
+            107,
+            108,
+            109,
+            110,
+            111,
+            112,
+            113,
+            114,
+            115,
+            116,
+            117,
+            118,
+            119,
+            120,
+            121,
+            122,
+            123,
+            124,
+            125,
+            126,
+            127,
+            128,
+            129,
+            130,
+            131,
+            132,
+            133,
+            134,
+            135,
+            136,
+            137,
+            138,
+            139,
+            140
+          ]
+        },
+        "deadline_s": 1200.0,
+        "probes": 40,
+        "passed": 39,
+        "timeouts": [],
+        "rows": [
+          {
+            "tag": "HumanEval_157-s101-r0",
+            "status": "complete",
+            "elapsed_s": 216.15762090682983,
+            "finish_reason": "stop",
+            "stream_events": 3187,
+            "passed": true,
+            "completion_tokens": 8882,
+            "reasoning_tail_zlib_ratio": 0.35,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s102-r1",
+            "status": "complete",
+            "elapsed_s": 15.583906650543213,
+            "finish_reason": "stop",
+            "stream_events": 218,
+            "passed": true,
+            "completion_tokens": 685,
+            "reasoning_tail_zlib_ratio": 0.4918,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s103-r2",
+            "status": "complete",
+            "elapsed_s": 27.548837423324585,
+            "finish_reason": "stop",
+            "stream_events": 392,
+            "passed": true,
+            "completion_tokens": 1143,
+            "reasoning_tail_zlib_ratio": 0.4192,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s104-r3",
+            "status": "complete",
+            "elapsed_s": 38.21734428405762,
+            "finish_reason": "stop",
+            "stream_events": 547,
+            "passed": true,
+            "completion_tokens": 1541,
+            "reasoning_tail_zlib_ratio": 0.428,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s105-r4",
+            "status": "complete",
+            "elapsed_s": 23.910061836242676,
+            "finish_reason": "stop",
+            "stream_events": 339,
+            "passed": true,
+            "completion_tokens": 1019,
+            "reasoning_tail_zlib_ratio": 0.4396,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s106-r5",
+            "status": "complete",
+            "elapsed_s": 6.024003744125366,
+            "finish_reason": "stop",
+            "stream_events": 79,
+            "passed": true,
+            "completion_tokens": 262,
+            "reasoning_tail_zlib_ratio": 0.6597,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s107-r6",
+            "status": "complete",
+            "elapsed_s": 417.759473323822,
+            "finish_reason": "stop",
+            "stream_events": 5977,
+            "passed": true,
+            "completion_tokens": 16884,
+            "reasoning_tail_zlib_ratio": 0.3269,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s108-r7",
+            "status": "complete",
+            "elapsed_s": 72.37727570533752,
+            "finish_reason": "stop",
+            "stream_events": 1032,
+            "passed": true,
+            "completion_tokens": 2950,
+            "reasoning_tail_zlib_ratio": 0.3544,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s109-r8",
+            "status": "complete",
+            "elapsed_s": 531.7474884986877,
+            "finish_reason": "stop",
+            "stream_events": 7572,
+            "passed": true,
+            "completion_tokens": 21389,
+            "reasoning_tail_zlib_ratio": 0.3265,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s110-r9",
+            "status": "complete",
+            "elapsed_s": 77.67123174667358,
+            "finish_reason": "stop",
+            "stream_events": 1109,
+            "passed": true,
+            "completion_tokens": 3067,
+            "reasoning_tail_zlib_ratio": 0.3571,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s111-r10",
+            "status": "complete",
+            "elapsed_s": 150.05351328849792,
+            "finish_reason": "stop",
+            "stream_events": 2146,
+            "passed": true,
+            "completion_tokens": 6310,
+            "reasoning_tail_zlib_ratio": 0.3123,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s112-r11",
+            "status": "complete",
+            "elapsed_s": 14.093908786773682,
+            "finish_reason": "stop",
+            "stream_events": 195,
+            "passed": true,
+            "completion_tokens": 548,
+            "reasoning_tail_zlib_ratio": 0.5081,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s113-r12",
+            "status": "complete",
+            "elapsed_s": 32.481878995895386,
+            "finish_reason": "stop",
+            "stream_events": 461,
+            "passed": true,
+            "completion_tokens": 1255,
+            "reasoning_tail_zlib_ratio": 0.4382,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s114-r13",
+            "status": "complete",
+            "elapsed_s": 20.81096601486206,
+            "finish_reason": "stop",
+            "stream_events": 293,
+            "passed": true,
+            "completion_tokens": 895,
+            "reasoning_tail_zlib_ratio": 0.468,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s115-r14",
+            "status": "complete",
+            "elapsed_s": 22.514929056167603,
+            "finish_reason": "stop",
+            "stream_events": 318,
+            "passed": false,
+            "completion_tokens": 993,
+            "reasoning_tail_zlib_ratio": 0.4683,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s116-r15",
+            "status": "complete",
+            "elapsed_s": 27.068437099456787,
+            "finish_reason": "stop",
+            "stream_events": 383,
+            "passed": true,
+            "completion_tokens": 1154,
+            "reasoning_tail_zlib_ratio": 0.4385,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s117-r16",
+            "status": "complete",
+            "elapsed_s": 23.249176025390625,
+            "finish_reason": "stop",
+            "stream_events": 324,
+            "passed": true,
+            "completion_tokens": 933,
+            "reasoning_tail_zlib_ratio": 0.4395,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s118-r17",
+            "status": "complete",
+            "elapsed_s": 4.175964117050171,
+            "finish_reason": "stop",
+            "stream_events": 51,
+            "passed": true,
+            "completion_tokens": 164,
+            "reasoning_tail_zlib_ratio": 0.653,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s119-r18",
+            "status": "complete",
+            "elapsed_s": 7.238694190979004,
+            "finish_reason": "stop",
+            "stream_events": 95,
+            "passed": true,
+            "completion_tokens": 289,
+            "reasoning_tail_zlib_ratio": 0.5888,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s120-r19",
+            "status": "complete",
+            "elapsed_s": 20.07575035095215,
+            "finish_reason": "stop",
+            "stream_events": 281,
+            "passed": true,
+            "completion_tokens": 823,
+            "reasoning_tail_zlib_ratio": 0.4735,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s121-r20",
+            "status": "complete",
+            "elapsed_s": 328.44686555862427,
+            "finish_reason": "stop",
+            "stream_events": 4692,
+            "passed": true,
+            "completion_tokens": 13264,
+            "reasoning_tail_zlib_ratio": 0.3245,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s122-r21",
+            "status": "complete",
+            "elapsed_s": 560.5887973308563,
+            "finish_reason": "stop",
+            "stream_events": 8016,
+            "passed": true,
+            "completion_tokens": 22549,
+            "reasoning_tail_zlib_ratio": 0.3242,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s123-r22",
+            "status": "complete",
+            "elapsed_s": 13.718864679336548,
+            "finish_reason": "stop",
+            "stream_events": 189,
+            "passed": true,
+            "completion_tokens": 534,
+            "reasoning_tail_zlib_ratio": 0.5062,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s124-r23",
+            "status": "complete",
+            "elapsed_s": 90.06396484375,
+            "finish_reason": "stop",
+            "stream_events": 1291,
+            "passed": true,
+            "completion_tokens": 3692,
+            "reasoning_tail_zlib_ratio": 0.3533,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s125-r24",
+            "status": "complete",
+            "elapsed_s": 60.05158996582031,
+            "finish_reason": "stop",
+            "stream_events": 850,
+            "passed": true,
+            "completion_tokens": 2461,
+            "reasoning_tail_zlib_ratio": 0.3568,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s126-r25",
+            "status": "complete",
+            "elapsed_s": 20.59310555458069,
+            "finish_reason": "stop",
+            "stream_events": 273,
+            "passed": true,
+            "completion_tokens": 805,
+            "reasoning_tail_zlib_ratio": 0.457,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s127-r26",
+            "status": "complete",
+            "elapsed_s": 18.519732236862183,
+            "finish_reason": "stop",
+            "stream_events": 252,
+            "passed": true,
+            "completion_tokens": 771,
+            "reasoning_tail_zlib_ratio": 0.4829,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s128-r27",
+            "status": "complete",
+            "elapsed_s": 22.935775756835938,
+            "finish_reason": "stop",
+            "stream_events": 282,
+            "passed": true,
+            "completion_tokens": 806,
+            "reasoning_tail_zlib_ratio": 0.4656,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s129-r28",
+            "status": "complete",
+            "elapsed_s": 54.30767822265625,
+            "finish_reason": "stop",
+            "stream_events": 717,
+            "passed": true,
+            "completion_tokens": 2147,
+            "reasoning_tail_zlib_ratio": 0.3678,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s130-r29",
+            "status": "complete",
+            "elapsed_s": 25.330249071121216,
+            "finish_reason": "stop",
+            "stream_events": 352,
+            "passed": true,
+            "completion_tokens": 982,
+            "reasoning_tail_zlib_ratio": 0.4599,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s131-r30",
+            "status": "complete",
+            "elapsed_s": 17.946191549301147,
+            "finish_reason": "stop",
+            "stream_events": 239,
+            "passed": true,
+            "completion_tokens": 654,
+            "reasoning_tail_zlib_ratio": 0.491,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s132-r31",
+            "status": "complete",
+            "elapsed_s": 14.205229043960571,
+            "finish_reason": "stop",
+            "stream_events": 190,
+            "passed": true,
+            "completion_tokens": 573,
+            "reasoning_tail_zlib_ratio": 0.5111,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s133-r32",
+            "status": "complete",
+            "elapsed_s": 56.920642375946045,
+            "finish_reason": "stop",
+            "stream_events": 760,
+            "passed": true,
+            "completion_tokens": 2207,
+            "reasoning_tail_zlib_ratio": 0.3715,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s134-r33",
+            "status": "complete",
+            "elapsed_s": 10.966995477676392,
+            "finish_reason": "stop",
+            "stream_events": 146,
+            "passed": true,
+            "completion_tokens": 429,
+            "reasoning_tail_zlib_ratio": 0.5373,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s135-r34",
+            "status": "complete",
+            "elapsed_s": 50.58155131340027,
+            "finish_reason": "stop",
+            "stream_events": 674,
+            "passed": true,
+            "completion_tokens": 1888,
+            "reasoning_tail_zlib_ratio": 0.4101,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s136-r35",
+            "status": "complete",
+            "elapsed_s": 44.13690423965454,
+            "finish_reason": "stop",
+            "stream_events": 576,
+            "passed": true,
+            "completion_tokens": 1654,
+            "reasoning_tail_zlib_ratio": 0.3754,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s137-r36",
+            "status": "complete",
+            "elapsed_s": 12.658720016479492,
+            "finish_reason": "stop",
+            "stream_events": 169,
+            "passed": true,
+            "completion_tokens": 535,
+            "reasoning_tail_zlib_ratio": 0.5193,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s138-r37",
+            "status": "complete",
+            "elapsed_s": 21.11352562904358,
+            "finish_reason": "stop",
+            "stream_events": 296,
+            "passed": true,
+            "completion_tokens": 824,
+            "reasoning_tail_zlib_ratio": 0.4605,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s139-r38",
+            "status": "complete",
+            "elapsed_s": 15.880822658538818,
+            "finish_reason": "stop",
+            "stream_events": 214,
+            "passed": true,
+            "completion_tokens": 616,
+            "reasoning_tail_zlib_ratio": 0.5022,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s140-r39",
+            "status": "complete",
+            "elapsed_s": 22.15247368812561,
+            "finish_reason": "stop",
+            "stream_events": 284,
+            "passed": true,
+            "completion_tokens": 854,
+            "reasoning_tail_zlib_ratio": 0.4617,
+            "reasoning_tail_period": null
+          }
+        ]
+      }
+    },
+    {
+      "arm": "kw-k6w-e59-wmma9",
+      "run": "20261117T165801",
+      "protocol": {
+        "model": "qwen38-htr",
+        "sampling": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repetition_penalty": 1.0,
+          "seed": 42
+        },
+        "thinking": true,
+        "reasoning_effort": "xhigh",
+        "real_inference": true
+      },
+      "he_repeat": {
+        "spec": {
+          "HumanEval/157": [
+            101,
+            102,
+            103,
+            104,
+            105,
+            106,
+            107,
+            108,
+            109,
+            110,
+            111,
+            112,
+            113,
+            114,
+            115,
+            116,
+            117,
+            118,
+            119,
+            120,
+            121,
+            122,
+            123,
+            124,
+            125,
+            126,
+            127,
+            128,
+            129,
+            130,
+            131,
+            132,
+            133,
+            134,
+            135,
+            136,
+            137,
+            138,
+            139,
+            140
+          ]
+        },
+        "deadline_s": 1200.0,
+        "probes": 40,
+        "passed": 40,
+        "timeouts": [],
+        "rows": [
+          {
+            "tag": "HumanEval_157-s101-r0",
+            "status": "complete",
+            "elapsed_s": 84.22396469116211,
+            "finish_reason": "stop",
+            "stream_events": 1305,
+            "passed": true,
+            "completion_tokens": 3728,
+            "reasoning_tail_zlib_ratio": 0.3499,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s102-r1",
+            "status": "complete",
+            "elapsed_s": 38.22702503204346,
+            "finish_reason": "stop",
+            "stream_events": 558,
+            "passed": true,
+            "completion_tokens": 1556,
+            "reasoning_tail_zlib_ratio": 0.4124,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s103-r2",
+            "status": "complete",
+            "elapsed_s": 17.371580600738525,
+            "finish_reason": "stop",
+            "stream_events": 248,
+            "passed": true,
+            "completion_tokens": 710,
+            "reasoning_tail_zlib_ratio": 0.4427,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s104-r3",
+            "status": "complete",
+            "elapsed_s": 224.64873242378235,
+            "finish_reason": "stop",
+            "stream_events": 3366,
+            "passed": true,
+            "completion_tokens": 9593,
+            "reasoning_tail_zlib_ratio": 0.3377,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s105-r4",
+            "status": "complete",
+            "elapsed_s": 36.17342734336853,
+            "finish_reason": "stop",
+            "stream_events": 551,
+            "passed": true,
+            "completion_tokens": 1522,
+            "reasoning_tail_zlib_ratio": 0.4012,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s106-r5",
+            "status": "complete",
+            "elapsed_s": 12.330043315887451,
+            "finish_reason": "stop",
+            "stream_events": 183,
+            "passed": true,
+            "completion_tokens": 519,
+            "reasoning_tail_zlib_ratio": 0.5299,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s107-r6",
+            "status": "complete",
+            "elapsed_s": 31.87174391746521,
+            "finish_reason": "stop",
+            "stream_events": 486,
+            "passed": true,
+            "completion_tokens": 1414,
+            "reasoning_tail_zlib_ratio": 0.4053,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s108-r7",
+            "status": "complete",
+            "elapsed_s": 11.998916149139404,
+            "finish_reason": "stop",
+            "stream_events": 178,
+            "passed": true,
+            "completion_tokens": 517,
+            "reasoning_tail_zlib_ratio": 0.4939,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s109-r8",
+            "status": "complete",
+            "elapsed_s": 12.834365844726562,
+            "finish_reason": "stop",
+            "stream_events": 191,
+            "passed": true,
+            "completion_tokens": 560,
+            "reasoning_tail_zlib_ratio": 0.5066,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s110-r9",
+            "status": "complete",
+            "elapsed_s": 320.2623333930969,
+            "finish_reason": "stop",
+            "stream_events": 4929,
+            "passed": true,
+            "completion_tokens": 13925,
+            "reasoning_tail_zlib_ratio": 0.3076,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s111-r10",
+            "status": "complete",
+            "elapsed_s": 5.335433483123779,
+            "finish_reason": "stop",
+            "stream_events": 74,
+            "passed": true,
+            "completion_tokens": 206,
+            "reasoning_tail_zlib_ratio": 0.5859,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s112-r11",
+            "status": "complete",
+            "elapsed_s": 153.37213110923767,
+            "finish_reason": "stop",
+            "stream_events": 2364,
+            "passed": true,
+            "completion_tokens": 6845,
+            "reasoning_tail_zlib_ratio": 0.317,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s113-r12",
+            "status": "complete",
+            "elapsed_s": 166.91901421546936,
+            "finish_reason": "stop",
+            "stream_events": 2572,
+            "passed": true,
+            "completion_tokens": 7412,
+            "reasoning_tail_zlib_ratio": 0.3219,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s114-r13",
+            "status": "complete",
+            "elapsed_s": 131.11097478866577,
+            "finish_reason": "stop",
+            "stream_events": 2023,
+            "passed": true,
+            "completion_tokens": 5672,
+            "reasoning_tail_zlib_ratio": 0.3363,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s115-r14",
+            "status": "complete",
+            "elapsed_s": 14.330004930496216,
+            "finish_reason": "stop",
+            "stream_events": 214,
+            "passed": true,
+            "completion_tokens": 617,
+            "reasoning_tail_zlib_ratio": 0.4816,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s116-r15",
+            "status": "complete",
+            "elapsed_s": 25.926565885543823,
+            "finish_reason": "stop",
+            "stream_events": 394,
+            "passed": true,
+            "completion_tokens": 1125,
+            "reasoning_tail_zlib_ratio": 0.4497,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s117-r16",
+            "status": "complete",
+            "elapsed_s": 25.739069938659668,
+            "finish_reason": "stop",
+            "stream_events": 390,
+            "passed": true,
+            "completion_tokens": 1112,
+            "reasoning_tail_zlib_ratio": 0.4423,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s118-r17",
+            "status": "complete",
+            "elapsed_s": 9.804939031600952,
+            "finish_reason": "stop",
+            "stream_events": 144,
+            "passed": true,
+            "completion_tokens": 452,
+            "reasoning_tail_zlib_ratio": 0.5364,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s119-r18",
+            "status": "complete",
+            "elapsed_s": 80.26639103889465,
+            "finish_reason": "stop",
+            "stream_events": 1237,
+            "passed": true,
+            "completion_tokens": 3575,
+            "reasoning_tail_zlib_ratio": 0.3635,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s120-r19",
+            "status": "complete",
+            "elapsed_s": 218.6255385875702,
+            "finish_reason": "stop",
+            "stream_events": 3360,
+            "passed": true,
+            "completion_tokens": 9511,
+            "reasoning_tail_zlib_ratio": 0.3235,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s121-r20",
+            "status": "complete",
+            "elapsed_s": 10.543033599853516,
+            "finish_reason": "stop",
+            "stream_events": 156,
+            "passed": true,
+            "completion_tokens": 475,
+            "reasoning_tail_zlib_ratio": 0.5144,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s122-r21",
+            "status": "complete",
+            "elapsed_s": 41.49723982810974,
+            "finish_reason": "stop",
+            "stream_events": 635,
+            "passed": true,
+            "completion_tokens": 1889,
+            "reasoning_tail_zlib_ratio": 0.3958,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s123-r22",
+            "status": "complete",
+            "elapsed_s": 13.615706205368042,
+            "finish_reason": "stop",
+            "stream_events": 203,
+            "passed": true,
+            "completion_tokens": 568,
+            "reasoning_tail_zlib_ratio": 0.4987,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s124-r23",
+            "status": "complete",
+            "elapsed_s": 37.47495889663696,
+            "finish_reason": "stop",
+            "stream_events": 572,
+            "passed": true,
+            "completion_tokens": 1548,
+            "reasoning_tail_zlib_ratio": 0.4148,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s125-r24",
+            "status": "complete",
+            "elapsed_s": 71.32310605049133,
+            "finish_reason": "stop",
+            "stream_events": 1097,
+            "passed": true,
+            "completion_tokens": 3093,
+            "reasoning_tail_zlib_ratio": 0.3479,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s126-r25",
+            "status": "complete",
+            "elapsed_s": 8.66905426979065,
+            "finish_reason": "stop",
+            "stream_events": 126,
+            "passed": true,
+            "completion_tokens": 386,
+            "reasoning_tail_zlib_ratio": 0.5742,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s127-r26",
+            "status": "complete",
+            "elapsed_s": 27.603497743606567,
+            "finish_reason": "stop",
+            "stream_events": 419,
+            "passed": true,
+            "completion_tokens": 1230,
+            "reasoning_tail_zlib_ratio": 0.4311,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s128-r27",
+            "status": "complete",
+            "elapsed_s": 26.151091814041138,
+            "finish_reason": "stop",
+            "stream_events": 399,
+            "passed": true,
+            "completion_tokens": 1235,
+            "reasoning_tail_zlib_ratio": 0.4192,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s129-r28",
+            "status": "complete",
+            "elapsed_s": 10.791714191436768,
+            "finish_reason": "stop",
+            "stream_events": 159,
+            "passed": true,
+            "completion_tokens": 478,
+            "reasoning_tail_zlib_ratio": 0.5181,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s130-r29",
+            "status": "complete",
+            "elapsed_s": 11.813424587249756,
+            "finish_reason": "stop",
+            "stream_events": 175,
+            "passed": true,
+            "completion_tokens": 496,
+            "reasoning_tail_zlib_ratio": 0.5188,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s131-r30",
+            "status": "complete",
+            "elapsed_s": 22.052913427352905,
+            "finish_reason": "stop",
+            "stream_events": 336,
+            "passed": true,
+            "completion_tokens": 952,
+            "reasoning_tail_zlib_ratio": 0.4335,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s132-r31",
+            "status": "complete",
+            "elapsed_s": 22.020158767700195,
+            "finish_reason": "stop",
+            "stream_events": 335,
+            "passed": true,
+            "completion_tokens": 951,
+            "reasoning_tail_zlib_ratio": 0.4467,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s133-r32",
+            "status": "complete",
+            "elapsed_s": 10.95112943649292,
+            "finish_reason": "stop",
+            "stream_events": 162,
+            "passed": true,
+            "completion_tokens": 530,
+            "reasoning_tail_zlib_ratio": 0.4838,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s134-r33",
+            "status": "complete",
+            "elapsed_s": 12.775251388549805,
+            "finish_reason": "stop",
+            "stream_events": 189,
+            "passed": true,
+            "completion_tokens": 541,
+            "reasoning_tail_zlib_ratio": 0.5385,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s135-r34",
+            "status": "complete",
+            "elapsed_s": 15.903863430023193,
+            "finish_reason": "stop",
+            "stream_events": 239,
+            "passed": true,
+            "completion_tokens": 714,
+            "reasoning_tail_zlib_ratio": 0.4921,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s136-r35",
+            "status": "complete",
+            "elapsed_s": 13.784160852432251,
+            "finish_reason": "stop",
+            "stream_events": 205,
+            "passed": true,
+            "completion_tokens": 612,
+            "reasoning_tail_zlib_ratio": 0.4966,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s137-r36",
+            "status": "complete",
+            "elapsed_s": 29.877305507659912,
+            "finish_reason": "stop",
+            "stream_events": 456,
+            "passed": true,
+            "completion_tokens": 1323,
+            "reasoning_tail_zlib_ratio": 0.4283,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s138-r37",
+            "status": "complete",
+            "elapsed_s": 169.6631281375885,
+            "finish_reason": "stop",
+            "stream_events": 2599,
+            "passed": true,
+            "completion_tokens": 7398,
+            "reasoning_tail_zlib_ratio": 0.3363,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s139-r38",
+            "status": "complete",
+            "elapsed_s": 11.407508373260498,
+            "finish_reason": "stop",
+            "stream_events": 169,
+            "passed": true,
+            "completion_tokens": 526,
+            "reasoning_tail_zlib_ratio": 0.4928,
+            "reasoning_tail_period": null
+          },
+          {
+            "tag": "HumanEval_157-s140-r39",
+            "status": "complete",
+            "elapsed_s": 29.291722774505615,
+            "finish_reason": "stop",
+            "stream_events": 446,
+            "passed": true,
+            "completion_tokens": 1261,
+            "reasoning_tail_zlib_ratio": 0.42,
+            "reasoning_tail_period": null
+          }
+        ]
+      }
+    }
+  ],
+  "source_hashes": {
+    "stack-ab/runner/runs/20261116T191214/visits/v01-s-shipped-r1/realistic.json": "afa57c8b0238e6f27c4ca03e7377cd9fe40518813b2de2176152220112420b5c",
+    "stack-ab/runner/runs/20261116T191214/visits/v02-k-k6w-e59-r1/realistic.json": "c5e3a2c9dd700c131733dd2d1cbf1ed0f202895d1ecdf6e78e0e55a1b43c7b73",
+    "stack-ab/runner/runs/20261116T191214/visits/v03-kw-k6w-e59-wmma9-r1/realistic.json": "748dd1131ae367c74f95d7b4648670fc41a52008a78b6712e498ed1a80949622",
+    "stack-ab/runner/runs/20261116T191214/visits/v04-kw-k6w-e59-wmma9-r2/realistic.json": "adb66acb9dbb756edbe813c7e78f07eff010e246092677128171622f11883e56",
+    "stack-ab/runner/runs/20261116T191214/visits/v05-k-k6w-e59-r2/realistic.json": "dc49b8b15375c2a2c04e27bd0353fee8575d2444403dc01db6d365100270ca59",
+    "stack-ab/runner/runs/20261116T191214/visits/v06-s-shipped-r2/realistic.json": "a07e2252ac8aed4036ef427b46cb7dce9e72e070c18efb988a6dd17406125160",
+    "stack-ab/runner/runs/20261116T191214/summary.json": "683ce72550923bfcd6695277e6c1b11be9ac239390da2cf7e1704949f471d435",
+    "task-ab/runner/runs/20261116T220748/visits/v01-s-shipped-r1/tasks/humaneval/native-result.json": "0118c810beaf73d9babb7d22ed5d910181cce2a9c7beece9efd497e2662b3ea8",
+    "task-ab/runner/runs/20261116T220748/visits/v02-kw-k6w-e59-wmma9-r1/tasks/humaneval/native-result.json": "d01eabd5ad1e6f29b4a37a5e293c8cf60413c1ea2eea38f53ffc1a77dc5f8002",
+    "task-ab/runner/runs/20261117T085053/visits/v01-s-shipped-r1/tasks/scores.json": "dfcce7033e252d384f5d1430e341c86bfeb20b570b4f5003d2dbd7138d98cf67",
+    "task-ab/runner/runs/20261117T085053/visits/v02-kw-k6w-e59-wmma9-r1/tasks/scores.json": "d9218d8173bd1281cb33222c28c656bc3e31fc54d65895470614a8c4e2ca1a6c",
+    "task-ab/runner/runs/20261117T165801/visits/v01-s-shipped-r1/tasks/scores.json": "4eb7ca6ebeb57928794ff472e68494ab6fad37bd911b9b7f7cc2b8a3cd3abe90",
+    "task-ab/runner/runs/20261117T165801/visits/v02-kw-k6w-e59-wmma9-r1/tasks/scores.json": "11717d36d0b4b522b0706644524b5e0094460f944895beda47cd7b8d9eb8e59e"
+  }
+}

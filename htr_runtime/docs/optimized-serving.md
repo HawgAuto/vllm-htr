@@ -21,18 +21,27 @@ vLLM interface. It makes the retained concurrency stack the runtime default:
 The PLE hot-row cache stays off by default. Rejected grouped dense-output work,
 unfinished concurrency changes and persistent unpacked weight shadows are not
 part of this release. v0.2.4 improves single-stream decode in the selected-stack
-screens; 2–4-stream throughput stayed within approximately ±5%. See the versioned
-release evidence for exact conditions. The historical throughput targets remain unmet.
+screens; 2–4-stream changes vary by workload, including a −5.60% steady two-stream
+result. No multi-stream or prefill win is established. See the [versioned
+release evidence](../releases/v0.2.4/README.md) for exact conditions and the known
+seed42 looping limitation. The historical throughput targets remain unmet.
 
 ## Native controls
 
 Use ordinary `vllm serve`, or the image's equivalent default entry point. Existing
-sampling, context, KV budget, concurrency and speculation flags remain native:
+sampling, context, KV budget, concurrency and speculation flags remain native.
+Pull the qualified image first (no registry login required):
+
+```sh
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5
+```
+
+Then start it:
 
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.4
+IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5
 MODEL=${MODEL:-"$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"}
 WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v024"}
 mkdir -p "$WORKSPACE"
@@ -79,7 +88,7 @@ with its historical presets, not the recommended way to configure concurrency.
 ```sh
 git clone https://github.com/HawgAuto/vllm-htr.git
 cd vllm-htr
-git checkout htr-v0.2.4
+git checkout 62cb02413de66042cb11c6dc853922618c368887
 python3 htr_runtime/build_optimized.py \
   --output /absolute/path/outside-checkout/htr-build \
   --tag vllm-htr:v0.2.4

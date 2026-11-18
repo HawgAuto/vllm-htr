@@ -1,0 +1,537 @@
+{
+  "schema": "htr-v024-final-image-qualification-v1",
+  "status": "QUALIFIED",
+  "image": "sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5",
+  "runtime_source_commit": "62cb02413de66042cb11c6dc853922618c368887",
+  "scope": "Htr5Core: MTP3 INT8 262144-context seq4 selected-stack folding check; BF16 32768-context seq1 MTP3 cold-start/tools and MTP0 selected-stack folding check. Short requests, not filled contexts.",
+  "weights_changed": false,
+  "sampling_defaults_changed": false,
+  "native_rebuild": {
+    "k6": "830f49e0de6ec4a47a642cad661516d0091efe8ce30cac2abb49666e565e8ca0",
+    "dense_wmma": "d015e97814ce3fc98eb56f3e2e5cf7f931d48ba5d734ae400c92da7c00a288f2",
+    "both_byte_identical": true
+  },
+  "cpu_suite": {
+    "run": 147,
+    "failures": 0,
+    "errors": 0,
+    "superseded": 7
+  },
+  "installed_binding_tests": 2,
+  "visits": {
+    "ref": {
+      "image": "sha256:7b7a4688671d945c439c0f934611598975f6fbe67459ca36897b824c17e424a3",
+      "ready_s": 165.5,
+      "empty_workspace": false,
+      "chat": {
+        "status": 200,
+        "content": "42"
+      },
+      "tool": null,
+      "route_markers": {
+        "HTR_MOE_K6W_ACTIVE": [
+          "HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 7, \"rows\": [2, 3, 4], \"shared\": false}",
+          "(EngineCore pid=154) HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 154, \"rows\": [2, 3, 4], \"shared\": false}"
+        ],
+        "HTR_DENSE_WMMA_ROUTE": [
+          "(EngineCore pid=154) HTR_DENSE_WMMA_ROUTE {\"M\": 20, \"m\": 1280, \"n\": 2560, \"K\": 5, \"nsplit\": 10}",
+          "(EngineCore pid=154) HTR_DENSE_WMMA_ROUTE {\"M\": 20, \"m\": 2560, \"n\": 640, \"K\": 5, \"nsplit\": 2}",
+          "(EngineCore pid=154) HTR_DENSE_WMMA_ROUTE {\"M\": 20, \"m\": 13312, \"n\": 2560, \"K\": 5, \"nsplit\": 8}"
+        ],
+        "HTR_MOE_GROUPED_ACTIVE": [
+          "HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"d2e1779fe0c17a98126258728442aa10a2888e1e64a6265e715faa25513f74d9\", \"bound_files\": 17, \"pid\": 7, \"rows\": [12, 16, 24, 32, 40]}",
+          "(EngineCore pid=154) HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"d2e1779fe0c17a98126258728442aa10a2888e1e64a6265e715faa25513f74d9\", \"bound_files\": 17, \"pid\": 154, \"rows\": [12, 16, 24, 32, 40]}"
+        ],
+        "HTR_MOE_PARTITION4_ACTIVE": [
+          "HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 7}",
+          "(EngineCore pid=154) HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 154}"
+        ],
+        "HTR_MOE_GROUPED_SELFCHECK": [
+          "(EngineCore pid=154) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 12, \"finite\": true, \"live_rows\": 12, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 154, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=154) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 16, \"finite\": true, \"live_rows\": 16, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 154, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=154) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 24, \"finite\": true, \"live_rows\": 24, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 154, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}"
+        ],
+        "HTR_QSA_TAU_SELFCHECK": [],
+        "Application startup complete": [
+          "(APIServer pid=7) INFO:     Application startup complete."
+        ],
+        "GPU KV cache size": [
+          "(EngineCore pid=154) INFO 11-18 04:19:04 [kv_cache_utils.py:2432] GPU KV cache size: 1,262,363 tokens, Maximum concurrency for 262,144 tokens per request: 4.82x"
+        ]
+      },
+      "log_diagnostics": {
+        "Traceback": 1,
+        "\\bERROR\\b": 8,
+        "unable to make temporary file": 0,
+        "HSA_STATUS_ERROR": 0,
+        "bit mismatch": 0
+      }
+    },
+    "rel": {
+      "image": "sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5",
+      "ready_s": 391.2,
+      "empty_workspace": false,
+      "chat": {
+        "status": 200,
+        "content": "42"
+      },
+      "tool": {
+        "first_status": 200,
+        "first_finish": "tool_calls",
+        "tool_calls": [
+          {
+            "id": "chatcmpl-tool-a3c55f556ab85ac9",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\": \"Lisbon\"}"
+            }
+          }
+        ],
+        "second_status": 200,
+        "second_finish": "stop",
+        "final": "It's currently **19\u00b0C** in Lisbon with **clear** skies. \u2600\ufe0f"
+      },
+      "route_markers": {
+        "HTR_MOE_K6W_ACTIVE": [
+          "HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 7, \"rows\": [2, 3, 4], \"shared\": false}",
+          "(EngineCore pid=1416) HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 1416, \"rows\": [2, 3, 4], \"shared\": false}"
+        ],
+        "HTR_DENSE_WMMA_ROUTE": [
+          "(EngineCore pid=1416) HTR_DENSE_WMMA_ROUTE {\"M\": 20, \"m\": 1280, \"n\": 2560, \"K\": 5, \"nsplit\": 10}",
+          "(EngineCore pid=1416) HTR_DENSE_WMMA_ROUTE {\"M\": 20, \"m\": 2560, \"n\": 640, \"K\": 5, \"nsplit\": 2}",
+          "(EngineCore pid=1416) HTR_DENSE_WMMA_ROUTE {\"M\": 20, \"m\": 13312, \"n\": 2560, \"K\": 5, \"nsplit\": 8}"
+        ],
+        "HTR_MOE_GROUPED_ACTIVE": [
+          "HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"ee46b66b3d9cc193352ed9df5a5758759bd2432a3dc6eb1f10ee6cd934c1ba1e\", \"bound_files\": 17, \"pid\": 7, \"rows\": [12, 16, 24, 32, 40]}",
+          "(EngineCore pid=1416) HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"ee46b66b3d9cc193352ed9df5a5758759bd2432a3dc6eb1f10ee6cd934c1ba1e\", \"bound_files\": 17, \"pid\": 1416, \"rows\": [12, 16, 24, 32, 40]}"
+        ],
+        "HTR_MOE_PARTITION4_ACTIVE": [
+          "HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 7}",
+          "(EngineCore pid=1416) HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 1416}"
+        ],
+        "HTR_MOE_GROUPED_SELFCHECK": [
+          "(EngineCore pid=1416) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 12, \"finite\": true, \"live_rows\": 12, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1416, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=1416) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 16, \"finite\": true, \"live_rows\": 16, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1416, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=1416) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 24, \"finite\": true, \"live_rows\": 24, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1416, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}"
+        ],
+        "HTR_QSA_TAU_SELFCHECK": [],
+        "Application startup complete": [
+          "(APIServer pid=7) INFO:     Application startup complete."
+        ],
+        "GPU KV cache size": [
+          "(EngineCore pid=1416) INFO 11-18 04:25:10 [kv_cache_utils.py:2432] GPU KV cache size: 1,262,363 tokens, Maximum concurrency for 262,144 tokens per request: 4.82x"
+        ]
+      },
+      "log_diagnostics": {
+        "Traceback": 0,
+        "\\bERROR\\b": 0,
+        "unable to make temporary file": 0,
+        "HSA_STATUS_ERROR": 0,
+        "bit mismatch": 0
+      }
+    },
+    "card3": {
+      "image": "sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5",
+      "ready_s": 436.1,
+      "empty_workspace": true,
+      "chat": {
+        "status": 200,
+        "content": "42"
+      },
+      "tool": {
+        "first_status": 200,
+        "first_finish": "tool_calls",
+        "tool_calls": [
+          {
+            "id": "chatcmpl-tool-95078806e2abf635",
+            "type": "function",
+            "function": {
+              "name": "get_weather",
+              "arguments": "{\"city\": \"Lisbon\"}"
+            }
+          }
+        ],
+        "second_status": 200,
+        "second_finish": "stop",
+        "final": "It's currently 19\u00b0C in Lisbon with clear skies."
+      },
+      "route_markers": {
+        "HTR_MOE_K6W_ACTIVE": [
+          "HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 7, \"rows\": [2, 3, 4], \"shared\": false}",
+          "(EngineCore pid=2484) HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 2484, \"rows\": [2, 3, 4], \"shared\": false}"
+        ],
+        "HTR_DENSE_WMMA_ROUTE": [
+          "(EngineCore pid=2484) HTR_DENSE_WMMA_ROUTE {\"M\": 26, \"m\": 1280, \"n\": 2560, \"K\": 5, \"nsplit\": 10}",
+          "(EngineCore pid=2484) HTR_DENSE_WMMA_ROUTE {\"M\": 26, \"m\": 2560, \"n\": 640, \"K\": 5, \"nsplit\": 2}",
+          "(EngineCore pid=2484) HTR_DENSE_WMMA_ROUTE {\"M\": 26, \"m\": 13312, \"n\": 2560, \"K\": 5, \"nsplit\": 8}"
+        ],
+        "HTR_MOE_GROUPED_ACTIVE": [
+          "HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"ee46b66b3d9cc193352ed9df5a5758759bd2432a3dc6eb1f10ee6cd934c1ba1e\", \"bound_files\": 17, \"pid\": 7, \"rows\": [12, 16, 24, 32, 40]}",
+          "(EngineCore pid=2484) HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"ee46b66b3d9cc193352ed9df5a5758759bd2432a3dc6eb1f10ee6cd934c1ba1e\", \"bound_files\": 17, \"pid\": 2484, \"rows\": [12, 16, 24, 32, 40]}"
+        ],
+        "HTR_MOE_PARTITION4_ACTIVE": [
+          "HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 7}",
+          "(EngineCore pid=2484) HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 2484}"
+        ],
+        "HTR_MOE_GROUPED_SELFCHECK": [
+          "(EngineCore pid=2484) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 12, \"finite\": true, \"live_rows\": 12, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 2484, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=2484) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 16, \"finite\": true, \"live_rows\": 16, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 2484, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=2484) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 24, \"finite\": true, \"live_rows\": 24, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 2484, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}"
+        ],
+        "HTR_QSA_TAU_SELFCHECK": [
+          "(EngineCore pid=2484) HTR_QSA_TAU_SELFCHECK {\"bitwise\": true, \"kind\": \"first\", \"n\": 1, \"nreq\": 1, \"page\": 1600, \"pid\": 2484, \"rows\": 282}",
+          "(EngineCore pid=2484) HTR_QSA_TAU_SELFCHECK {\"bitwise\": true, \"kind\": \"first\", \"n\": 2, \"nreq\": 1, \"page\": 1600, \"pid\": 2484, \"rows\": 282}",
+          "(EngineCore pid=2484) HTR_QSA_TAU_SELFCHECK {\"bitwise\": true, \"kind\": \"first\", \"n\": 3, \"nreq\": 1, \"page\": 1600, \"pid\": 2484, \"rows\": 282}"
+        ],
+        "Application startup complete": [
+          "(APIServer pid=7) INFO:     Application startup complete."
+        ],
+        "GPU KV cache size": [
+          "(EngineCore pid=2484) INFO 11-18 04:33:53 [kv_cache_utils.py:2432] GPU KV cache size: 37,449 tokens, Maximum concurrency for 32,768 tokens per request: 1.14x"
+        ]
+      },
+      "log_diagnostics": {
+        "Traceback": 0,
+        "\\bERROR\\b": 0,
+        "unable to make temporary file": 0,
+        "HSA_STATUS_ERROR": 0,
+        "bit mismatch": 0
+      }
+    },
+    "ref0": {
+      "image": "sha256:7b7a4688671d945c439c0f934611598975f6fbe67459ca36897b824c17e424a3",
+      "ready_s": 290.9,
+      "empty_workspace": false,
+      "chat": {
+        "status": 200,
+        "content": "42"
+      },
+      "tool": null,
+      "route_markers": {
+        "HTR_MOE_K6W_ACTIVE": [
+          "HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 7, \"rows\": [2, 3, 4], \"shared\": false}",
+          "(EngineCore pid=1319) HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 1319, \"rows\": [2, 3, 4], \"shared\": false}"
+        ],
+        "HTR_DENSE_WMMA_ROUTE": [
+          "(EngineCore pid=1319) HTR_DENSE_WMMA_ROUTE {\"M\": 11, \"m\": 1280, \"n\": 2560, \"K\": 5, \"nsplit\": 10}",
+          "(EngineCore pid=1319) HTR_DENSE_WMMA_ROUTE {\"M\": 11, \"m\": 2560, \"n\": 640, \"K\": 5, \"nsplit\": 5}",
+          "(EngineCore pid=1319) HTR_DENSE_WMMA_ROUTE {\"M\": 11, \"m\": 13312, \"n\": 2560, \"K\": 5, \"nsplit\": 8}"
+        ],
+        "HTR_MOE_GROUPED_ACTIVE": [
+          "HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"d2e1779fe0c17a98126258728442aa10a2888e1e64a6265e715faa25513f74d9\", \"bound_files\": 17, \"pid\": 7, \"rows\": [12, 16, 24, 32, 40]}",
+          "(EngineCore pid=1319) HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"d2e1779fe0c17a98126258728442aa10a2888e1e64a6265e715faa25513f74d9\", \"bound_files\": 17, \"pid\": 1319, \"rows\": [12, 16, 24, 32, 40]}"
+        ],
+        "HTR_MOE_PARTITION4_ACTIVE": [
+          "HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 7}",
+          "(EngineCore pid=1319) HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 1319}"
+        ],
+        "HTR_MOE_GROUPED_SELFCHECK": [
+          "(EngineCore pid=1319) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 12, \"finite\": true, \"live_rows\": 12, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1319, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=1319) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 16, \"finite\": true, \"live_rows\": 16, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1319, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=1319) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 24, \"finite\": true, \"live_rows\": 24, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1319, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}"
+        ],
+        "HTR_QSA_TAU_SELFCHECK": [],
+        "Application startup complete": [
+          "(APIServer pid=7) INFO:     Application startup complete."
+        ],
+        "GPU KV cache size": [
+          "(EngineCore pid=1319) INFO 11-18 04:39:37 [kv_cache_utils.py:2432] GPU KV cache size: 58,982 tokens, Maximum concurrency for 32,768 tokens per request: 1.80x"
+        ]
+      },
+      "log_diagnostics": {
+        "Traceback": 0,
+        "\\bERROR\\b": 0,
+        "unable to make temporary file": 0,
+        "HSA_STATUS_ERROR": 0,
+        "bit mismatch": 0
+      }
+    },
+    "card0": {
+      "image": "sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5",
+      "ready_s": 290.8,
+      "empty_workspace": false,
+      "chat": {
+        "status": 200,
+        "content": "42"
+      },
+      "tool": null,
+      "route_markers": {
+        "HTR_MOE_K6W_ACTIVE": [
+          "HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 7, \"rows\": [2, 3, 4], \"shared\": false}",
+          "(EngineCore pid=1319) HTR_MOE_K6W_ACTIVE {\"grouped\": true, \"inner\": \"forward\", \"partitioned\": true, \"pid\": 1319, \"rows\": [2, 3, 4], \"shared\": false}"
+        ],
+        "HTR_DENSE_WMMA_ROUTE": [
+          "(EngineCore pid=1319) HTR_DENSE_WMMA_ROUTE {\"M\": 11, \"m\": 1280, \"n\": 2560, \"K\": 5, \"nsplit\": 10}",
+          "(EngineCore pid=1319) HTR_DENSE_WMMA_ROUTE {\"M\": 11, \"m\": 2560, \"n\": 640, \"K\": 5, \"nsplit\": 5}",
+          "(EngineCore pid=1319) HTR_DENSE_WMMA_ROUTE {\"M\": 11, \"m\": 13312, \"n\": 2560, \"K\": 5, \"nsplit\": 8}"
+        ],
+        "HTR_MOE_GROUPED_ACTIVE": [
+          "HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"ee46b66b3d9cc193352ed9df5a5758759bd2432a3dc6eb1f10ee6cd934c1ba1e\", \"bound_files\": 17, \"pid\": 7, \"rows\": [12, 16, 24, 32, 40]}",
+          "(EngineCore pid=1319) HTR_MOE_GROUPED_ACTIVE {\"binding_sha256\": \"ee46b66b3d9cc193352ed9df5a5758759bd2432a3dc6eb1f10ee6cd934c1ba1e\", \"bound_files\": 17, \"pid\": 1319, \"rows\": [12, 16, 24, 32, 40]}"
+        ],
+        "HTR_MOE_PARTITION4_ACTIVE": [
+          "HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 7}",
+          "(EngineCore pid=1319) HTR_MOE_PARTITION4_ACTIVE {\"moe2_sha256\": \"583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac\", \"pid\": 1319}"
+        ],
+        "HTR_MOE_GROUPED_SELFCHECK": [
+          "(EngineCore pid=1319) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 12, \"finite\": true, \"live_rows\": 12, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1319, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=1319) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 16, \"finite\": true, \"live_rows\": 16, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1319, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}",
+          "(EngineCore pid=1319) HTR_MOE_GROUPED_SELFCHECK {\"L\": 0, \"T\": 24, \"finite\": true, \"live_rows\": 24, \"mismatches\": 0, \"oracle\": \"native_live_plus_semantic_empty\", \"pid\": 1319, \"qualification_input\": \"eager_live_prefix\", \"reference_repeat_mismatches\": 0, \"source_T\": 2048, \"zero_rows\": 0}"
+        ],
+        "HTR_QSA_TAU_SELFCHECK": [],
+        "Application startup complete": [
+          "(APIServer pid=7) INFO:     Application startup complete."
+        ],
+        "GPU KV cache size": [
+          "(EngineCore pid=1319) INFO 11-18 04:45:01 [kv_cache_utils.py:2432] GPU KV cache size: 58,982 tokens, Maximum concurrency for 32,768 tokens per request: 1.80x"
+        ]
+      },
+      "log_diagnostics": {
+        "Traceback": 1,
+        "\\bERROR\\b": 8,
+        "unable to make temporary file": 0,
+        "HSA_STATUS_ERROR": 0,
+        "bit mismatch": 0
+      }
+    }
+  },
+  "greedy_mtp3": [
+    {
+      "id": "lisbon",
+      "token_ids_identical": true,
+      "tokens_identical": true,
+      "logprobs_identical": true,
+      "first_token_divergence": null,
+      "n_tokens": [
+        96,
+        96
+      ],
+      "max_abs_logprob_diff": 0.0
+    },
+    {
+      "id": "code",
+      "token_ids_identical": true,
+      "tokens_identical": true,
+      "logprobs_identical": true,
+      "first_token_divergence": null,
+      "n_tokens": [
+        128,
+        128
+      ],
+      "max_abs_logprob_diff": 0.0
+    },
+    {
+      "id": "math",
+      "token_ids_identical": true,
+      "tokens_identical": true,
+      "logprobs_identical": true,
+      "first_token_divergence": null,
+      "n_tokens": [
+        128,
+        128
+      ],
+      "max_abs_logprob_diff": 0.0
+    }
+  ],
+  "greedy_mtp0": [
+    {
+      "id": "lisbon",
+      "token_ids_identical": true,
+      "tokens_identical": true,
+      "logprobs_identical": true,
+      "first_token_divergence": null,
+      "n_tokens": [
+        96,
+        96
+      ],
+      "max_abs_logprob_diff": 0.0
+    },
+    {
+      "id": "code",
+      "token_ids_identical": true,
+      "tokens_identical": true,
+      "logprobs_identical": true,
+      "first_token_divergence": null,
+      "n_tokens": [
+        128,
+        128
+      ],
+      "max_abs_logprob_diff": 0.0
+    },
+    {
+      "id": "math",
+      "token_ids_identical": true,
+      "tokens_identical": true,
+      "logprobs_identical": true,
+      "first_token_divergence": null,
+      "n_tokens": [
+        128,
+        128
+      ],
+      "max_abs_logprob_diff": 0.0
+    }
+  ],
+  "dense_wmma_9_to_15_rows": [
+    {
+      "M": 12,
+      "m": 1280,
+      "n": 2560,
+      "K": 5,
+      "nsplit": 10
+    },
+    {
+      "M": 12,
+      "m": 2560,
+      "n": 640,
+      "K": 5,
+      "nsplit": 5
+    },
+    {
+      "M": 12,
+      "m": 13312,
+      "n": 2560,
+      "K": 5,
+      "nsplit": 8
+    },
+    {
+      "M": 12,
+      "m": 640,
+      "n": 2560,
+      "K": 5,
+      "nsplit": 10
+    },
+    {
+      "M": 10,
+      "m": 1280,
+      "n": 2560,
+      "K": 5,
+      "nsplit": 10
+    },
+    {
+      "M": 10,
+      "m": 2560,
+      "n": 640,
+      "K": 5,
+      "nsplit": 5
+    },
+    {
+      "M": 10,
+      "m": 13312,
+      "n": 2560,
+      "K": 5,
+      "nsplit": 8
+    },
+    {
+      "M": 10,
+      "m": 640,
+      "n": 2560,
+      "K": 5,
+      "nsplit": 10
+    },
+    {
+      "M": 11,
+      "m": 640,
+      "n": 2560,
+      "K": 5,
+      "nsplit": 10
+    }
+  ],
+  "delivery_normalizations": [
+    "host model/workspace paths",
+    "container name",
+    "host loopback port 18320 rather than 8000",
+    "docker create/start and explicit stop/remove rather than docker run --rm"
+  ],
+  "card_container_environment_equals_image": true,
+  "docker_bridge_forwarding_exercised": true,
+  "limitations": [
+    "Historical selected-stack speed/quality screens were not rerun on the final image.",
+    "Greedy identity is a short request check, not whole-model bitwise equivalence.",
+    "Optional KV formats, multimodal, Bf16Core and million-context capacity not requalified.",
+    "No new prefill benchmark or throughput guarantee.",
+    "Seed42 HumanEval/157 looping limitation retained."
+  ],
+  "source_audit": {
+    "new_layers": 4,
+    "findings": 0
+  },
+  "evidence_sha256": {
+    "IDENTITY-ref-rel.json": "8964a1b1794fa4433237fdf1faa069a0e69305dbe9c38641b1347bc67b1bb953",
+    "IDENTITY-ref0-card0.json": "8964a1b1794fa4433237fdf1faa069a0e69305dbe9c38641b1347bc67b1bb953",
+    "SUMMARY.json": "d2c73414d70b01d3db1d3800cc5921daa3ff84d55a0b132ed4d6aca5b677582c",
+    "card0-chat.json": "2f4c81a7ebc9368c7d2d7d376d167b8cbac2f54aecbda53b52127654ccda1df4",
+    "card0-greedy.json": "5c11604ebf327f3699c1454aed16a24a7bf9b2a49732c8025c09bb4e11e63bf0",
+    "card0-inside.json": "9ef2b11c9a262969a8a76d27ff7b7ec5b4f8b850d4d9629ea2b5950d3d54f796",
+    "card0.json": "788c727cab96a601a186a6e17a19de30c6b723daf1f5b8031ebe9f83695f21f6",
+    "card3-chat.json": "817855764b345a60e5ca1a02a2b4df9f3fb92ab649f8dcd750cbbf2457f45429",
+    "card3-inside.json": "925ceedfca88ff4eaf1e6375a202b037be0e2b05f6636de25878c6bf9d98f731",
+    "card3-tool.json": "e82c6a0c67c5f1089582f73aa3dab2b3ee9753c81e4f588cbfb5db2787cc6c69",
+    "card3.json": "434c50ea10e40525e2ea7de5a524467e97a5637bb780fa01012bd7407f1fb430",
+    "ref-chat.json": "01fc68605938db73613c8f48560ca89199d85345f4a626012e7d7cb8c3bd1b8c",
+    "ref-concurrent4.json": "fd68c0e3eb2dcd54a5adc4632487873c3959208f6aebe26460eaee4a5b772a9e",
+    "ref-greedy.json": "81f07db2f004a16ab9dc5fc2fa80d2160e9dc88ffc5c7e788ab1c0195941d5b8",
+    "ref-inside.json": "5a39ed4773905740169a3d9cecd095e0fdd12c7a724a2a90f4e0592ce50f97a3",
+    "ref.json": "c64195b1f73e1c95349214cbc1b382a39e686da02cf520c50a8bce44ee38aaee",
+    "ref0-chat.json": "742da890c66de861cd81228d219012d289fc1a8dd5faddef67a671f7a79d34b4",
+    "ref0-greedy.json": "5c11604ebf327f3699c1454aed16a24a7bf9b2a49732c8025c09bb4e11e63bf0",
+    "ref0-inside.json": "107d3aa29cd16f4e01adcc60f7e3669ce453d96a193d8d2a1b985a83dd4e3ee5",
+    "ref0.json": "c65e5c2f710c8181a56fd6d92f4894059538de7dcf92a122c651ceb243c5def0",
+    "rel-chat.json": "d86cf084d2f528613c66c1a7bc6768df14dce5b20145e79bc4eb95c177e72525",
+    "rel-concurrent4.json": "fd68c0e3eb2dcd54a5adc4632487873c3959208f6aebe26460eaee4a5b772a9e",
+    "rel-greedy.json": "81f07db2f004a16ab9dc5fc2fa80d2160e9dc88ffc5c7e788ab1c0195941d5b8",
+    "rel-inside.json": "16c2abe28fc0274832ef63ec938dd8ce3c472331faf110f6ea06fe0fbbea5782",
+    "rel-tool.json": "e95ccdc04544b5d4de1b4395bd2aa3fea5d7883bf8fa4ac4b7098a3d426faeb2",
+    "rel.json": "6e0bad5178190a36131741c0c774c4daaf2d948574ec8c4cfa2e048749057bf8"
+  },
+  "speculative_activity": {
+    "ref": {
+      "observed_intervals": [
+        {
+          "accepted": 53,
+          "drafted": 120
+        },
+        {
+          "accepted": 186,
+          "drafted": 225
+        }
+      ],
+      "scope": "log intervals from short smoke requests, not a benchmark"
+    },
+    "rel": {
+      "observed_intervals": [
+        {
+          "accepted": 56,
+          "drafted": 123
+        },
+        {
+          "accepted": 155,
+          "drafted": 180
+        },
+        {
+          "accepted": 148,
+          "drafted": 267
+        },
+        {
+          "accepted": 21,
+          "drafted": 21
+        }
+      ],
+      "scope": "log intervals from short smoke requests, not a benchmark"
+    },
+    "card3": {
+      "observed_intervals": [
+        {
+          "accepted": 35,
+          "drafted": 36
+        }
+      ],
+      "scope": "log intervals from short smoke requests, not a benchmark"
+    }
+  },
+  "shutdown_diagnostics": {
+    "ref": "AsyncLLM output-handler EngineDeadError after commanded shutdown and engine-manager stop; no serving-time ERROR/Traceback.",
+    "card0": "AsyncLLM output-handler EngineDeadError after commanded shutdown and engine-manager stop; no serving-time ERROR/Traceback."
+  },
+  "startup_interpretation": "Fresh process readiness: reference 165.5s and packaged 391.2s copied the same campaign cache but the packaged image compiled additional identities; not a controlled cold-start speed benchmark. Card MTP3 from empty workspace 436.1s. MTP0 reference 290.9s and packaged 290.8s each copied the completed card workspace."
+}

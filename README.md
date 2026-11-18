@@ -1,4 +1,57 @@
-# vLLM HTR — v0.2.3
+# vLLM HTR — v0.2.4
+
+Native HTR serving for **AMD Strix Halo / gfx1151**, with **K6 routed-MoE decode**,
+**dense WMMA at eligible 9–15 rows**, and the **PLE zero-row startup repair**.
+Weights, tokenizer/configuration and checkpoint sampling defaults are unchanged.
+
+[Run v0.2.4](htr_runtime/docs/optimized-serving.md) · [Htr5Core model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Exact results and limitations](htr_runtime/releases/v0.2.4/README.md) · [Release history](RELEASES.md)
+
+```sh
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5
+```
+
+Version alias: `ghcr.io/hawgauto/vllm-htr:v0.2.4`. Ordinary `vllm serve` receives
+the optimizations by default; native flags and explicit disable controls remain
+available. No forced evaluation seed, persistent unpacked-weight shadow or
+mandatory compiler-cache download. PLE hot rows remain off by default.
+
+## What v0.2.4 brings
+
+The retained selected-stack screens used Htr5Core, MTP3, maximum four sequences,
+40,960 configured context and two mirrored visits per arm:
+
+| Single-stream metric | v0.2.3 | Selected v0.2.4 stack | Change |
+|---|---:|---:|---:|
+| Steady aggregate output | 48.05 tok/s | 55.35 tok/s | +15.19% |
+| Mixed prompts, output / full wall | 34.08 tok/s | 36.41 tok/s | +6.82% |
+| Mixed prompts, per-request decode p50 | 48.10 tok/s | 53.83 tok/s | +11.91% |
+
+Multi-stream changes varied: steady 2/3/4-stream −5.60% / +2.44% / +4.14%;
+mixed-prompt +1.77% / +4.46% / +0.96%. There is no established multi-stream or
+prefill win, and two visits do not establish statistical noise bounds.
+
+Separate task screens (262K configured context, INT8 KV, MTP3, thinking on,
+temperature1.0/top-p0.95/top-k20, optional2GiB PLE hot rows) recorded HumanEval+
+159 → 162 / 164, ToolEval125 / 138 both, and Hermes20 1850 → 1950 / 2000.
+These selected-stack performance/quality screens were not rerun on the packaged
+image. HumanEval/157 still looped at evaluation seed42 (reproduced twice), but not
+at seeds1–3 or101–140; this finite screen is not a population loop-rate estimate.
+[All visits, exact conditions and limitations](htr_runtime/releases/v0.2.4/README.md).
+The historical throughput targets remain unmet.
+
+Qualification covered five real-model starts (three final-image, two reference),
+matched token IDs and logprobs
+against the selected stack in MTP0/MTP3, concurrent-request delivery, native
+route/self-checks and a documented-command cold-start/tool round trip. Empty
+workspace MTP3 readiness took436.1s; first start and new shapes can compile.
+This is short-request delivery/packaging qualification, not whole-model bitwise
+or maximum-context validation. [Qualification](htr_runtime/releases/v0.2.4/QUALIFICATION.json).
+
+Executable source: [`62cb02413de66042cb11c6dc853922618c368887`](https://github.com/HawgAuto/vllm-htr/tree/62cb02413de66042cb11c6dc853922618c368887).
+The release tag adds documentation/evidence only. Historical sections below retain
+their original pins and scope; use the current guide above for v0.2.4.
+
+## Preserved v0.2.3 release
 
 Native HTR serving for **AMD Strix Halo / gfx1151**, now with the retained
 concurrency stack: **grouped MoE**, **selected dense WMMA**, and **expanded

@@ -1,5 +1,15 @@
 # vLLM HTR release history
 
+## v0.2.4 — single-stream decode and PLE startup repair
+
+K6 routed-MoE decode at2–4 rows and dense WMMA at eligible9–15 rows are now runtime defaults. Async PLE row limit0 safely disables its path; the self-check wait is bounded. The empty-workspace cold-start repair is included. Weights, tokenizer/configuration and sampling defaults are unchanged.
+
+Selected-stack screens recorded steady single-stream48.05→55.35tok/s (+15.19%) and mixed-prompt output/full wall34.08→36.41tok/s (+6.82%). Steady two-stream declined5.60%; no multi-stream or prefill improvement is established. Task screens: HumanEval+159→162/164, ToolEval125/138 both, Hermes20 1850→1950/2000. The seed42 HumanEval/157 looping limitation remains. These historical selected-stack screens were not rerun on the packaged image; [all rows and conditions](htr_runtime/releases/v0.2.4/README.md).
+
+Executable source `62cb02413de66042cb11c6dc853922618c368887`; image `ghcr.io/hawgauto/vllm-htr@sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5`; image alias `v0.2.4`; runtime tag `htr-v0.2.4`; model metadata tag `v0.2.4`. The release tag adds documentation/evidence only.
+
+[Final-image qualification](htr_runtime/releases/v0.2.4/QUALIFICATION.json): three packaged-image starts and two selected-stack references; matched short greedy token IDs/logprobs in MTP0/MTP3, live native route/self-checks, concurrent requests, and a documented-command empty-workspace chat/tool round trip. CPU suite147 tests (7 explicit supersessions), installed integrity2/2; native K6 and dense WMMA rebuild byte-identically. Empty-workspace MTP3 readiness436.1s; first start and new shapes may compile. Optional formats and million-context capacity retain their earlier qualification scope. [Run/build](htr_runtime/docs/optimized-serving.md).
+
 ## v0.2.3-coldstart.1 — cold start from an empty workspace
 
 v0.2.3 plus the cold-start fix: `htr_native_policy.environment_defaults()` now creates `TMPDIR` and the cache roots, so the first start no longer needs `mkdir -p "$WORKSPACE/tmp"` before `docker run`.
