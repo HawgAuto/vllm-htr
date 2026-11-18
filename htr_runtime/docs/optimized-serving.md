@@ -1,8 +1,11 @@
-# HTR v0.2.3 optimized serving
+# HTR v0.2.4 optimized serving
 
 This serving update keeps the v0.2.2 engine, model weights, KV formats and native
 vLLM interface. It makes the retained concurrency stack the runtime default:
 
+- K6 routed-MoE decode at 2–4 rows, outside the unchanged partition/grouped startup guards.
+- Dense WMMA widened to eligible 9–15-row projections.
+- Async PLE row limit zero now disables the path instead of allocating a zero-byte buffer; the self-check wait is bounded.
 - Grouped expert-major MoE planning at its admitted row counts, using the
   existing native kernels and per-layer bitwise startup checks.
 - Selected K5/BF16 dense WMMA projections at the measured shapes and row counts.
@@ -17,8 +20,9 @@ vLLM interface. It makes the retained concurrency stack the runtime default:
 
 The PLE hot-row cache stays off by default. Rejected grouped dense-output work,
 unfinished concurrency changes and persistent unpacked weight shadows are not
-part of this release. Single-stream gains are not implied by high-concurrency
-screens. The historical throughput targets remain unmet.
+part of this release. v0.2.4 improves single-stream decode in the selected-stack
+screens; 2–4-stream throughput stayed within approximately ±5%. See the versioned
+release evidence for exact conditions. The historical throughput targets remain unmet.
 
 ## Native controls
 
@@ -28,9 +32,9 @@ sampling, context, KV budget, concurrency and speculation flags remain native:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.3-coldstart.1
+IMAGE=ghcr.io/hawgauto/vllm-htr:v0.2.4
 MODEL=${MODEL:-"$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"}
-WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v023"}
+WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v024"}
 mkdir -p "$WORKSPACE"
 exec docker run --rm --init --pull=never --name vllm-htr \
   --device /dev/kfd --device /dev/dri/renderD128 \
@@ -55,7 +59,9 @@ compiler-cache reuse; the first start and newly encountered shapes may compile.
 
 Optional environment overrides go before the image name:
 
-- `-e HTR_MOE_GROUPED=0`: retain the predecessor MoE route.
+- `-e HTR_MOE_K6=0`: disable the new 2–4-row K6 route.
+- `-e HTR_DENSE_WMMA_MIN9=0`: restore the 16-row dense WMMA floor.
+- `-e HTR_MOE_GROUPED=0`: disable grouped MoE (independent of K6).
 - `-e HTR_DENSE_WMMA=0`: retain the predecessor dense route.
 - `-e HTR_PLE_ASYNC_MAXN=4`: explicitly choose the asynchronous PLE row limit.
   Zero disables this asynchronous row path. The legacy E59_PLE_DEV_MAXN override
@@ -73,16 +79,16 @@ with its historical presets, not the recommended way to configure concurrency.
 ```sh
 git clone https://github.com/HawgAuto/vllm-htr.git
 cd vllm-htr
-git checkout htr-v0.2.3
+git checkout htr-v0.2.4
 python3 htr_runtime/build_optimized.py \
   --output /absolute/path/outside-checkout/htr-build \
-  --tag vllm-htr:v0.2.3
+  --tag vllm-htr:v0.2.4
 ```
 
 The builder requires a clean committed tree, the pinned public v0.2.2 base and
-Docker. It rebuilds the selected dense extension from source using the original
-Ninja recipe and requires byte identity with the qualified native artifact. The
-cold-start fix is commit 879fc13d99a0 on main, after the htr-v0.2.3 tag.
+Docker. It rebuilds the selected dense and K6 extensions from source using their
+bound Ninja recipes and requires byte identity with both qualified native artifacts.
+The empty-workspace cold-start fix is included.
 All other native libraries are inherited unchanged from the pinned base. It
 checks source/native/base/KV manifest consistency before admitting the image.
 No host ROCm compiler or GPU access is needed for the build. The historical

@@ -77,6 +77,13 @@ class V024Runtime(unittest.TestCase):
         for row in manifest['modules']:
             self.assertNotIn('/home/', (ROOT/row['recipe']).read_text())
 
+    def test_public_builder_supplies_both_native_artifacts(self):
+        text = (ROOT/'build_optimized.py').read_text()
+        self.assertIn("assert version == '0.2.4'", text)
+        self.assertIn("native/'htr_moe_k6.so'", text)
+        self.assertIn("k6_actual == k6['accepted_binary_sha256']", text)
+        self.assertIn("native/'htr_dense_wmma.so'", text)
+
     def test_installer_verifies_and_binds_k6(self):
         text = (ROOT/'install_optimized.py').read_text()
         self.assertIn("/payload/native/htr_moe_k6.so", text)
