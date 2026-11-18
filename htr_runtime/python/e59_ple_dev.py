@@ -13,9 +13,19 @@ Every other step calls mark_sync() (stream-ordered n16 = 0 -> the kernel neither
 ctrl[0]; a host-side sync publication could overwrite readiness before the preceding GPU consumer finishes. Bytes identical to the sync path
 (same lookup); the first E59_PLE_DEV_CHECKS async steps are self-checked (torch.equal vs the synchronous reference) and abort on
 mismatch. A 2 s GPU timeout sets ctrl[1]; the host raises on the next step.
+
+A row limit <= 0 (HTR_PLE_ASYNC_MAXN=0 / E59_PLE_DEV_MAXN=0) means the path is fully
+off: mark_sync and ple_dev_wait are no-ops and submit_decode declines, so no buffer is
+ever allocated. Zero is not a usable size for the coherent rows buffer.
+
+The self-check wait is bounded (E59_PLE_DEV_SYNC_S, default 5 s, 0 = unbounded): the
+2 s GPU deadline inside k_wait_copy is the only other bound on this path and it runs
+entirely on the GPU, so a wedged producer used to block the host in
+torch.cuda.synchronize() forever with no thread left to read ctrl[1].
 """
 import json
 import os
+import time
 import concurrent.futures as _cf
 
 import numpy as np
@@ -25,10 +35,16 @@ ENABLED = os.environ.get("E59_PLE_DEV", "0") == "1"
 MAXN = int(os.environ.get("E59_PLE_DEV_MAXN", "4"))
 CHECKS = int(os.environ.get("E59_PLE_DEV_CHECKS", "3"))
 SO = os.environ.get("E59_PLE_DEV_SO", "/opt/e59/e59_pledev_ext.so")
+SYNC_S = float(os.environ.get("E59_PLE_DEV_SYNC_S", "5.0"))
 _ext = [None]
 _pool = [None]
 _B = {}
 _S = dict(seq=0, steps=0, syncs=0, checks=0, pending=None, check=None)
+
+
+def _active():
+    """Async path is on only with a positive row budget (see module docstring)."""
+    return ENABLED and MAXN > 0
 
 
 def _x():
@@ -42,6 +58,8 @@ def _x():
 
 
 def _buffers():
+    if MAXN <= 0:
+        raise RuntimeError("E59: row limit must be positive (HTR_PLE_ASYNC_MAXN/E59_PLE_DEV_MAXN); zero disables the async path")
     if not _B:
         x = _x()
         ctrl = x.alloc_coherent(64)                       # int32[16]: [0] ready seq, [1] GPU timeout flag
@@ -92,13 +110,36 @@ def _fstat_check(reader):
             raise OSError(f"safetensors shard identity changed: {loc.path}")
 
 
+def _sync_stream(what):
+    """Wait for the current stream, but never longer than SYNC_S (0 = unbounded).
+
+    The only other bound on this path is the GPU-side 2 s deadline in k_wait_copy, and
+    that one can only be observed from the host on the *next* step. Blocking here used
+    to be unbounded: a lost ctrl[0] publication left EngineCore in
+    torch.cuda.synchronize() with no thread left to read ctrl[1] (A08).
+    """
+    if SYNC_S <= 0:
+        torch.cuda.synchronize()
+        return
+    ev = torch.cuda.Event()
+    ev.record()
+    t0 = time.monotonic()
+    while not ev.query():
+        if time.monotonic() - t0 > SYNC_S:
+            b = _B
+            err = _x().host_load(b["ctrl"], 1) if b else "n/a"
+            raise RuntimeError(f"E59: {what} blocked for {SYNC_S}s (ctrl[1]={err}); "
+                               f"the async PLE producer never satisfied the GPU wait")
+        time.sleep(0.001)
+
+
 def _selfcheck():
     ck = _S["check"]
     if ck is None:
         return
     _S["check"] = None
     rows, emb, ngram_ids, n = ck
-    torch.cuda.synchronize()
+    _sync_stream("selfcheck")
     ref = emb.ngram_embedding(ngram_ids).flatten(-2)
     ok = bool(torch.equal(ref.view(torch.int16), rows[:n].view(torch.int16)))
     _S["checks"] += 1
@@ -109,7 +150,7 @@ def _selfcheck():
 
 def mark_sync():
     """Every non-E59 step (prefill, E53 async, sync fallback, dummy runs): the GPU kernel must neither wait nor copy."""
-    if not ENABLED:
+    if not _active():
         return
     _drain()
     _selfcheck()
@@ -125,7 +166,7 @@ def mark_sync():
 
 
 def submit_decode(emb, ngram_ids, rows, n):
-    if not ENABLED or n > MAXN or n <= 0:
+    if not _active() or n > MAXN or n <= 0:
         return False
     import direct_ple_ab_v1 as P
     arm, case = P.read_arm()
@@ -166,7 +207,7 @@ def submit_decode(emb, ngram_ids, rows, n):
 
 @torch.library.custom_op("e59::ple_dev_wait", mutates_args=("rows",))
 def ple_dev_wait(rows: torch.Tensor, dep: torch.Tensor) -> None:
-    if not ENABLED:
+    if not _active():
         return
     b = _buffers()
     _x().wait_copy(rows, b["ctrl_d"], b["exp"], b["rows_d"], b["err_d"])

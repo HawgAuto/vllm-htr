@@ -20,8 +20,18 @@ def enabled():
     return value == '1'
 
 
+def min_m():
+    # Opt-in 9..15-row widening. Default 16 reproduces v0.2.3 dispatch exactly.
+    # The native gemv_wmma floor is M >= 1 (NB = ceil(M/16) <= 4); this is the
+    # Python row-policy knob and nothing else. Unset/0 -> the literal 16 floor.
+    value = os.environ.get('HTR_DENSE_WMMA_MIN9', '0')
+    if value not in ('0', '1'):
+        raise ValueError('HTR_DENSE_WMMA_MIN9 must be 0 or 1')
+    return 9 if value == '1' else 16
+
+
 def eligible(M, mt, nt, K, dtype):
-    return (16 <= M <= 64 and dtype == torch.bfloat16 and K == 5 and (mt,nt) in SHAPES
+    return (min_m() <= M <= 64 and dtype == torch.bfloat16 and K == 5 and (mt,nt) in SHAPES
             and ((mt,nt) != (1024,160) or M == 16))
 
 

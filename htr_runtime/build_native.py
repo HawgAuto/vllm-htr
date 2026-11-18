@@ -12,7 +12,7 @@ import shutil
 import subprocess
 
 ROOT = Path(__file__).resolve().parent
-EXPECTED = {'htr_kernels', 'htr_moe2', 'htr_moe_prefill_v3', 'htr_moe_serve_k',
+EXPECTED = {'htr_kernels', 'htr_moe2', 'htr_moe_k6', 'htr_moe_prefill_v3', 'htr_moe_serve_k',
             'htr_dq_arena', 'htr_moe_prefill', 'htr_moe_prefill_v2',
             'e59_pledev_ext', 'hiphc', 'hiphcp', 'ple_gather_v2'}
 

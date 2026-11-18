@@ -23,6 +23,16 @@
       "accepted_binary_sha256": "de777aacdbf4e7b9c5786c382c866962253a903e552b7c1ee18e61c861ad64f2"
     },
     {
+      "name": "htr_moe_k6",
+      "recipe": "native-recipes/htr_moe_k6.ninja.in",
+      "output": "native-bin/htr_moe_k6.so",
+      "sources": [
+        "native-source/moe2/k6/k6.hip",
+        "native-source/moe2/k6/k6.cpp"
+      ],
+      "accepted_binary_sha256": "830f49e0de6ec4a47a642cad661516d0091efe8ce30cac2abb49666e565e8ca0"
+    },
+    {
       "name": "htr_moe_prefill_v3",
       "recipe": "native-recipes/htr_moe_prefill_v3.ninja.in",
       "output": "native-bin/htr_moe_prefill_v3.so",
@@ -139,7 +149,13 @@
     "native-recipes/hiphcp.ninja.in": "669dff3c9dfddb6fae44077b7400aa6dadcc1605f55b6cbf6104b230744cb197",
     "native-recipes/ple_gather_v2.ninja.in": "a689fe3c1f753eed5304c726b87aa7aa5bf9025091b4e6e0913b70733d045533",
     "native-source/ple-gather/ple_gather_v2.c": "e148fc97e8326b14ce57fe480f95a1f39c483493118efed5ca53c8a048c6e869",
-    "native-source/qsa_tau/qsa_tau_v2.hip": "581bee354a25c61c7e1167c1e18dba9757d457ffacacadfb3433086ea0315e9c"
+    "native-source/qsa_tau/qsa_tau_v2.hip": "581bee354a25c61c7e1167c1e18dba9757d457ffacacadfb3433086ea0315e9c",
+    "native-source/moe2/k6/gen_k6.py": "a0fadaada6066357b7e039b88fda246dcfe7ed67ed446836753abab3d318a9ce",
+    "native-source/moe2/k6/inc_moe2.inc": "c349c2688854c227b8727a9ddd8895502df1dabbb6c942aaf3dcc5a65e117b80",
+    "native-source/moe2/k6/k6.hip": "4a6bd56201368942fce6a8fcaa54b86a5538a358e912ad0296b0d6f894ee2eea",
+    "native-source/moe2/k6/k6.cpp": "25e05aeabb4bd0f591ddbe76bad8759af73cad14e0fed2c5bb16e47e94735da6",
+    "native-source/moe2/k6/k6_host.inc": "ddab67e48aa4d357b04cf204d57733e9de694564764ef0d6d61024fd819a4077",
+    "native-recipes/htr_moe_k6.ninja.in": "34c28c64983f82ff49140bddf30b4ae7fa241abc65f5f04f415f5dbbaf7fcdc2"
   },
   "hsaco": [
     {

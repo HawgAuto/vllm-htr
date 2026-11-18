@@ -71,6 +71,11 @@ def resolve_ple_maxn(mtp, env):
         maximum = int(value)
         if maximum < 0:
             raise ValueError('PLE async row limit must be nonnegative')
+    if maximum == 0:
+        # E59 fix (v0.2.4): "0" switches the async row path off; it is not a buffer
+        # size. Leaving E59_PLE_DEV=1 with a zero row limit crashed startup in
+        # hipHostGetDevicePointer (zero-byte coherent buffer).
+        env['E59_PLE_DEV'] = '0'
     env['HTR_PLE_ASYNC_MAXN'] = str(maximum)
     env['E59_PLE_DEV_MAXN'] = str(maximum)
     return maximum

@@ -73,3 +73,24 @@ def hpf3_ext():
         spec.loader.exec_module(mod)
         _HPF3 = mod
     return _HPF3
+
+
+# ---- v0.2.4 K6-A: routed-MoE block kernel (ROWX + CMB + EPW + tight LDS + NT/VP + SPLIT, (3,2) down split).
+# A separate module so htr_moe2.so stays byte-identical (partition4.MOE2_SHA256 and grouped-bindings.json pin it).
+# Default OFF: HTR_MOE_K6=1 selects it; the route falls back to htr_moe2 unchanged when the switch is off.
+_K6 = None
+
+
+def k6_ext():
+    global _K6
+    if _K6 is None:
+        path = os.environ.get('HTR_MOE_K6_SO') or os.path.join(os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'),
+                                                               'htr_moe_k6.so')
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'HTR_MOE_K6: missing native extension {path}')
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('htr_moe_k6', path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _K6 = mod
+    return _K6

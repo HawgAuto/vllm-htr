@@ -5,10 +5,10 @@ COPY source/htr_runtime /payload/htr_runtime
 COPY native /payload/native
 RUN /opt/venv/bin/python3 /payload/htr_runtime/install_optimized.py
 ARG SOURCE_REVISION=unknown
-LABEL org.opencontainers.image.version="0.2.3" \
+LABEL org.opencontainers.image.version="0.2.4" \
       org.opencontainers.image.source="https://github.com/HawgAuto/vllm-htr" \
       org.opencontainers.image.revision="${SOURCE_REVISION}" \
-      org.opencontainers.image.description="HTR optimized serving with grouped MoE, selected dense WMMA, asynchronous PLE and repaired quantized-KV bindings"
+      org.opencontainers.image.description="HTR optimized serving with grouped MoE, K6 routed-MoE decode, dense WMMA at 9-64 rows, asynchronous PLE and repaired quantized-KV bindings"
 USER 1000:1000
 WORKDIR /workspace
 ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]

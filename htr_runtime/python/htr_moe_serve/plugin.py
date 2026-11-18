@@ -263,3 +263,127 @@ def register():
     partition4.register()
     from . import grouped
     grouped.register()
+    register_k6w()      # v0.2.4 K6W: OUTERMOST, installed last so every shipped guard stays native
+
+
+# ----------------------------------------------------------------------------- v0.2.4 K6W
+# K6-A routed-MoE kernel installed as the OUTERMOST wrapper of `routes.forward`.
+#
+# WHY OUTERMOST (this is the whole point of K6W)
+# The shipped runtime stacks two *guarded* wrappers over routes.forward, in this order
+# (plugin.register, plugin.py:259-265): partition4.install() then grouped.install().
+#   * partition4 captures `orig = R.forward` BEFORE it wraps and routes every internal call
+#     through `_Proxy(R, orig)` (partition4.py:29-37, 48, 65). Its 4-row partition calls and its
+#     `t <= 4` fallback therefore hit the function that was `routes.forward` at install time.
+#   * grouped captures `original = R.forward` (which is partition4's forward), and its startup
+#     guard compares `P.forward(...)` == that original against `grouped_plan.forward(...)` == the
+#     native expert-major plan (grouped.py:56-65, 91-115). prime_smaller re-runs the same
+#     comparison for rows 1..4 with cloned eager prefixes (grouped.py:74-85).
+# Putting the K6 branch INSIDE routes.forward (the w7/k6a overlay) makes the *reference* side of
+# both guards K6 while the *candidate* side stays native, so every startup guard fails
+# (A06: "RuntimeError: Grouped MoE bit mismatch: 24" at layer L=1). Wrapping R.forward after both
+# installs leaves routes.forward byte-identical to shipped, so both guards compare native against
+# native and pass.
+#
+# NUMERICS (approved class): K6-A is row-invariant (each row's output == what the kernel produces
+# for that row alone), while the shipped decode route is not: a row's bits depend on the launch
+# bucket M (bucket(T) = 1/2/4/8) and on its position inside its expert group. Measured on the
+# shipped module by the A05d parity gate: 0/2, 0/3, 0/4 and 0/8 rows equal to row-alone at
+# uniform routing (w7/k6a-build/evidence/parity/run-20261113T005200/parity.json). K6 at T=2..4 is
+# therefore ROUNDING-CHANGING versus shipped, not bit-identical -- user-approved for v0.2.4.
+# Default OFF: with HTR_MOE_K6 unset no wrapper is installed and routing is byte-identical.
+K6W_ON = os.environ.get('HTR_MOE_K6') == '1'
+K6W_SHARED = os.environ.get('HTR_MOE_K6_SHARED') == '1'
+_K6W_SCR = {}
+
+
+def _k6w_rows(spec):
+    out = set()
+    for part in spec.split(','):
+        part = part.strip()
+        if not part:
+            continue
+        lo, _, hi = part.partition('-')
+        out.update(range(int(lo), int(hi or lo) + 1))
+    if not out or min(out) < 1 or max(out) > 8:
+        raise ValueError(f'HTR_MOE_K6_ROWS={spec!r}: row counts must land inside 1..8')
+    return frozenset(out)
+
+
+K6W_ROWS = _k6w_rows(os.environ.get('HTR_MOE_K6_ROWS', '1-8'))
+
+
+def _k6w_bucket(T):
+    """K6 row bucket: k6_plan SPLITs a group larger than M, so the bucket stops at 4."""
+    return 1 if T == 1 else 2 if T == 2 else 4
+
+
+def _k6w_scratch(dev):
+    """G = T*topk groups (+ ceil(T/M) shared groups in phase B); part = G*ns*M*m f32, which is
+    G*M*5120 for both the gate|up (ns 4, m 1280) and the down (ns 2, m 2560) launch."""
+    s = _K6W_SCR.get(str(dev))
+    if s is None:
+        a, m = 8 * 10, 4
+        g = a + (-(-8 // m) if K6W_SHARED else 0)
+        f = dict(dtype=torch.float32, device=dev)
+        s = _K6W_SCR[str(dev)] = dict(
+            gu=torch.empty(g * m * 2 * 640, **f), dn=torch.empty(g * m * 2560, **f),
+            part=torch.empty(g * m * 5120, **f),
+            cnt_gu=torch.zeros(g * 10, dtype=torch.int32, device=dev), cnt_dn=torch.zeros(g * 20, dtype=torch.int32, device=dev),
+            cnt_c2=torch.zeros(20, dtype=torch.int32, device=dev))
+    return s
+
+
+def decode_route_k6(ar, x, ids32, w32):
+    """K6-A: plan (1 WG, on device) + gate|up + down-with-fused-combine = 3 launches, like E29.
+
+    T <= 8; x bf16 [T,2560] contiguous, ids32 int32 [T,10] contiguous (-1 = no expert),
+    w32 f32 [T,10] contiguous. Shared expert stays on its own K5 path (phase A).
+    """
+    from .kernels import k6_ext
+    from . import routes as R
+    T = x.shape[0]
+    assert 1 <= T <= 8 and T in K6W_ROWS and ids32.shape == (T, R.TOPK) and w32.shape == (T, R.TOPK)
+    E, s, M = k6_ext(), _k6w_scratch(x.device), _k6w_bucket(T)
+    A_, nsh = T * R.TOPK, (-(-T // M) if K6W_SHARED else 0)
+    # phase A passes x twice: k6_plan never reads x/wsg when nsh == 0
+    ge, gr, gn, slot, ng, sg = E.k6_plan(ids32, M, int(ar.get('sh_g', -1)), nsh, x, ar.get('wsg', x))
+    kf = ar['_kf']
+    sp = R.spadk(ar)
+    E.k6_gemv(kf, M, ar['qw'], ar['qoff'], ar['kexp'], ar['scales'], ar['su'], ar['sv'], ge, gr, gn, x, s['part'],
+              s['cnt_gu'], s['gu'], R.cbscale(), *sp, R.FENCE_RA)
+    return E.k6_gemv_dn_fused(kf, M, ar['qw'], ar['qoff'], ar['kexp'], ar['scales'], ar['su'], ar['sv'], ge, gr, gn, s['gu'],
+                              s['part'], s['cnt_dn'], s['dn'], R.cbscale(), *sp, R.FENCE_RA, slot, w32, ng, s['cnt_c2'], sg,
+                              A_)   # sh_g = A: first shared group (== the group count in phase A, so never hit)
+
+
+def register_k6w():
+    """Install K6 as the OUTERMOST R.forward wrapper. Call LAST, after partition4 + grouped.
+
+    Only direct model calls with T in HTR_MOE_K6_ROWS reach the K6 route; every call the shipped
+    guards make internally goes through the proxies they captured, so it stays native.
+    """
+    if not K6W_ON:
+        return None                     # default off: R.forward is exactly grouped's forward
+    from . import routes as R
+    if getattr(R, '_htr_k6w', False):
+        return R.forward
+    if not getattr(R, '_htr_grouped', False):
+        # not fatal (an env that disables grouped), but then the guard-vs-native argument does not
+        # hold and the caller should know which stack it got
+        _log('HTR_MOE_K6W_NO_GROUPED', install=os.environ.get('HTR_MOE_GROUPED', '1'))
+    inner = R.forward
+
+    def forward(ar, x, ids, w):
+        if x.shape[0] in K6W_ROWS and ar.get('_kf') == 4:
+            return decode_route_k6(ar, x, ids.to(torch.int32).contiguous(), w.to(torch.float32).contiguous())
+        return inner(ar, x, ids, w)
+
+    forward._htr_orig = inner
+    forward._htr_k6w = True
+    R.forward = forward
+    R._htr_k6w = True
+    _log('HTR_MOE_K6W_ACTIVE', rows=sorted(K6W_ROWS), inner=getattr(inner, '__name__', str(inner)),
+         partitioned=bool(getattr(R, '_htr_partition4', False)), grouped=bool(getattr(R, '_htr_grouped', False)),
+         shared=K6W_SHARED)
+    return forward

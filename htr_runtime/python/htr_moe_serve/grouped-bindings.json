@@ -9,15 +9,18 @@
     "/opt/vllm-htr/python/htr_moe_serve/dispatch.py": "d44dba6c085ecea3cecfa8d08848d06d7f51d53e1289873074ea82791bd3ece0",
     "/opt/vllm-htr/python/htr_moe_serve/grouped.py": "f29826e1855f8f564953606b8b0523f465856ec183885f3351056b28fa92ae91",
     "/opt/vllm-htr/python/htr_moe_serve/grouped_plan.py": "3d601771b12301f07152966b4dfcea70f14925d85cca410864c394cfdde7d3e8",
-    "/opt/vllm-htr/python/htr_moe_serve/kernels.py": "89a02c880fdebb750a94d8b1c1f281fdf22a2238a48487fd622c87c09cf87eb4",
+    "/opt/vllm-htr/python/htr_moe_serve/kernels.py": "d29a9ec3442b584ad411c074287111ed08327ff16f6887ee9d0f06f2061114f7",
     "/opt/vllm-htr/python/htr_moe_serve/partition4.py": "f0e173f761db0209a6c6c27294171f1e906c8dccd0b7832854af58becc9d99a9",
     "/opt/vllm-htr/python/htr_moe_serve/partition4_plan.py": "cc159cbb1706f0b9c8d2883a14c8eb3164baad14aae444f4694cc0fd39fcadb3",
-    "/opt/vllm-htr/python/htr_moe_serve/plugin.py": "8898e486684ebf15e2d6ea2e5ddfce791d20752dae8a11672c18d11b41c88ddb",
+    "/opt/vllm-htr/python/htr_moe_serve/plugin.py": "50776af443b586a2175450052728675bd6a01fa681153f2eea81e09b4f0e82fc",
     "/opt/vllm-htr/python/htr_moe_serve/prefill.py": "316610ff72923e9fb12fe2312ed9fb2540fac161fd855a96786be3babdc7b9d4",
     "/opt/vllm-htr/python/htr_moe_serve/prefill2.py": "086d8ca563e2622937f9e2aa1e29050d55589d3229343041971b89e460ce3e17",
     "/opt/vllm-htr/python/htr_moe_serve/routes.py": "5d103813c61839256633ea0ef61c8961a40bde40e42c602695cc2c59ea4b95f1",
     "/opt/vllm-htr/python/htr_moe_serve/wire.py": "546d60b7f36057a4077d7dd7f8f546e433b6f18ffc2276d79f3610cd6d3f1537"
   },
   "schema": "htr-grouped-moe-bindings-v1",
-  "scope": "Selected grouped MoE; original native arithmetic and runtime parity guards."
+  "scope": "Selected grouped MoE; original native arithmetic and runtime parity guards.",
+  "k6w": {
+    "note": "v0.2.4: plugin.py installs the K6 routed-MoE decode kernel (native-bin/htr_moe_k6.so) as the outermost R.forward wrapper after partition4 and grouped, so both startup guards still compare native against native; kernels.py adds the k6_ext loader. routes.py, partition4.py, grouped.py, dispatch.py, grouped_plan.py and htr_moe2.so are unchanged from v0.2.3. HTR_MOE_K6=1 and HTR_MOE_K6_ROWS=2-4 are runtime defaults (runtime-env.json); set HTR_MOE_K6=0 to restore the v0.2.3 route."
+  }
 }

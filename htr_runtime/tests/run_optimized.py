@@ -9,6 +9,10 @@ superseded=[(test_release_seed_policy.ReleaseSeedPolicy,'test_release_version_is
 (test_quantized_release.QuantizedLaunch,'test_current_distribution_version','Frozen v0.2.1 literal; test_combined_runtime.test_successor_distribution_version covers v0.2.2'),
 (test_launch_htr.LaunchContract,'test_retired_research_paths_are_gone','Frozen plugin roster; test_combined_runtime.test_kept_plugin_roster_and_retired_paths retains all dead-path checks and adds the accepted filter')]
 superseded.append((test_combined_runtime.CombinedRuntime,'test_successor_distribution_version','Frozen v0.2.2 literal; test_optimized_runtime.test_release_version covers v0.2.3'))
+import test_optimized_runtime
+superseded.append((test_optimized_runtime.OptimizedRuntime,'test_release_version','Frozen v0.2.3 literal; test_v024_runtime.test_release_version covers v0.2.4'))
+import test_native_build
+superseded.append((test_native_build.NativeBuild,'test_complete_sanitized_source_closure_and_selected_math_flags','Frozen 11-module literal; test_v024_runtime.test_native_build_closure_with_k6 repeats every check over 12 modules'))
 for cls,name,reason in superseded:setattr(cls,name,unittest.skip(reason)(getattr(cls,name)))
 suite=unittest.defaultTestLoader.discover(str(ROOT/'tests'))
 result=unittest.TextTestRunner(verbosity=2).run(suite)

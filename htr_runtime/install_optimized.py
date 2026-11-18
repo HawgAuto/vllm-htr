@@ -59,6 +59,17 @@ def main():
     for name, digest in build['files'].items():
         assert sha(ROOT/name) == digest, name
     shutil.copyfile(binary, ROOT/'native-bin/htr_dense_wmma.so')
+    # v0.2.4 K6 routed-MoE decode module: a separate library so htr_moe2.so stays
+    # byte-identical. Its accepted identity and pinned sources come from NATIVE-BUILD.json;
+    # once copied into native-bin it is bound in native-policy-bindings.json below.
+    native_build = json.loads((ROOT/'NATIVE-BUILD.json').read_text())
+    k6 = next(m for m in native_build['modules'] if m['name'] == 'htr_moe_k6')
+    k6_binary = Path('/payload/native/htr_moe_k6.so')
+    assert sha(k6_binary) == k6['accepted_binary_sha256'], 'K6 native identity'
+    for name, digest in native_build['files'].items():
+        if name.startswith('native-source/moe2/k6/') or name == k6['recipe']:
+            assert sha(ROOT/name) == digest, name
+    shutil.copyfile(k6_binary, ROOT/k6['output'])
     grouped = json.loads((ROOT/'python/htr_moe_serve/grouped-bindings.json').read_text())
     for name, digest in grouped['files'].items():
         assert sha(name) == digest, ('grouped closure drift', name)

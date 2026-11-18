@@ -34,5 +34,8 @@
   "HTR_Q38F": "on",
   "HTR_PLE_ROW_CACHE_BYTES": "0",
   "HTR_MOE_GROUPED": "1",
-  "HTR_DENSE_WMMA": "1"
+  "HTR_DENSE_WMMA": "1",
+  "HTR_MOE_K6": "1",
+  "HTR_MOE_K6_ROWS": "2-4",
+  "HTR_DENSE_WMMA_MIN9": "1"
 }
