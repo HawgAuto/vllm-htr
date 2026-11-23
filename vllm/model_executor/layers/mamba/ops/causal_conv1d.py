@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -1564,6 +1565,26 @@ def _causal_conv1d_update_kernel(
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+_HTR_CONV1D_NATIVE = os.environ.get("HTR_CONV1D_NATIVE", "0") == "1"
+_HTR_CONV1D_SO = os.environ.get(
+    "HTR_CONV1D_SO", "/opt/vllm-htr/native-bin/htr_causal_conv1d_update.so"
+)
+_HTR_CONV1D_MOD = None
+
+
+def _load_htr_conv1d():
+    global _HTR_CONV1D_MOD
+    if _HTR_CONV1D_MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("htr_causal_conv1d_update", _HTR_CONV1D_SO)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"HTR_CONV1D_NATIVE: cannot load {_HTR_CONV1D_SO}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _HTR_CONV1D_MOD = mod
+    return _HTR_CONV1D_MOD
+
+
 def causal_conv1d_update(
     x: torch.Tensor,
     conv_state: torch.Tensor,
@@ -1618,6 +1639,34 @@ def causal_conv1d_update(
     out: optional output tensor with the same shape as `x`. When omitted,
         the input is overwritten.
     """
+    if (
+        _HTR_CONV1D_NATIVE
+        and current_platform.is_rocm()
+        and x.is_cuda
+        and x.dim() == 2
+        and x.dtype == torch.bfloat16
+        and conv_state.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and weight.size(1) == 4
+        and conv_state_indices is not None
+        and conv_state_indices.dim() == 1
+        and block_idx_last_scheduled_token is None
+        and initial_state_idx is None
+        and (bias is None or bias.dtype == torch.bfloat16)
+        and (query_start_loc is None or (1 <= max_query_len <= 8))
+    ):
+        _act = "silu" if activation is True else (None if activation is False else activation)
+        if _act in (None, "silu", "swish"):
+            _out = x if out is None else out
+            _load_htr_conv1d().causal_conv1d_update_w4(
+                x, conv_state, weight, bias, conv_state_indices,
+                num_accepted_tokens, query_start_loc, _out,
+                _act in ("silu", "swish"),
+                int(max_query_len if query_start_loc is not None else 1),
+                int(null_block_id if null_block_id is not None else -1),
+            )
+            return _out
     if validate_data:
         assert null_block_id is not None
         assert x.stride(1) == 1
