@@ -412,6 +412,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         token_to_req: torch.Tensor,
         output_scale: torch.Tensor | None = None,
         output_block_scale: torch.Tensor | None = None,
+        gate: torch.Tensor | None = None,
+        gate_applied_out: list[bool] | None = None,
     ) -> torch.Tensor:
         del key, value
         if output_scale is not None or output_block_scale is not None:
@@ -490,6 +492,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             token_to_req,
             output[:num_tokens],
             zero_fallback=_GL_OUT_TAIL,
+            gate=gate[:num_tokens] if gate is not None else None,
+            gate_applied_out=gate_applied_out,
         )
         return output
 
@@ -684,7 +688,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         output: torch.Tensor,
         qkv: torch.Tensor | None = None,
         gate: torch.Tensor | None = None,
-    ) -> None:
+        fuse_gate: bool = False,
+    ) -> bool:
         # query/key/value are None when the fused prepare runs inside the
         # indexer launch, which then writes the gate into ``gate``.
         metadata = get_forward_context().attn_metadata
@@ -694,7 +699,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             output.zero_()
             if gate is not None:
                 gate.zero_()
-            return
+            return False
         main_metadata = cast(FlashAttentionMetadata, metadata[self.layer_name])
         if self.kv_cache.numel() == 0:
             raise RuntimeError("QSA main K/V cache is not bound")
@@ -764,6 +769,7 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             assert gate is not None
             gate[num_tokens:].zero_()
         assert query is not None
+        _gate_done: list[bool] = []
         impl.forward_qsa(
             self,
             query,
@@ -773,7 +779,10 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             main_metadata,
             output,
             token_to_req=side_metadata.token_to_req,
+            gate=gate if fuse_gate else None,
+            gate_applied_out=_gate_done if fuse_gate else None,
         )
+        return bool(_gate_done)
 
     def forward(
         self,
@@ -889,15 +898,18 @@ def qwen4_exp_qsa_with_output(
     # nb2-gatefuse-v1: this op owns the QSA output gate, applied once per element after attention with the
     # verbatim inductor-body Triton kernel (htr_qsa.gate_apply_).
     from htr_qsa import gate_apply_
-    layer._run_qsa(
+    _gd = layer._run_qsa(
         hidden_states,
         positions,
         query,
         key,
         value,
         output,
+        gate=gate,
+        fuse_gate=True,
     )
-    gate_apply_(output, gate)
+    if not _gd:
+        gate_apply_(output, gate)
 
 
 direct_register_custom_op(
@@ -921,7 +933,7 @@ def qwen4_exp_qsa_prepare_with_output(
     layer = get_forward_context().no_compile_layers[layer_name]
     if not isinstance(layer, Qwen4ExpQSAAttention):
         raise TypeError(f"{layer_name} is not a Qwen4Exp QSA owner")
-    layer._run_qsa(
+    _gd = layer._run_qsa(
         hidden_states,
         positions,
         None,
@@ -930,8 +942,9 @@ def qwen4_exp_qsa_prepare_with_output(
         output,
         qkv=qkv,
         gate=gate,
+        fuse_gate=apply_gate,
     )
-    if apply_gate:
+    if apply_gate and not _gd:
         # nb2-gatefuse-v1: gate applied once, by the same kernel as the unfused path.
         from htr_qsa import gate_apply_
 

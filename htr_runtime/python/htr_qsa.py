@@ -46,6 +46,15 @@ FN = 'qsa_tau_v2'
 SHARE = 2          # compatibility groups (v2)
 
 ENABLED = os.environ.get('HTR_QSA_TAU', '1') == '1'
+DECODE_UNION = os.environ.get('HTR_QSA_DECODE_UNION', '0') == '1'
+DECODE_UNION_HSACO = os.environ.get(
+    'HTR_QSA_DECODE_UNION_HSACO',
+    os.path.join(os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'), 'qsa_decode_union.hsaco'),
+)
+DECODE_UNION_SHA256 = '1db342131f05a00e9f3474fc3d14fac218ff631890b57d9d3cd9d3b0bf64b056'
+DECODE_UNION_MAX_ROWS = int(os.environ.get('HTR_QSA_DECODE_UNION_MAX_ROWS', '256'))
+_DEC_MOD = {}
+_DEC_SCRATCH = {}
 CHECKS = int(os.environ.get('HTR_QSA_TAU_CHECKS', '8'))
 MR_CHECKS = int(os.environ.get('HTR_QSA_TAU_MR_CHECKS', '8'))
 
@@ -222,9 +231,90 @@ def sparse_paged_attention(q, k_cache, v_cache, logical_indices, block_table, to
     return out
 
 
-def attention(q, k_cache, v_cache, logical_indices, block_table, token_to_req, out, *, zero_fallback=False):
+def _dec_module():
+    if 'm' not in _DEC_MOD:
+        import direct_hip_module_v1 as hm
+        if _sha(DECODE_UNION_HSACO) != DECODE_UNION_SHA256:
+            raise RuntimeError('HTR_QSA_DECODE_UNION: unexpected ' + DECODE_UNION_HSACO)
+        m = hm.Module(DECODE_UNION_HSACO)
+        _DEC_MOD.update(m=m, hm=hm, attrs=m.attrs('qsa_decode_union'))
+        _log('HTR_QSA_DECODE_UNION_ACTIVE', hsaco=DECODE_UNION_HSACO, sha256=DECODE_UNION_SHA256,
+             max_rows=DECODE_UNION_MAX_ROWS, attrs=_DEC_MOD['attrs'])
+    return _DEC_MOD['m'], _DEC_MOD['hm']
+
+
+def _dec_scratch(dev):
+    idx = dev.index if dev.index is not None else 0
+    buf = _DEC_SCRATCH.get(idx)
+    if buf is None:
+        # max(nprog * nsplits) <= 32 -> 32 * 2 * 48 * 256 * 4B = 3.1 MB total, MALL-resident & HIP-graph safe!
+        buf = (
+            torch.empty((64 * 48, 256), dtype=torch.float32, device=dev),
+            torch.empty((64 * 48,), dtype=torch.float32, device=dev),
+            torch.zeros((64 * 2,), dtype=torch.int32, device=dev),
+        )
+        _DEC_SCRATCH[idx] = buf
+    return buf
+
+
+def _dec_admitted(q, k, v, idx, bt, t2r, out, gate):
+    if not DECODE_UNION:
+        return False
+    if not (q.is_cuda and q.ndim == 3 and 1 <= q.shape[0] <= DECODE_UNION_MAX_ROWS):
+        return False
+    if not (q.shape[1:] == (24, 256) and q.dtype == torch.bfloat16):
+        return False
+    if not (k.shape == v.shape and k.ndim == 4 and k.shape[2:] == (2, 256) and k.dtype == torch.bfloat16):
+        return False
+    if not (idx.shape == (q.shape[0], 2051) and idx.dtype == torch.int32 and idx.stride(1) == 1):
+        return False
+    if not (bt.ndim == 2 and bt.dtype == torch.int32 and bt.stride(1) == 1 and t2r.dtype == torch.int32 and t2r.stride(0) == 1):
+        return False
+    if out is None or out.shape != q.shape or out.dtype != torch.bfloat16 or out.stride(2) != 1 or q.stride(2) != 1:
+        return False
+    if (q.data_ptr() & 15) or (out.data_ptr() & 15) or (k.data_ptr() & 15) or (v.data_ptr() & 15):
+        return False
+    if any(st & 7 for st in (q.stride(0), q.stride(1), out.stride(0), out.stride(1), k.stride(0), k.stride(1), k.stride(2), v.stride(0), v.stride(1), v.stride(2))):
+        return False
+    if gate is not None:
+        if gate.shape != q.shape or gate.dtype != torch.bfloat16 or gate.stride(2) != 1:
+            return False
+    dev = q.device.index
+    if dev not in _ARCH:
+        _ARCH[dev] = torch.cuda.get_device_properties(dev).gcnArchName.split(':')[0]
+    return _ARCH[dev] == 'gfx1151'
+
+
+def _dec_launch(q, k, v, idx, bt, t2r, out, gate):
+    m, hm = _dec_module()
+    part_o, part_lse, counters = _dec_scratch(q.device)
+    rows = int(q.shape[0])
+    nprog = (rows + 3) // 4
+    nsplits = 16 if nprog <= 2 else (8 if nprog <= 4 else (4 if nprog <= 8 else (2 if nprog <= 16 else 1)))
+    I32, I64 = ctypes.c_int32, ctypes.c_int64
+    gp = hm.ptr(gate) if gate is not None else ctypes.c_void_p(0)
+    sg0 = int(gate.stride(0)) if gate is not None else 0
+    sg1 = int(gate.stride(1)) if gate is not None else 0
+    with torch.cuda.device(q.device):
+        m.launch('qsa_decode_union', (nprog, int(k.shape[2]), nsplits), (384, 1, 1),
+                 [hm.ptr(q), hm.ptr(k), hm.ptr(v), hm.ptr(idx), hm.ptr(bt), hm.ptr(t2r),
+                  hm.ptr(out), gp, hm.ptr(part_o), hm.ptr(part_lse), hm.ptr(counters),
+                  I64(q.stride(0)), I64(q.stride(1)), I64(k.stride(0)), I64(k.stride(1)), I64(k.stride(2)),
+                  I64(v.stride(0)), I64(v.stride(1)), I64(v.stride(2)), I64(out.stride(0)), I64(out.stride(1)),
+                  I64(sg0), I64(sg1), I64(idx.stride(0)), I64(bt.stride(0)),
+                  I32(rows), I32(k.shape[0]), I32(k.shape[1]), I32(bt.shape[1]), I32(bt.shape[0]), I32(SHARE)])
+
+
+def attention(q, k_cache, v_cache, logical_indices, block_table, token_to_req, out, *, zero_fallback=False, gate=None, gate_applied_out=None):
     """QSA owner entry point. zero_fallback: the caller skipped zero-initialising out[:rows]
-    (DIRECT_QSA_OUT_TAILZERO); zero it here so every path sees the same zero-initialised output."""
+    (DIRECT_QSA_OUT_TAILZERO); zero it here so every path sees the same zero-initialised output.
+    When HTR_QSA_DECODE_UNION=1 and admitted (rows <= 256, including HIP graphs), runs split-K
+    tile-union qsa_decode_union with optional fused sigmoid gate."""
+    if _dec_admitted(q, k_cache, v_cache, logical_indices, block_table, token_to_req, out, gate):
+        _dec_launch(q, k_cache, v_cache, logical_indices, block_table, token_to_req, out, gate)
+        if gate_applied_out is not None and gate is not None:
+            gate_applied_out.append(True)
+        return out
     if zero_fallback and out is not None:
         out.zero_()
     return sparse_paged_attention(q, k_cache, v_cache, logical_indices, block_table, token_to_req, out)
