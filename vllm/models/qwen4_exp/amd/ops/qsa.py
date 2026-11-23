@@ -24,6 +24,63 @@ _HTR_QSA_MQA_V5_HSACO = os.environ.get(
 _HTR_QSA_MQA_V5_SHA256 = "a76acf12885c641a237e83f9c57575fc873ace9a32c2b5316947ea8e4438436b"
 _MQA_V5_MOD = {}
 
+# V5-I2: opt-in fused Wave32 QSA canonicalize + expand (5 launches -> 1 launch, 100% bitwise)
+_HTR_QSA_CANON_EXPAND_FUSED = os.environ.get("HTR_QSA_CANON_EXPAND_FUSED", "0") == "1"
+_HTR_QSA_CE_HSACO = os.environ.get(
+    "HTR_QSA_CE_HSACO",
+    os.path.join(os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "qsa_canon_expand_fused.hsaco"),
+)
+_HTR_QSA_CE_SHA256 = "3d36e7f5f20c1d67bcd0b8cd0d18aa76c1aad16ad2649555380c7f1e5ff2af05"
+_CE_MOD = {}
+
+
+def _canon_expand_fused_eligible(blocks, logits, visible_blocks, query_positions, sequence_lengths, token_to_req, out, block_topk):
+    return (
+        _HTR_QSA_CANON_EXPAND_FUSED
+        and current_platform.is_rocm()
+        and blocks.is_cuda
+        and 1 <= block_topk <= 512
+        and blocks.dtype == torch.int32
+        and logits.dtype == torch.float32
+        and visible_blocks.dtype == torch.int32
+        and query_positions.dtype == torch.int64
+        and sequence_lengths.dtype == torch.int32
+        and token_to_req.dtype == torch.int32
+        and out.dtype == torch.int32
+        and query_positions.is_contiguous()
+        and sequence_lengths.is_contiguous()
+        and token_to_req.is_contiguous()
+    )
+
+
+def _canon_expand_fused_run(blocks, logits, visible_blocks, query_positions, sequence_lengths, token_to_req, out, compress_ratio):
+    import ctypes, hashlib
+    if "m" not in _CE_MOD:
+        import direct_hip_module_v1 as hm
+        with open(_HTR_QSA_CE_HSACO, "rb") as _f:
+            sha = hashlib.sha256(_f.read()).hexdigest()
+        if sha != _HTR_QSA_CE_SHA256:
+            raise RuntimeError(f"HTR_QSA_CANON_EXPAND_FUSED: unexpected {_HTR_QSA_CE_HSACO} ({sha})")
+        m = hm.Module(_HTR_QSA_CE_HSACO)
+        _CE_MOD.update(m=m, hm=hm)
+    m, hm = _CE_MOD["m"], _CE_MOD["hm"]
+    I32, I64 = ctypes.c_int32, ctypes.c_int64
+    rows, K = int(blocks.shape[0]), int(blocks.shape[1])
+    W = int(logits.shape[1])
+    out_w = int(out.shape[1])
+    with torch.cuda.device(blocks.device):
+        m.launch(
+            "qsa_canon_expand_fused", (rows, 1, 1), (256, 1, 1),
+            [
+                hm.ptr(blocks), hm.ptr(logits), hm.ptr(visible_blocks),
+                hm.ptr(query_positions), hm.ptr(sequence_lengths), hm.ptr(token_to_req), hm.ptr(out),
+                I64(blocks.stride(0)), I64(blocks.stride(1)), I64(logits.stride(0)), I64(logits.stride(1)),
+                I64(visible_blocks.stride(0)), I64(out.stride(0)), I64(out.stride(1)),
+                I32(rows), I32(W), I32(K), I32(sequence_lengths.shape[0]),
+                I32(compress_ratio), I32(out_w),
+            ],
+        )
+
 
 def _mqa_v5_eligible(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths):
     if not (_HTR_QSA_MQA_V5 and q.is_cuda and q.ndim == 3 and q.shape[1] == 4 and q.shape[2] == 128):
@@ -1065,16 +1122,27 @@ def qsa_select_paged_tokens(
                 logits.stride(1),
                 block_topk,
             )
-        _direct_canonicalize_selected_blocks(blocks, logits, visible_blocks)
-        expand_qsa_block_indices_cuda(
-            blocks,
-            query_positions[row_slice],
-            sequence_lengths,
-            token_to_req[row_slice],
-            compress_ratio,
-            token_topk,
-            out[row_slice],
-        )
+        if _canon_expand_fused_eligible(
+            blocks, logits, visible_blocks,
+            query_positions[row_slice], sequence_lengths, token_to_req[row_slice],
+            out[row_slice], block_topk,
+        ):
+            _canon_expand_fused_run(
+                blocks, logits, visible_blocks,
+                query_positions[row_slice], sequence_lengths, token_to_req[row_slice],
+                out[row_slice], compress_ratio,
+            )
+        else:
+            _direct_canonicalize_selected_blocks(blocks, logits, visible_blocks)
+            expand_qsa_block_indices_cuda(
+                blocks,
+                query_positions[row_slice],
+                sequence_lengths,
+                token_to_req[row_slice],
+                compress_ratio,
+                token_topk,
+                out[row_slice],
+            )
     return out
 
 
