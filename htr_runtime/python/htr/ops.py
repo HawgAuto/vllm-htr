@@ -69,6 +69,25 @@ K5_SPLITPLANE = os.environ.get("HTR_K5_SPLITPLANE") == "1"
 K4_B128 = os.environ.get("HTR_K4_B128") == "1"
 _K5SP_MOD = None
 _K5SP_CACHE = {}
+# V5-W4: opt-in fused on-the-fly K4/K5 prefill WMMA (0 BF16 weight materialization, 91 VGPRs, 16w/SIMD)
+DENSE_PREFILL_WMMA = os.environ.get("HTR_DENSE_PREFILL_WMMA", "0") == "1"
+DENSE_PREFILL_WMMA_MIN_M = int(os.environ.get("HTR_DENSE_PREFILL_WMMA_MIN_M", "65"))
+DENSE_PREFILL_WMMA_MAX_M = int(os.environ.get("HTR_DENSE_PREFILL_WMMA_MAX_M", "1600"))
+_DPW_MOD = None
+
+
+def _dpw_ext():
+    global _DPW_MOD
+    if _DPW_MOD is None:
+        import importlib.util
+        path = os.environ.get("HTR_DENSE_PREFILL_WMMA_SO") or os.path.join(
+            os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "htr_dense_prefill_wmma.so"
+        )
+        spec = importlib.util.spec_from_file_location("htr_dense_prefill_wmma", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _DPW_MOD = mod
+    return _DPW_MOD
 
 
 def _k5sp_ext():
@@ -128,6 +147,15 @@ def _linear_impl(x2, qweight, scales, su, sv, bias):
             else:
                 outs.append(E.gemv_epi(qweight, xt[r0:r1], xs[r0:r1], tok[r0:r1], scales, CB, sv, bias, cnt, ns, od, _e8))
         return torch.cat(outs)
+    if (
+        DENSE_PREFILL_WMMA
+        and DENSE_PREFILL_WMMA_MIN_M <= M <= DENSE_PREFILL_WMMA_MAX_M
+        and x2.dtype == torch.bfloat16
+        and qweight.shape[2] in (32, 40)
+        and (mt % 8) == 0
+    ):
+        xt, xs, tok = E.prologue(x2, su)
+        return _dpw_ext().dense_prefill_wmma(qweight, xt, tok, scales, CB, sv, bias)
     if M > GEMV_MAX_M and PREFILL == "w":
         # Prefill: dequantize this weight to BF16 for the duration of the call, then the vendor BF16 GEMM. No
         # persistent BF16 copy is kept (a process-lifetime cache gave the same tokens but held ~4-6 GiB).
