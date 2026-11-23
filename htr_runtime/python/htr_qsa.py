@@ -34,8 +34,14 @@ import triton.language as tl
 # Fail closed if the files this kernel contract was qualified against change.
 QSA_OPS_SHA256 = '6ab20eb2778759530ab9fbb7c4a9b435a169d68da85b2b02a75b158301407990'
 HIP_MODULE_SHA256 = '6c2b7fd9a715a144fc3e2cde58525418f229073591905b060a68815c8100780d'
-HSACO_SHA256 = 'e5a845c8407cd2ed78560e7b9f83ba5c202a11749914618ded862aab056a355c'
-HSACO = os.path.join(os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'), 'qsa_tau_v2.hsaco')
+TAU_V3 = os.environ.get('HTR_QSA_TAU_V3', '0') == '1'
+HSACO_V3_SHA256 = 'a0e894d4d1b387fee6a06ae6a3fc48b85e31db0f1362b6da1256751df64005fb'
+HSACO_SHA256 = HSACO_V3_SHA256 if TAU_V3 else 'e5a845c8407cd2ed78560e7b9f83ba5c202a11749914618ded862aab056a355c'
+HSACO = os.environ.get(
+    'HTR_QSA_TAU_HSACO',
+    os.path.join(os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'),
+                 'qsa_tau_v3.hsaco' if TAU_V3 else 'qsa_tau_v2.hsaco'),
+)
 FN = 'qsa_tau_v2'
 SHARE = 2          # compatibility groups (v2)
 

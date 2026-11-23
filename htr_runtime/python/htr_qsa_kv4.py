@@ -8,7 +8,8 @@ from htr_kv4 import cache_views
 from htr_qsa_kv4_ops import attention_rotated as _split,write_int4 as _write,rotate_query,finish_output
 _STATE={'writes':0,'split_calls':0,'tau_calls':0,'selfchecks':0}
 _SEEN=set(); _MODULE=None; _ARCH={}
-HSACO_SHA256='cf3597834cae448fb6f7f15b827152f5847fd76b130140a7c924ef92ba98ba69'
+TAU_V3=os.environ.get('HTR_QSA_TAU_V3','0')=='1'
+HSACO_SHA256='0c66077243566f45f94ee353b975348244b8ea5581416c3fa5a2831f074d0743' if TAU_V3 else 'cf3597834cae448fb6f7f15b827152f5847fd76b130140a7c924ef92ba98ba69'
 
 def _log(tag,**fields):
     print(tag+' '+json.dumps({'pid':os.getpid(),**fields},sort_keys=True),file=sys.stderr,flush=True)
@@ -28,7 +29,7 @@ def _module():
         import direct_hip_module_v1 as hm
         sha=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
         assert sha(hm.__file__)=='6c2b7fd9a715a144fc3e2cde58525418f229073591905b060a68815c8100780d'
-        path=pathlib.Path(os.environ.get('HTR_KV4_TAU_HSACO','/opt/vllm-htr/native-bin/qsa_tau_kv4.hsaco'))
+        path=pathlib.Path(os.environ.get('HTR_KV4_TAU_HSACO',os.path.join(os.environ.get('HTR_NATIVE_DIR','/opt/vllm-htr/native-bin'),'qsa_tau_kv4_v3.hsaco' if TAU_V3 else 'qsa_tau_kv4.hsaco')))
         assert sha(path)==HSACO_SHA256,'INT4 native binary mismatch'
         module=hm.Module(str(path)); module.fn('qsa_tau_kv4')
         libpath=os.path.realpath(hm.lib()._name)
