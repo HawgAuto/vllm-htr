@@ -16,7 +16,7 @@ from . import arena as A
 from . import wire
 from .kernels import moe_ext, dq_ext
 from .kernels import moe2_ext  # E29
-from .kernels import hpf3_ext  # E31
+from .kernels import hpf3_ext, hpf4_ext  # E31, V5-F1
 
 TOPK, MAXT = 10, 8
 BPS_GU, BPS_DN, FENCE_RA = 5, 1, 1
@@ -24,6 +24,7 @@ CUT = int(os.environ.get('HTR_MOE_PREFILL_CUT', '512'))
 V2_MIN = int(os.environ.get('HTR_MOE_V2_MIN', '0'))      # 0 = v2 route disabled (pre-sweep behaviour, byte-identical routing)
 FUSE = os.environ.get('HTR_MOE_FUSE_COMBINE') == '1'   # E29: fused down+combine decode route (bitwise == decode_route)
 HPF3 = os.environ.get('HTR_MOE_HPF3') == '1'           # E31: v2 route through hpf3_forward (bitwise == hpf2_forward)
+HPF4 = os.environ.get('HTR_MOE_HPF4') == '1'           # V5-F1: BM=16 optimal 8-block pairing (bitwise == hpf3)
 _SCR, _BF, _CB, _V2 = {}, {}, {}, {}
 
 
@@ -137,15 +138,26 @@ def v2_route(ar, x, ids, w):
     valid = ids >= 0
     idc = torch.where(valid, ids, torch.zeros_like(ids)).to(torch.int32)
     wc = torch.where(valid, w, torch.zeros_like(w)).to(torch.float32).contiguous()
-    sid, eid, ntpp = moe_align_block_size(idc, 64, A.NE, pad_sorted_ids=True)
+    bm = 16 if HPF4 else 64
+    sid, eid, ntpp = moe_align_block_size(idc, bm, A.NE, pad_sorted_ids=True)
     dev, Pn = x.device, sid.numel()
     sc = _V2.setdefault(str(dev), {})
-    for k, (n, dt) in dict(A1=(Pn * A.H, torch.float16), Y1=(Pn * 2 * A.I, torch.bfloat16), A2=(Pn * A.I, torch.float16),
-                           Y2=(Pn * A.H, torch.bfloat16), S=(Pn, torch.float32), inv=(idc.numel(), torch.int32)).items():
+    need = dict(A1=(Pn * A.H, torch.float16), Y1=(Pn * 2 * A.I, torch.bfloat16), A2=(Pn * A.I, torch.float16),
+                Y2=(Pn * A.H, torch.bfloat16), S=(Pn, torch.float32), inv=(idc.numel(), torch.int32))
+    if HPF4:
+        nb = Pn // 16
+        need['grp_y'] = (nb, torch.int32)
+        need['grp_nblk'] = (nb, torch.int32)
+        need['grp_cnt'] = (1, torch.int32)
+    for k, (n, dt) in need.items():
         if k not in sc or sc[k].numel() < n:
             sc[k] = torch.empty(n, dtype=dt, device=dev)
     nsat = sc.setdefault('nsat', torch.zeros(1, dtype=torch.int32, device=dev))
     K = ar['_K']
+    if HPF4:
+        return hpf4_ext().hpf4_forward(x.contiguous(), sid.to(torch.int32), eid.to(torch.int32), ntpp.to(torch.int32), wc, ar['qw'], ar['qoff'],
+                                       ar['scales'], ar['su'], ar['sv'], cbscale(), K, int(ar['_spad'].get(K, 0)), sc['A1'], sc['Y1'],
+                                       sc['A2'], sc['Y2'], sc['S'], sc['inv'], nsat, sc['grp_y'], sc['grp_nblk'], sc['grp_cnt'], 31)
     if HPF3:
         return hpf3_ext().hpf3_forward(x.contiguous(), sid.to(torch.int32), eid.to(torch.int32), ntpp.to(torch.int32), wc, ar['qw'], ar['qoff'],
                                        ar['scales'], ar['su'], ar['sv'], cbscale(), K, int(ar['_spad'].get(K, 0)), sc['A1'], sc['Y1'],

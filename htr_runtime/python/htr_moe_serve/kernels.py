@@ -94,3 +94,23 @@ def k6_ext():
         spec.loader.exec_module(mod)
         _K6 = mod
     return _K6
+
+
+# ---- V5-F1: opt-in BM=16 optimal 8-block pairing MoE prefill (bit-exact vs hpf3, -43..73% padded rows & eliminates odd-y misses)
+_HPF4 = None
+
+
+def hpf4_ext():
+    global _HPF4
+    if _HPF4 is None:
+        import importlib.util
+        path = os.environ.get('HTR_HPF4_SO') or os.path.join(
+            os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'), 'hpf4_bm16.so'
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'HTR_MOE_HPF4: missing native extension {path}')
+        spec = importlib.util.spec_from_file_location('hpf4_bm16', path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _HPF4 = mod
+    return _HPF4
