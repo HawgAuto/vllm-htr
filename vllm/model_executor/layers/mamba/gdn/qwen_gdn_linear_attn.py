@@ -94,8 +94,108 @@ MAX_FUSED_GDN_MTP_TOKENS = 8
 FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
+_HTR_GDN_FUSED_SPEC = os.environ.get("HTR_GDN_FUSED_SPEC", "0") == "1"
+_HTR_GDN_FUSED_VB = os.environ.get("HTR_GDN_FUSED_VB", "auto").strip().lower()
+_HTR_GDN_FUSED_SO = os.environ.get(
+    "HTR_GDN_FUSED_SO",
+    "/opt/vllm-htr/native-bin/htr_gdn_spec_fused.so",
+)
+_HTR_GDN_MOD = None
+_HTR_GDN_SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+_HTR_GDN_CU_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+
+
+def _load_htr_gdn_fused():
+    global _HTR_GDN_MOD
+    if _HTR_GDN_MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("htr_gdn_spec_fused", _HTR_GDN_FUSED_SO)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"HTR_GDN_FUSED_SPEC: cannot load {_HTR_GDN_FUSED_SO}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _HTR_GDN_MOD = mod
+        logger.info_once(
+            "HTR_GDN_FUSED_SPEC active: so=%s vb=%s",
+            _HTR_GDN_FUSED_SO, _HTR_GDN_FUSED_VB,
+        )
+    return _HTR_GDN_MOD
+
+
+def _get_htr_gdn_scratch(dev: torch.device, need_slots: int):
+    idx = dev.index if dev.index is not None else 0
+    buf = _HTR_GDN_SCRATCH.get(idx)
+    if buf is None or buf[1].numel() < need_slots:
+        cap = max(need_slots, 64 * 48 * 8)  # 24576 slots (~12.6 MB), avoids realloc during HIP graph capture
+        buf = (
+            torch.empty((cap, 128), dtype=torch.float32, device=dev),
+            torch.zeros((cap,), dtype=torch.float32, device=dev),
+            torch.zeros((cap,), dtype=torch.int32, device=dev),
+        )
+        _HTR_GDN_SCRATCH[idx] = buf
+    return buf
+
+
+def _htr_gdn_spec_fused_impl(
+    mixed_qkv: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    num_accepted_tokens: torch.Tensor | None,
+    state: torch.Tensor,
+    output_gate: torch.Tensor,
+    norm_weight: torch.Tensor,
+    out: torch.Tensor,
+    scale: float,
+    norm_eps: float,
+    output_gate_activation: str,
+) -> torch.Tensor:
+    HV, V = out.shape[-2:]
+    K = state.shape[-1]
+    H = (mixed_qkv.shape[-1] - HV * V) // (2 * K)
+    num_reqs = cu_seqlens.numel() - 1
+    max_T = state_indices.shape[1]
+    if (
+        K != 128
+        or V != 128
+        or state.dtype != torch.float32
+        or not state.is_contiguous()
+        or mixed_qkv.dtype != torch.bfloat16
+        or out.dtype != torch.bfloat16
+        or not out.is_contiguous()
+        or output_gate_activation not in ("sigmoid", "silu")
+    ):
+        return fused_gdn_decode_post_conv_mtp_triton(
+            mixed_qkv=mixed_qkv, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
+            state_indices=state_indices, cu_seqlens=cu_seqlens,
+            num_accepted_tokens=num_accepted_tokens, state=state,
+            output_gate=output_gate, norm_weight=norm_weight, out=out,
+            scale=scale, norm_eps=norm_eps,
+            output_gate_activation=output_gate_activation,
+        )
+    mod = _load_htr_gdn_fused()
+    if _HTR_GDN_FUSED_VB in ("1", "2", "4"):
+        vb = int(_HTR_GDN_FUSED_VB)
+    else:
+        # auto: VB=4 (192 WGs, 16w/SIMD) at c=1; VB=2 (192 WGs) at c=2; VB=1 (0 atomics, LDS-only) at c>=3
+        vb = 4 if num_reqs <= 1 else (2 if num_reqs == 2 else 1)
+    so, ssq, cnt = _get_htr_gdn_scratch(out.device, num_reqs * HV * max_T)
+    act_mode = 0 if output_gate_activation == "sigmoid" else 1
+    mod.gdn_spec_fused(
+        mixed_qkv, a, b, A_log, dt_bias,
+        state_indices, cu_seqlens, num_accepted_tokens,
+        state, output_gate, norm_weight, out,
+        so, ssq, cnt,
+        H, HV, float(scale), float(norm_eps), act_mode, vb,
+    )
+    return out
+
+
 def supports_fused_mtp_decode() -> bool:
-    """ROCm runs the Triton port; elsewhere the CUDA op must be built."""
+    """ROCm runs the Triton port (or native HTR_GDN_FUSED_SPEC); elsewhere the CUDA op must be built."""
     return current_platform.is_rocm() or hasattr(
         torch.ops._C, "fused_gdn_decode_post_conv_mtp"
     )
@@ -103,6 +203,8 @@ def supports_fused_mtp_decode() -> bool:
 
 def fused_mtp_decode_impl() -> Callable[..., torch.Tensor]:
     if current_platform.is_rocm():
+        if _HTR_GDN_FUSED_SPEC:
+            return _htr_gdn_spec_fused_impl
         return fused_gdn_decode_post_conv_mtp_triton
     return ops.fused_gdn_decode_post_conv_mtp
 
@@ -573,7 +675,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             or vllm_config.model_config.dtype != torch.bfloat16
             or conv_state_dtype != torch.bfloat16
             or recurrent_state_dtype not in FUSED_GDN_STATE_DTYPES
-            or not current_platform.has_device_capability(80)
+            or (not current_platform.has_device_capability(80) and not (current_platform.is_rocm() and _HTR_GDN_FUSED_SPEC))
         ):
             return (
                 "the fused CUDA kernel requires a BF16 GDN model with "
@@ -1919,6 +2021,61 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 output_gate=output_gate,
                 core_attn_out=core_attn_out,
                 attn_metadata=attn_metadata,
+            )
+            return
+        if (
+            _HTR_GDN_FUSED_SPEC
+            and current_platform.is_rocm()
+            and attn_metadata.num_prefills == 0
+            and attn_metadata.num_spec_decodes == 0
+            and attn_metadata.num_decodes > 0
+            and attn_metadata.non_spec_state_indices_tensor is not None
+            and self.head_k_dim == 128
+            and self.head_v_dim == 128
+            and self.kv_cache[1].dtype == torch.float32
+            and self.norm.activation in ("sigmoid", "silu")
+        ):
+            n_tok = attn_metadata.num_actual_tokens
+            conv_state = (
+                self.kv_cache[0]
+                if is_conv_state_dim_first()
+                else self.kv_cache[0].transpose(-1, -2)
+            )
+            conv_weights = self.conv1d.weight.view(
+                self.conv1d.weight.size(0), self.conv1d.weight.size(2)
+            )
+            ns_idx = attn_metadata.non_spec_state_indices_tensor[:n_tok]
+            mqkv = causal_conv1d_update(
+                mixed_qkv[:n_tok],
+                conv_state,
+                conv_weights,
+                self.conv1d.bias,
+                self.activation,
+                conv_state_indices=ns_idx,
+                validate_data=False,
+            )
+            dev_i = mqkv.device.index if mqkv.device.index is not None else 0
+            ck = (dev_i, n_tok)
+            cu = _HTR_GDN_CU_CACHE.get(ck)
+            if cu is None:
+                cu = torch.arange(n_tok + 1, dtype=torch.int32, device=mqkv.device)
+                _HTR_GDN_CU_CACHE[ck] = cu
+            _htr_gdn_spec_fused_impl(
+                mixed_qkv=mqkv,
+                a=a[:n_tok],
+                b=b[:n_tok],
+                A_log=self.A_log,
+                dt_bias=self.dt_bias,
+                state_indices=ns_idx.unsqueeze(1),
+                cu_seqlens=cu,
+                num_accepted_tokens=None,
+                state=self.kv_cache[1],
+                output_gate=output_gate[:n_tok],
+                norm_weight=self.norm.weight,
+                out=core_attn_out[:n_tok],
+                scale=self.head_k_dim**-0.5,
+                norm_eps=self.layer_norm_epsilon,
+                output_gate_activation=self.norm.activation,
             )
             return
         self._forward_core(
