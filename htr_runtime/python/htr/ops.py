@@ -64,6 +64,34 @@ EPI8 = os.environ.get("HTR_EPI8", "1") == "1"
 # v4: 8 < M <= GEMV_LOOP_MAX uses the chunked decode GEMV (dev/bench_smallm.json: 3-6x faster than dequant_w+GEMM at M 9-32,
 # break-even ~M 96 on MiMo shapes). 0 disables.
 GEMV_LOOP_MAX = int(os.environ.get("HTR_GEMV_LOOP_MAX", "64"))
+# V5-W3: opt-in K5 16B+4B split-plane aligned global_load_b128 GEMV (bit-exact vs gemv_epi, 0 extra weight bytes).
+K5_SPLITPLANE = os.environ.get("HTR_K5_SPLITPLANE") == "1"
+_K5SP_MOD = None
+_K5SP_CACHE = {}
+
+
+def _k5sp_ext():
+    global _K5SP_MOD
+    if _K5SP_MOD is None:
+        import importlib.util
+        path = os.environ.get("HTR_K5_SPLITPLANE_SO") or os.path.join(
+            os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "k5_splitplane.so"
+        )
+        spec = importlib.util.spec_from_file_location("k5_splitplane", path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _K5SP_MOD = mod
+    return _K5SP_MOD
+
+
+def _k5sp_planes(qweight):
+    key = (qweight.data_ptr(), qweight.shape, str(qweight.device))
+    planes = _K5SP_CACHE.get(key)
+    if planes is None:
+        assert not torch.cuda.is_current_stream_capturing(), "HTR_K5_SPLITPLANE: repack must occur during eager warmup before graph capture"
+        planes = tuple(_k5sp_ext().repack_k5(qweight))
+        _K5SP_CACHE[key] = planes
+    return planes
 
 
 def _ns_eff(mt, nt, nsplit):
@@ -90,8 +118,12 @@ def _linear_impl(x2, qweight, scales, su, sv, bias):
         for r0 in range(0, M, GEMV_MAX_M):
             r1 = min(M, r0 + GEMV_MAX_M)
             ns = nsplit_for(mt, nt, r1 - r0)
-            outs.append(E.gemv_epi(qweight, xt[r0:r1], xs[r0:r1], tok[r0:r1], scales, CB, sv, bias, cnt, ns, od,
-                                   int(EPI8 and _ns_eff(mt, nt, ns) % 8 == 0)))
+            _e8 = int(EPI8 and _ns_eff(mt, nt, ns) % 8 == 0)
+            if K5_SPLITPLANE and qweight.shape[2] == 40:
+                p16, p4 = _k5sp_planes(qweight)
+                outs.append(_k5sp_ext().gemv_k5_sp16_epi(p16, p4, xt[r0:r1], xs[r0:r1], tok[r0:r1], scales, CB, sv, bias, cnt, ns, od, _e8))
+            else:
+                outs.append(E.gemv_epi(qweight, xt[r0:r1], xs[r0:r1], tok[r0:r1], scales, CB, sv, bias, cnt, ns, od, _e8))
         return torch.cat(outs)
     if M > GEMV_MAX_M and PREFILL == "w":
         # Prefill: dequantize this weight to BF16 for the duration of the call, then the vendor BF16 GEMM. No
@@ -104,7 +136,11 @@ def _linear_impl(x2, qweight, scales, su, sv, bias):
     xt, xs, tok = E.prologue(x2, su)
     if M <= GEMV_MAX_M and EPI:
         ns = nsplit_for(mt, nt, M)
-        return E.gemv_epi(qweight, xt, xs, tok, scales, CB, sv, bias, counters(x2.device), ns, od, int(EPI8 and _ns_eff(mt, nt, ns) % 8 == 0))
+        _e8 = int(EPI8 and _ns_eff(mt, nt, ns) % 8 == 0)
+        if K5_SPLITPLANE and qweight.shape[2] == 40:
+            p16, p4 = _k5sp_planes(qweight)
+            return _k5sp_ext().gemv_k5_sp16_epi(p16, p4, xt, xs, tok, scales, CB, sv, bias, counters(x2.device), ns, od, _e8)
+        return E.gemv_epi(qweight, xt, xs, tok, scales, CB, sv, bias, counters(x2.device), ns, od, _e8)
     if M <= GEMV_MAX_M:
         part = E.gemv_partials(qweight, xt, nsplit_for(mt, nt, M))
         return E.epilogue(part, xs, tok, scales, CB, sv, bias, 0, od)
