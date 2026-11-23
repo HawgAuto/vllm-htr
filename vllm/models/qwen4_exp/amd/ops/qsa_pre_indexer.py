@@ -26,8 +26,6 @@ def supports_fused_pre_indexer(
     compression it was written for; everything it rejects has a working unfused
     path.
     """
-    if getattr(rotary_emb, 'table_free', False):
-        return False
     rotary_dim = int(rotary_emb.rotary_dim)
     mrope_section = getattr(rotary_emb, "mrope_section", None)
     return (
@@ -56,11 +54,14 @@ def _norm_rope(
     pos_w,
     cos_sin_ptr,
     cos_sin_stride,
+    inv_freq_ptr,
+    mscale,
     norm_weight_ptr,
     eps,
     IS_MROPE: tl.constexpr,
     MROPE_H: tl.constexpr,
     MROPE_W: tl.constexpr,
+    TABLE_FREE: tl.constexpr,
 ):
     """Apply Gemma RMSNorm and selected-axis NeoX RoPE to register rows."""
     TILE_T: tl.constexpr = x.shape[0]
@@ -70,7 +71,22 @@ def _norm_rope(
     HALF: tl.constexpr = D // 2
     QUARTER: tl.constexpr = D // 4
     pairs = tl.arange(0, QUARTER)
-    if IS_MROPE:
+    if TABLE_FREE:
+        inv_f = tl.load(inv_freq_ptr + pairs).to(tl.float32)
+        if IS_MROPE:
+            h_mask = ((pairs % 3) == 1) & (pairs <= 3 * MROPE_H)
+            w_mask = ((pairs % 3) == 2) & (pairs <= 3 * MROPE_W)
+            pos_sel = tl.where(
+                w_mask[None, :],
+                pos_w[:, None],
+                tl.where(h_mask[None, :], pos_h[:, None], pos_t[:, None]),
+            )
+        else:
+            pos_sel = pos_t[:, None]
+        ang = pos_sel.to(tl.float32) * inv_f[None, :]
+        cos = (tl.cos(ang) * mscale).to(tl.bfloat16)
+        sin = (tl.sin(ang) * mscale).to(tl.bfloat16)
+    elif IS_MROPE:
         # Qwen interleaves temporal, height, and width rotary pairs. Each axis
         # still indexes the same position-major cos/sin table.
         h_mask = ((pairs % 3) == 1) & (pairs <= 3 * MROPE_H)
@@ -138,6 +154,8 @@ def _qsa_pre_indexer_kernel(
     pos_stride_axis,
     pos_stride_token,
     cos_sin_ptr,
+    inv_freq_ptr,
+    mscale,
     q_norm_weight_ptr,
     k_norm_weight_ptr,
     eps,
@@ -173,6 +191,7 @@ def _qsa_pre_indexer_kernel(
     CACHE_HAS_ROPE_POS: tl.constexpr,
     MROPE_H: tl.constexpr,
     MROPE_W: tl.constexpr,
+    TABLE_FREE: tl.constexpr,
 ):
     pid = tl.program_id(0)
     # K work occupies the first programs; the remaining programs tile Q. This
@@ -219,11 +238,14 @@ def _qsa_pre_indexer_kernel(
             pos_w,
             cos_sin_ptr,
             D // 2,
+            inv_freq_ptr,
+            mscale,
             q_norm_weight_ptr,
             eps,
             IS_2D_POSITIONS,
             MROPE_H,
             MROPE_W,
+            TABLE_FREE,
         )
         tl.store(
             q_out_ptr
@@ -375,11 +397,14 @@ def _qsa_pre_indexer_kernel(
                 pos_w + tl.arange(0, 1),
                 cos_sin_ptr,
                 D // 2,
+                inv_freq_ptr,
+                mscale,
                 k_norm_weight_ptr,
                 eps,
                 IS_K_MROPE,
                 MROPE_H,
                 MROPE_W,
+                TABLE_FREE,
             )
             compressed_block = (compressed_slot // COMP_PAGE_SIZE).to(tl.int64)
             compressed_row = compressed_slot % COMP_PAGE_SIZE
@@ -453,7 +478,7 @@ def qsa_pre_indexer(
     q: torch.Tensor,
     k: torch.Tensor,
     positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     eps: float,
@@ -470,19 +495,31 @@ def qsa_pre_indexer(
     compress_ratio: int,
     mrope_section: tuple[int, int, int] | None,
     rope_pos_offset: int | None,
+    inv_freq: torch.Tensor | None = None,
+    mscale: float = 1.0,
 ) -> None:
     """Normalize Q, compress K, then update the circular raw state."""
     num_tokens = q.shape[0]
     if num_tokens == 0:
         return
     num_q_heads, head_dim = q_out.shape[1:]
-    assert cos_sin_cache.shape[-1] * 2 == head_dim
+    table_free = cos_sin_cache is None
+    if table_free:
+        assert inv_freq is not None and inv_freq.numel() * 4 == head_dim and inv_freq.is_contiguous()
+        cs_arg = inv_freq
+        inv_arg = inv_freq
+        cs_stride = head_dim // 2
+    else:
+        assert cos_sin_cache.shape[-1] * 2 == head_dim
+        assert cos_sin_cache.is_contiguous()
+        cs_arg = cos_sin_cache
+        inv_arg = cos_sin_cache
+        cs_stride = cos_sin_cache.stride(0)
     assert q.shape == (num_tokens, num_q_heads * head_dim)
     assert k.shape == (num_tokens, head_dim)
     assert q.stride(-1) == 1
     assert k.stride(-1) == 1
     assert q_out.stride(-1) == 1
-    assert cos_sin_cache.is_contiguous()
     assert state_cache.stride(-1) == 1
     assert compressed_cache.stride(-1) == 1
     assert k_work_metadata.ndim == 2 and k_work_metadata.shape[1] == 2
@@ -517,7 +554,9 @@ def qsa_pre_indexer(
         positions,
         pos_stride_axis,
         pos_stride_token,
-        cos_sin_cache,
+        cs_arg,
+        inv_arg,
+        float(mscale),
         q_norm_weight,
         k_norm_weight,
         eps,
@@ -553,6 +592,7 @@ def qsa_pre_indexer(
         CACHE_HAS_ROPE_POS=cache_has_rope_pos,
         MROPE_H=section[1],
         MROPE_W=section[2],
+        TABLE_FREE=table_free,
         num_warps=1,
     )
 

@@ -313,11 +313,12 @@ class QSAIndexer(nn.Module):
             self.index_n_heads,
             self.index_head_dim,
         )
+        _tf = getattr(self.rotary_emb, "table_free", False)
         qsa_pre_indexer(
             projected_q,
             raw_keys,
             positions,
-            self.rotary_emb.cos_sin_cache,
+            None if _tf else self.rotary_emb.cos_sin_cache,
             self.q_layernorm.weight,
             self.k_layernorm.weight,
             self.q_layernorm.variance_epsilon,
@@ -337,6 +338,8 @@ class QSAIndexer(nn.Module):
                 if raw_key_cache.cache_rope_positions
                 else None
             ),
+            inv_freq=getattr(self.rotary_emb, "inv_freq", None) if _tf else None,
+            mscale=float(getattr(self.rotary_emb, "mscale", 1.0)),
         )
         return q
 
