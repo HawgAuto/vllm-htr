@@ -26,6 +26,8 @@ def supports_fused_pre_indexer(
     compression it was written for; everything it rejects has a working unfused
     path.
     """
+    if getattr(rotary_emb, 'table_free', False):
+        return False
     rotary_dim = int(rotary_emb.rotary_dim)
     mrope_section = getattr(rotary_emb, "mrope_section", None)
     return (

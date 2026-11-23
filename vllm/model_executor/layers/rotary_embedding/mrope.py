@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
@@ -342,6 +343,7 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         # the input video. We enlarge max_position_embeddings to 4 times to get
         # a larger the cos and sin cache.
         self.cache_max_position_num = max_position_embeddings * 4
+        self.table_free = os.environ.get("HTR_ROPE_TABLE_FREE", "0") == "1"
         super().__init__(
             head_size,
             rotary_dim,
@@ -349,7 +351,13 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
             base,
             is_neox_style,
             dtype,
+            init_cache=not self.table_free,
         )
+        if self.table_free:
+            inv_f = self._compute_inv_freq(base).to(torch.float32)
+            self.register_buffer("inv_freq", inv_f, persistent=False)
+            self.cos_sin_cache = None
+            self.cos_sin_cache_bf16 = None
 
         self.mrope_section = mrope_section
         self.mrope_interleaved = mrope_interleaved
@@ -365,6 +373,17 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         if self.scaling_factor is None:
             return super()._compute_cos_sin_cache()
         return YaRNScalingRotaryEmbedding._compute_cos_sin_cache(self)
+
+    def compute_cos_sin(
+        self, positions: torch.Tensor, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        inv_f = self.inv_freq
+        if inv_f.device != positions.device:
+            inv_f = inv_f.to(positions.device)
+        freqs = positions.to(torch.float32).unsqueeze(-1) * inv_f
+        cos = (freqs.cos() * self.mscale).to(dtype)
+        sin = (freqs.sin() * self.mscale).to(dtype)
+        return cos, sin
 
     def forward_native(
         self,
@@ -387,10 +406,13 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None
 
-        cos_sin_cache = self._match_cos_sin_cache_dtype(query)
         num_tokens = positions.shape[-1]
-        cos_sin = cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        if getattr(self, "table_free", False):
+            cos, sin = self.compute_cos_sin(positions, query.dtype)
+        else:
+            cos_sin_cache = self._match_cos_sin_cache_dtype(query)
+            cos_sin = cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
         if positions.ndim == 2:
             assert self.mrope_section
             if self.mrope_interleaved:
@@ -439,10 +461,13 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         assert positions.ndim == 1 or positions.ndim == 2
         assert key is not None
 
-        cos_sin_cache = self._match_cos_sin_cache_dtype(query)
         num_tokens = positions.shape[-1]
-        cos_sin = cos_sin_cache[positions]
-        cos, sin = cos_sin.chunk(2, dim=-1)
+        if getattr(self, "table_free", False):
+            cos, sin = self.compute_cos_sin(positions, query.dtype)
+        else:
+            cos_sin_cache = self._match_cos_sin_cache_dtype(query)
+            cos_sin = cos_sin_cache[positions]
+            cos, sin = cos_sin.chunk(2, dim=-1)
         query_shape = query.shape
         key_shape = key.shape
         if positions.ndim == 2:
@@ -490,6 +515,8 @@ class MRotaryEmbedding(RotaryEmbeddingBase):
         key: torch.Tensor | None = None,
         offsets: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        if getattr(self, "table_free", False):
+            return self.forward_cuda(positions, query, key, offsets)
         if positions.ndim == 2:
             assert key is not None
             assert self.mrope_section

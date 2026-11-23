@@ -35,6 +35,8 @@ def _qsa_main_prepare_kernel(
     k_norm_weight_ptr,
     eps,
     cos_sin_ptr,
+    inv_freq_ptr,
+    mscale,
     pos_ptr,
     pos_stride_axis,
     pos_stride_token,
@@ -56,6 +58,7 @@ def _qsa_main_prepare_kernel(
     MROPE_H: tl.constexpr,
     MROPE_W: tl.constexpr,
     XBLOCK: tl.constexpr,
+    TABLE_FREE: tl.constexpr,
 ):
     W: tl.constexpr = 2 * (HQ + HK) * D
     HALF: tl.constexpr = ROT // 2
@@ -114,10 +117,16 @@ def _qsa_main_prepare_kernel(
         is_h = ((rot % 3) == 1) & (rot < 3 * MROPE_H)
         is_w = ((rot % 3) == 2) & (rot < 3 * MROPE_W)
         pos = tl.where(is_w, pos_w, tl.where(is_h, pos_h, pos))
-    cos = tl.load(cos_sin_ptr + pos * CS_STRIDE + rot, xmask, other=0.0).to(tl.float32)
-    sin = tl.load(cos_sin_ptr + pos * CS_STRIDE + HALF + rot, xmask, other=0.0).to(
-        tl.float32
-    )
+    if TABLE_FREE:
+        inv_f = tl.load(inv_freq_ptr + rot, xmask, other=0.0).to(tl.float32)
+        ang = pos.to(tl.float32) * inv_f
+        cos = (tl.cos(ang) * mscale).to(tl.bfloat16).to(tl.float32)
+        sin = (tl.sin(ang) * mscale).to(tl.bfloat16).to(tl.float32)
+    else:
+        cos = tl.load(cos_sin_ptr + pos * CS_STRIDE + rot, xmask, other=0.0).to(tl.float32)
+        sin = tl.load(cos_sin_ptr + pos * CS_STRIDE + HALF + rot, xmask, other=0.0).to(
+            tl.float32
+        )
     a1 = n1 * cos
     b1 = n2 * sin
     o1 = a1 - b1
@@ -176,7 +185,7 @@ def supports_main_prepare(
 def qsa_main_prepare(
     qkv: torch.Tensor,
     positions: torch.Tensor,
-    cos_sin_cache: torch.Tensor,
+    cos_sin_cache: torch.Tensor | None,
     q_norm_weight: torch.Tensor,
     k_norm_weight: torch.Tensor,
     eps: float,
@@ -189,6 +198,8 @@ def qsa_main_prepare(
     rotary_dim: int,
     mrope_section,
     gate_out: torch.Tensor,
+    inv_freq: torch.Tensor | None = None,
+    mscale: float = 1.0,
 ) -> torch.Tensor:
     """Return main Q [T, HQ, D]; write gate into ``gate_out[:T]`` and K/V into the cache.
 
@@ -203,8 +214,18 @@ def qsa_main_prepare(
     assert kv_cache_t.dtype == torch.bfloat16
     assert kv_cache_t.shape[2] == num_kv_heads and kv_cache_t.shape[3] == 2 * head_dim
     assert kv_cache_t.stride(-1) == 1
-    assert cos_sin_cache.dtype == torch.bfloat16 and cos_sin_cache.is_contiguous()
-    assert cos_sin_cache.shape[-1] == rotary_dim
+    table_free = cos_sin_cache is None
+    if table_free:
+        assert inv_freq is not None and inv_freq.numel() == rotary_dim // 2 and inv_freq.is_contiguous()
+        cs_arg = inv_freq
+        inv_arg = inv_freq
+        cs_stride = rotary_dim
+    else:
+        assert cos_sin_cache.dtype == torch.bfloat16 and cos_sin_cache.is_contiguous()
+        assert cos_sin_cache.shape[-1] == rotary_dim
+        cs_arg = cos_sin_cache
+        inv_arg = cos_sin_cache
+        cs_stride = cos_sin_cache.shape[-1]
     assert gate_out.is_contiguous() and gate_out.shape[1:] == (num_q_heads, head_dim)
     assert slot_mapping.shape[0] >= num_tokens
     is_2d = positions.ndim == 2
@@ -223,7 +244,9 @@ def qsa_main_prepare(
         q_norm_weight,
         k_norm_weight,
         eps,
-        cos_sin_cache,
+        cs_arg,
+        inv_arg,
+        float(mscale),
         positions,
         pos_stride_axis,
         pos_stride_token,
@@ -239,12 +262,13 @@ def qsa_main_prepare(
         HK=num_kv_heads,
         D=head_dim,
         ROT=rotary_dim,
-        CS_STRIDE=cos_sin_cache.shape[-1],
+        CS_STRIDE=cs_stride,
         PAGE=kv_cache_t.shape[1],
         IS_2D_POSITIONS=is_2d,
         MROPE_H=section[1],
         MROPE_W=section[2],
         XBLOCK=XBLOCK,
+        TABLE_FREE=table_free,
         num_warps=NUM_WARPS,
     )
     return q_out

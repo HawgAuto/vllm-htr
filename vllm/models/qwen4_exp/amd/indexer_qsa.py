@@ -43,9 +43,12 @@ def apply_qsa_rope(
     """Apply the main attention's exact 1D/MRoPE composition to QSA heads."""
     num_tokens, _, head_dim = tensor.shape
     rotary_dim = rotary_emb.rotary_dim
-    cache = rotary_emb._match_cos_sin_cache_dtype(tensor)  # noqa: SLF001
-    cos_sin = cache[positions]
-    cos, sin = cos_sin.chunk(2, dim=-1)
+    if getattr(rotary_emb, "table_free", False):
+        cos, sin = rotary_emb.compute_cos_sin(positions, tensor.dtype)
+    else:
+        cache = rotary_emb._match_cos_sin_cache_dtype(tensor)  # noqa: SLF001
+        cos_sin = cache[positions]
+        cos, sin = cos_sin.chunk(2, dim=-1)
     if positions.ndim == 2:
         shape = tensor.shape
         tensor, _ = triton_mrope(
@@ -181,7 +184,7 @@ class QSAIndexer(nn.Module):
         """Project replicated Q/K, normalize+rotate Q, and preserve raw K."""
         q_raw, token_k = self.project(hidden_states)
         q = q_raw.reshape(-1, self.index_n_heads, self.index_head_dim)
-        if _qnr is not None:  # decode23 qsa-normrope-v1: one exact launch (native fallback outside scope)
+        if _qnr is not None and not getattr(self.rotary_emb, "table_free", False):  # decode23 qsa-normrope-v1: one exact launch (native fallback outside scope)
             def _native_q(q=q):
                 n = apply_qsa_rmsnorm(self.q_layernorm, q.reshape(-1, self.index_head_dim)).reshape_as(q)
                 return apply_qsa_rope(self.rotary_emb, positions, n)
@@ -203,7 +206,7 @@ class QSAIndexer(nn.Module):
     ) -> torch.Tensor:
         """Normalize pooled K and apply the first token's exact group position."""
         keys = compressed_keys.reshape(-1, self.index_head_dim)
-        if _qnr is not None and getattr(self.rotary_emb, "mrope_section", None):  # decode23 qsa-normrope-v1
+        if _qnr is not None and not getattr(self.rotary_emb, "table_free", False) and getattr(self.rotary_emb, "mrope_section", None):  # decode23 qsa-normrope-v1
             positions = first_rope_positions.transpose(0, 1)
             def _native_k(keys=keys, positions=positions):
                 n = apply_qsa_rmsnorm(self.k_layernorm, keys).reshape(-1, 1, self.index_head_dim)

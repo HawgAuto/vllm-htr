@@ -714,10 +714,11 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 main_positions = positions[:, :num_tokens]
             else:
                 main_positions = positions[:num_tokens]
+            _tf = getattr(self.rotary_emb, "table_free", False)
             main_q = qsa_main_prepare(
                 qkv[:num_tokens],
                 main_positions,
-                self.rotary_emb._match_cos_sin_cache_dtype(qkv),
+                None if _tf else self.rotary_emb._match_cos_sin_cache_dtype(qkv),
                 self.q_norm.weight,
                 self.k_norm.weight,
                 self.q_norm.variance_epsilon,
@@ -729,6 +730,8 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
                 rotary_dim=int(self.rotary_emb.rotary_dim),
                 mrope_section=getattr(self.rotary_emb, "mrope_section", None),
                 gate_out=gate,
+                inv_freq=getattr(self.rotary_emb, "inv_freq", None) if _tf else None,
+                mscale=float(getattr(self.rotary_emb, "mscale", 1.0)),
             )
             main_outputs = (main_q, gate)
         selected = self.indexer(
