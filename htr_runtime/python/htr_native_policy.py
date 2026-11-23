@@ -170,6 +170,20 @@ def prepare_engine(args):
     if mtp == 0: spec = None
     if spec is not None and (mtp != 3 or spec.get('method','mtp') != 'mtp'):
         raise ValueError('HTR numerical pins currently implement MTP0 and MTP3')
+    # V5-D0: opt-in concurrency-aware dynamic MTP depth schedule (e.g. "1-1:3,2-2:2,3-4:1")
+    dyn_spec = os.environ.get('HTR_MTP_DYNAMIC_DEPTH', '').strip()
+    if spec is not None and dyn_spec:
+        sched = []
+        for item in dyn_spec.split(','):
+            rng, sep, depth_s = item.strip().partition(':')
+            if not sep:
+                raise ValueError(f'HTR_MTP_DYNAMIC_DEPTH invalid entry: {item!r}')
+            lo_s, _, hi_s = rng.partition('-')
+            lo, hi, depth = int(lo_s), int(hi_s or lo_s), int(depth_s)
+            if lo < 1 or hi < lo or not (0 <= depth <= mtp):
+                raise ValueError(f'HTR_MTP_DYNAMIC_DEPTH out of bounds: {item!r}')
+            sched.append((lo, hi, depth))
+        spec['num_speculative_tokens_per_batch_size'] = sched
     args.speculative_config = spec
     context, seqs, chunk = args.max_model_len, args.max_num_seqs, args.max_num_batched_tokens
     for name,value in [('max_model_len',context),('max_num_seqs',seqs),('max_num_batched_tokens',chunk)]:
@@ -189,9 +203,12 @@ def prepare_engine(args):
     cc=args.compilation_config
     if cc.cudagraph_capture_sizes is None:
         top=seqs*(mtp+1)
-        ladder=[1,2,3,4,5,6,8,10,12,16,20,24,32,40,48,64,80,96,128]
-        cc.cudagraph_capture_sizes=sorted({n for n in ladder if n<=top}|{top})
-        if seqs==1 and mtp==3: cc.cudagraph_capture_sizes=[1,2,3,4,5]
+        if os.environ.get('HTR_CUDAGRAPH_TIGHT', '0') == '1' and top <= 16:
+            cc.cudagraph_capture_sizes = list(range(1, top + 1))
+        else:
+            ladder=[1,2,3,4,5,6,8,10,12,16,20,24,32,40,48,64,80,96,128]
+            cc.cudagraph_capture_sizes=sorted({n for n in ladder if n<=top}|{top})
+            if seqs==1 and mtp==3: cc.cudagraph_capture_sizes=[1,2,3,4,5]
     if cc.max_cudagraph_capture_size is None:
         cc.max_cudagraph_capture_size=max(cc.cudagraph_capture_sizes)
     # Hash the unresolved native settings, before replacing overrides by a callable.

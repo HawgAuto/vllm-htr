@@ -2187,22 +2187,29 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
+            # V5-D0: honor dynamic speculative depth from scheduler_output when present
+            _sched_spec = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
+            _propose_kw = {"dp_sync": dp_sync, "mm_inputs": mm_inputs}
+            if _sched_spec is not None and isinstance(self.speculator, AutoRegressiveSpeculator):
+                _propose_kw["num_spec_tokens"] = int(_sched_spec)
             with use_workspace_lane(self._draft_workspace_lane):
-                draft_tokens = self.speculator.propose(
-                    input_batch,
-                    attn_metadata,
-                    slot_mappings_by_layer,
-                    spec_hidden_states,
-                    aux_hidden_states,
-                    num_sampled,
-                    num_rejected,
-                    self.req_states.last_sampled_tokens,
-                    self.req_states.next_prefill_tokens,
-                    self.sampler.sampling_states.temperature.gpu,
-                    self.sampler.sampling_states.seeds.gpu,
-                    dp_sync=dp_sync,
-                    mm_inputs=mm_inputs,
-                )
+                if _sched_spec == 0 and isinstance(self.speculator, AutoRegressiveSpeculator):
+                    draft_tokens = None
+                else:
+                    draft_tokens = self.speculator.propose(
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings_by_layer,
+                        spec_hidden_states,
+                        aux_hidden_states,
+                        num_sampled,
+                        num_rejected,
+                        self.req_states.last_sampled_tokens,
+                        self.req_states.next_prefill_tokens,
+                        self.sampler.sampling_states.temperature.gpu,
+                        self.sampler.sampling_states.seeds.gpu,
+                        **_propose_kw,
+                    )
             if draft_tokens is not None:
                 self.req_states.draft_tokens[input_batch.idx_mapping] = draft_tokens
                 if self.pp_handler is not None:
@@ -2220,9 +2227,17 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         if self.num_speculative_steps > 0:
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
+            _dth_drafts = self.req_states.draft_tokens[input_batch.idx_mapping]
+            _dth_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
+            if (
+                _dth_k is not None
+                and isinstance(self.speculator, AutoRegressiveSpeculator)
+                and 0 <= int(_dth_k) < _dth_drafts.shape[1]
+            ):
+                _dth_drafts = _dth_drafts[:, : int(_dth_k)]
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
-                self.req_states.draft_tokens[input_batch.idx_mapping],
+                _dth_drafts,
             )
             if self.pp_handler is not None and self.speculator is None:
                 # When a speculator ran, the propose() path above already
