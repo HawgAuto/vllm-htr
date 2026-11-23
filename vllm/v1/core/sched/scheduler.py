@@ -467,7 +467,13 @@ class Scheduler(SchedulerInterface):
             if long_prefill_threshold > 0:
                 max_prefill_tokens = min(max_prefill_tokens, long_prefill_threshold)
             aligned_end = end // block_size * block_size
-            if aligned_end > start or block_size <= max_prefill_tokens:
+            # HTR_V025_STARVATION_FIX: when max_num_batched_tokens is near block_size
+            # (e.g. mbt=3200, block_size=3200) and an active decode request consumes
+            # a few tokens, remaining budget < block_size makes aligned_end == start.
+            # Clipping end -> start returns 0 and starves all waiting prefills until
+            # every decode request finishes (Lever 2 mbt=3200 serialization bug).
+            # Only clip to aligned_end when it still makes forward progress (aligned_end > start).
+            if aligned_end > start:
                 end = aligned_end
 
         next_block_boundary = (start // block_size + 1) * block_size
