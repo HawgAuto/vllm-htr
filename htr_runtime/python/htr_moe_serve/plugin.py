@@ -305,8 +305,9 @@ def _k6w_rows(spec):
             continue
         lo, _, hi = part.partition('-')
         out.update(range(int(lo), int(hi or lo) + 1))
-    if not out or min(out) < 1 or max(out) > 8:
-        raise ValueError(f'HTR_MOE_K6_ROWS={spec!r}: row counts must land inside 1..8')
+    # V5-A5: native k6_plan supports A = T*10 <= 256 (T <= 25) and fused combine loops over arbitrary T.
+    if not out or min(out) < 1 or max(out) > 16:
+        raise ValueError(f'HTR_MOE_K6_ROWS={spec!r}: row counts must land inside 1..16')
     return frozenset(out)
 
 
@@ -323,8 +324,9 @@ def _k6w_scratch(dev):
     G*M*5120 for both the gate|up (ns 4, m 1280) and the down (ns 2, m 2560) launch."""
     s = _K6W_SCR.get(str(dev))
     if s is None:
-        a, m = 8 * 10, 4
-        g = a + (-(-8 // m) if K6W_SHARED else 0)
+        max_t = max(8, max(K6W_ROWS))
+        a, m = max_t * 10, 4
+        g = a + (-(-max_t // m) if K6W_SHARED else 0)
         f = dict(dtype=torch.float32, device=dev)
         s = _K6W_SCR[str(dev)] = dict(
             gu=torch.empty(g * m * 2 * 640, **f), dn=torch.empty(g * m * 2560, **f),
@@ -343,7 +345,7 @@ def decode_route_k6(ar, x, ids32, w32):
     from .kernels import k6_ext
     from . import routes as R
     T = x.shape[0]
-    assert 1 <= T <= 8 and T in K6W_ROWS and ids32.shape == (T, R.TOPK) and w32.shape == (T, R.TOPK)
+    assert 1 <= T <= 16 and T in K6W_ROWS and ids32.shape == (T, R.TOPK) and w32.shape == (T, R.TOPK)
     E, s, M = k6_ext(), _k6w_scratch(x.device), _k6w_bucket(T)
     A_, nsh = T * R.TOPK, (-(-T // M) if K6W_SHARED else 0)
     # phase A passes x twice: k6_plan never reads x/wsg when nsh == 0

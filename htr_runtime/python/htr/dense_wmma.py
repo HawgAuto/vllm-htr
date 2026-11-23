@@ -30,12 +30,35 @@ def min_m():
     return 9 if value == '1' else 16
 
 
+def _flag(name):
+    value = os.environ.get(name, '0')
+    if value not in ('0', '1'):
+        raise ValueError(f'{name} must be 0 or 1')
+    return value == '1'
+
+
 def eligible(M, mt, nt, K, dtype):
-    return (min_m() <= M <= 64 and dtype == torch.bfloat16 and K == 5 and (mt,nt) in SHAPES
-            and ((mt,nt) != (1024,160) or M == 16))
+    if not (min_m() <= M <= 64 and dtype == torch.bfloat16):
+        return False
+    # V5-A3: opt-in K=4 lm_head (15520,160) one-pass WMMA for M=9..64
+    if K == 4 and (mt, nt) == (15520, 160):
+        return _flag('HTR_DENSE_WMMA_LMHEAD')
+    if K != 5:
+        return False
+    # V5-A1b: opt-in (160,384) out_proj/o_proj (48 layers; nsplit already defined)
+    if (mt, nt) == (160, 384):
+        return _flag('HTR_DENSE_WMMA_OUTPROJ')
+    if (mt, nt) not in SHAPES:
+        return False
+    # V5-A1b: opt-in (1024,160) qkvz at M=9..15 (36 layers; previously M==16 only)
+    if (mt, nt) == (1024, 160) and M != 16:
+        return _flag('HTR_DENSE_WMMA_QKVZ9')
+    return True
 
 
 def nsplit(mt, nt, M):
+    if (mt,nt) == (15520,160):
+        return 4
     if (mt,nt) in ((1024,160), (832,160)):
         return 8
     if (mt,nt) == (640,160):
@@ -68,12 +91,13 @@ def ext(device):
 def linear(E, x, qw, scales, su, sv, bias, cb, cnt):
     M, n = x.shape
     mt, nt, words = qw.shape
-    if not eligible(M, mt, nt, words//8, x.dtype) or words != 40:
+    K = words // 8
+    if not eligible(M, mt, nt, K, x.dtype) or words not in (32, 40) or words != K * 8:
         raise ValueError('Dense WMMA unsupported call')
     # Metadata-only checks: safe in capture, no .item()/synchronization.
     if x.device.type != 'cuda' or n != nt*16:
         raise ValueError('Dense WMMA activation device/width')
-    for value, dtype, size in [(x, torch.bfloat16, M*n), (qw, torch.int32, mt*nt*40),
+    for value, dtype, size in [(x, torch.bfloat16, M*n), (qw, torch.int32, mt*nt*words),
                               (scales, torch.float16, mt*16), (su, torch.uint8, n//8),
                               (sv, torch.uint8, mt*2), (cnt, torch.int32, cnt.numel())]:
         if value.device != x.device or value.dtype != dtype or not value.is_contiguous() or value.numel() != size:
@@ -86,6 +110,6 @@ def linear(E, x, qw, scales, su, sv, bias, cb, cnt):
     key = (M,mt,nt)
     if key not in _SEEN:
         _SEEN.add(key)
-        print('HTR_DENSE_WMMA_ROUTE '+json.dumps({'M':M,'m':mt*16,'n':nt*16,'K':5,'nsplit':nsplit(mt,nt,M)}), flush=True)
+        print('HTR_DENSE_WMMA_ROUTE '+json.dumps({'M':M,'m':mt*16,'n':nt*16,'K':K,'nsplit':nsplit(mt,nt,M)}), flush=True)
     xt, xl, xs, tok = native.prologue_c11(x, su)
     return native.gemv_wmma(qw, xt, xl, xs, tok, scales, cb, sv, bias, cnt, nsplit(mt,nt,M))
