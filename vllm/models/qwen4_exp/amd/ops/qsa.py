@@ -15,6 +15,67 @@ try:  # [nb2-mqa4-ab-v1]
 except ImportError:
     _MQA_NATIVE = None
 
+# V5-I1: opt-in multi-request coalesced nontemporal Wave32 QSA indexer scorer (c=1..NREQ, 16w/SIMD)
+_HTR_QSA_MQA_V5 = os.environ.get("HTR_QSA_MQA_V5", "0") == "1"
+_HTR_QSA_MQA_V5_HSACO = os.environ.get(
+    "HTR_QSA_MQA_V5_HSACO",
+    os.path.join(os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "qsa_mqa_scores_v5.hsaco"),
+)
+_HTR_QSA_MQA_V5_SHA256 = "a76acf12885c641a237e83f9c57575fc873ace9a32c2b5316947ea8e4438436b"
+_MQA_V5_MOD = {}
+
+
+def _mqa_v5_eligible(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths):
+    if not (_HTR_QSA_MQA_V5 and q.is_cuda and q.ndim == 3 and q.shape[1] == 4 and q.shape[2] == 128):
+        return False
+    if q.dtype != torch.bfloat16 or k_cache.dtype != torch.bfloat16:
+        return False
+    if k_cache.ndim != 4 or k_cache.shape[2] != 1 or k_cache.shape[3] != 128:
+        return False
+    if q.stride(2) != 1 or k_cache.stride(3) != 1 or page_table.stride(1) != 1:
+        return False
+    if (q.data_ptr() & 15) or (k_cache.data_ptr() & 15) or (q.stride(0) & 7) or (q.stride(1) & 7):
+        return False
+    if (k_cache.stride(0) & 7) or (k_cache.stride(1) & 7):
+        return False
+    if token_to_req.dtype != torch.int32 or page_table.dtype != torch.int32 or sequence_lengths.dtype != torch.int32:
+        return False
+    if query_positions.dtype != torch.int64 or not token_to_req.is_contiguous() or not query_positions.is_contiguous() or not sequence_lengths.is_contiguous():
+        return False
+    return current_platform.is_rocm()
+
+
+def _mqa_v5_run(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, visible_blocks, logits, columns, compress_ratio, score_divisor):
+    import ctypes, hashlib
+    if "m" not in _MQA_V5_MOD:
+        import direct_hip_module_v1 as hm
+        with open(_HTR_QSA_MQA_V5_HSACO, "rb") as _f:
+            sha = hashlib.sha256(_f.read()).hexdigest()
+        if sha != _HTR_QSA_MQA_V5_SHA256:
+            raise RuntimeError(f"HTR_QSA_MQA_V5: unexpected {_HTR_QSA_MQA_V5_HSACO} ({sha})")
+        m = hm.Module(_HTR_QSA_MQA_V5_HSACO)
+        _MQA_V5_MOD.update(m=m, hm=hm)
+    m, hm = _MQA_V5_MOD["m"], _MQA_V5_MOD["hm"]
+    I32, I64, F32 = ctypes.c_int32, ctypes.c_int64, ctypes.c_float
+    rows = int(q.shape[0])
+    rpb = 16 if rows <= 64 else 32
+    gx = (int(columns) + 63) // 64
+    gy = (rows + rpb - 1) // rpb
+    with torch.cuda.device(q.device):
+        m.launch(
+            "qsa_mqa_scores_v5", (gx, gy, 1), (256, 1, 1),
+            [
+                hm.ptr(q), hm.ptr(k_cache), hm.ptr(page_table), hm.ptr(token_to_req),
+                hm.ptr(query_positions), hm.ptr(sequence_lengths),
+                hm.ptr(visible_blocks), hm.ptr(logits),
+                I64(q.stride(0)), I64(q.stride(1)), I64(k_cache.stride(0)), I64(k_cache.stride(1)),
+                I64(page_table.stride(0)), I64(logits.stride(0)),
+                I32(rows), I32(columns), I32(k_cache.shape[0]), I32(page_table.shape[0]),
+                I32(k_cache.shape[1]), I32(page_table.shape[1]), I32(compress_ratio),
+                F32(score_divisor), I32(rpb),
+            ],
+        )
+
 from vllm import _custom_ops as ops
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
@@ -819,6 +880,10 @@ def qsa_mqa_paged(
     logits = torch.empty((q.shape[0], columns), dtype=torch.float32, device=q.device)
     visible_blocks = torch.empty(q.shape[0], dtype=torch.int32, device=q.device)
     if not q.shape[0] or not columns:
+        return logits, visible_blocks
+    if _mqa_v5_eligible(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths):
+        _mqa_v5_run(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths,
+                    visible_blocks, logits, columns, compress_ratio, float(score_divisor))
         return logits, visible_blocks
     # The HIP specialization has no request-count or page-table-row-stride ABI.
     # Multi-request tables must use the request-aware Triton kernel below.
