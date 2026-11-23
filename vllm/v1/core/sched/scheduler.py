@@ -1,3 +1,4 @@
+import os
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import itertools
@@ -281,6 +282,26 @@ class Scheduler(SchedulerInterface):
         self.prefix_replay_tokens = replay_windows.pop() if replay_windows else 0
         self.num_prefill_lookahead = vllm_config.num_prefill_lookahead_tokens
         self.dynamic_sd_lookup: list[int] | None = None
+        # V5-D1: opt-in acceptance-aware dynamic MTP cap (e.g. HTR_MTP_ACCEPT_THRESH="0.30:1,0.55:2")
+        self._htr_accept_thresh: list[tuple[float, int]] = []
+        self._htr_accept_ema: float = 1.0
+        self._htr_accept_steps: int = 0
+        self._htr_accept_probe_every: int = 32
+        _at_raw = os.environ.get("HTR_MTP_ACCEPT_THRESH", "").strip()
+        if _at_raw and self.num_spec_tokens > 0:
+            _parsed = []
+            for _item in _at_raw.split(","):
+                _thr_s, _sep, _k_s = _item.strip().partition(":")
+                if not _sep:
+                    raise ValueError(f"HTR_MTP_ACCEPT_THRESH invalid entry: {_item!r}")
+                _thr, _k = float(_thr_s), int(_k_s)
+                if not (0.0 <= _thr <= 1.0) or not (0 <= _k <= self.num_spec_tokens):
+                    raise ValueError(f"HTR_MTP_ACCEPT_THRESH out of bounds: {_item!r}")
+                _parsed.append((_thr, _k))
+            self._htr_accept_thresh = sorted(_parsed, key=lambda kv: kv[0])
+            self._htr_accept_probe_every = max(
+                1, int(os.environ.get("HTR_MTP_ACCEPT_PROBE_EVERY", "32"))
+            )
         if speculative_config is not None:
             if speculative_config.num_speculative_tokens_per_batch_size:
                 self.dynamic_sd_lookup = build_dynamic_sd_schedule_lookup(
@@ -1442,6 +1463,18 @@ class Scheduler(SchedulerInterface):
             num_spec_tokens_to_schedule = self.dynamic_sd_lookup[
                 len(num_scheduled_tokens)
             ]
+        # V5-D1: opt-in acceptance-aware cap (periodic probe allows automatic recovery)
+        if self._htr_accept_thresh and num_spec_tokens_to_schedule > 0:
+            if (
+                self._htr_accept_steps >= 4
+                and (self._htr_accept_steps % self._htr_accept_probe_every) != 0
+            ):
+                for _thr, _kcap in self._htr_accept_thresh:
+                    if self._htr_accept_ema < _thr:
+                        num_spec_tokens_to_schedule = min(
+                            num_spec_tokens_to_schedule, _kcap
+                        )
+                        break
 
         scheduled_encoder_input_stats = None
         if (
@@ -2009,6 +2042,10 @@ class Scheduler(SchedulerInterface):
                         request.num_computed_tokens -= num_rejected
                     if request.num_output_placeholders > 0:
                         request.num_output_placeholders -= num_rejected
+                    if self._htr_accept_thresh and num_draft_tokens > 0:
+                        _rate = float(num_accepted) / float(num_draft_tokens)
+                        self._htr_accept_ema = 0.85 * self._htr_accept_ema + 0.15 * _rate
+                        self._htr_accept_steps += 1
                 spec_decoding_stats = self.make_spec_decoding_stats(
                     spec_decoding_stats,
                     num_draft_tokens=num_draft_tokens,
