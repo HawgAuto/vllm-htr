@@ -10,7 +10,7 @@
         "native-source/dense/htr_kernels.cpp",
         "native-source/dense/htr_kernels.hip"
       ],
-      "accepted_binary_sha256": "282a4edcf318c8d50468e0c02afb165ead0a1f2e8f31373148a7a73bdcd690e4"
+      "accepted_binary_sha256": "ddbe5b3d3cab420f06585cb7a6154490a584fd37511fac22cd5f232f5e8b6b1e"
     },
     {
       "name": "htr_moe2",
@@ -20,7 +20,7 @@
         "native-source/moe2/kernel.hip",
         "native-source/moe2/kernel.cpp"
       ],
-      "accepted_binary_sha256": "de777aacdbf4e7b9c5786c382c866962253a903e552b7c1ee18e61c861ad64f2"
+      "accepted_binary_sha256": "d08fd7da77cc0f365c1a3768442a01f46bfd6b145f0f873ee7303e22ce4307f8"
     },
     {
       "name": "htr_moe_k6",
@@ -30,7 +30,7 @@
         "native-source/moe2/k6/k6.hip",
         "native-source/moe2/k6/k6.cpp"
       ],
-      "accepted_binary_sha256": "830f49e0de6ec4a47a642cad661516d0091efe8ce30cac2abb49666e565e8ca0"
+      "accepted_binary_sha256": "1d1d9f35261558b983d8a17a5e27e0ba2581b0981630c4022acb34152484af1c"
     },
     {
       "name": "htr_moe_prefill_v3",
@@ -40,7 +40,7 @@
         "native-source/prefill/htr_moe_prefill_v6.cpp",
         "native-source/prefill/htr_moe_prefill_v6.hip"
       ],
-      "accepted_binary_sha256": "02e138ff0c810aea6aecf0f7d7ce12cccc01e4e5e71975aa6f0145aea00b826e"
+      "accepted_binary_sha256": "d4679d07e120baa5e1b1f19180e361774dc4e3ea1c70c204f8aee819503c3f56"
     },
     {
       "name": "htr_moe_serve_k",
@@ -50,7 +50,7 @@
         "native-source/moe/htr_moe.hip",
         "native-source/moe/htr_moe.cpp"
       ],
-      "accepted_binary_sha256": "93dfb88bf129b54667b99e36a0d785bfe491286dcad32382ed3fea1d81ede363"
+      "accepted_binary_sha256": "559713892af5d14b231bb2965b93678116d20379ec27d2c057d4e3fd741d7c7a"
     },
     {
       "name": "htr_dq_arena",
@@ -70,7 +70,7 @@
         "native-source/moe/htr_moe_prefill.hip",
         "native-source/moe/htr_moe_prefill.cpp"
       ],
-      "accepted_binary_sha256": "870f0032836c12f4e187b841d567d0c91d4133500bf2e22c21a04adaa7c009d1"
+      "accepted_binary_sha256": "69610919fa8d54aa60524d94b8c24aa13257b6752f121dc7838cda4b37c0e221"
     },
     {
       "name": "htr_moe_prefill_v2",
@@ -80,7 +80,7 @@
         "native-source/moe/htr_moe_prefill_v2.cpp",
         "native-source/moe/htr_moe_prefill_v2.hip"
       ],
-      "accepted_binary_sha256": "b9ecd0bf98f9e9c19c6a979db747a45283b0cb7a0fb5c6fa00981d832fb9639f"
+      "accepted_binary_sha256": "b1d2f51bed20aded6544f36d56f4b929a48d2643580b3d951b260075ba04073a"
     },
     {
       "name": "e59_pledev_ext",
@@ -121,25 +121,25 @@
   ],
   "files": {
     "native-source/dense/htr_kernels.cpp": "ae08b45113e8731bb05efca3b62f8681e67661bff394393652867687e49e4947",
-    "native-source/dense/htr_kernels.hip": "68d105e999683b73e982e2bf887348784a46c5e15f0d8e64ba05b1a568b8d324",
+    "native-source/dense/htr_kernels.hip": "0a43dde716f014f5d8cdc83077b6e6bc2e7f93d9b64a0d551c3bd67348a4298c",
     "native-recipes/htr_kernels.ninja.in": "67ec846734546cef13aa2fb2c0a2163c985d5b0461c74cf98d4911ccd4e05c6d",
-    "native-source/moe2/kernel.hip": "406e3fd4b2e376ae0eb3918e86dbe3eca94796264c3b5272831712a62e992678",
+    "native-source/moe2/kernel.hip": "64ec253d61a0ea4a9c1d836a27ff3208e7494744a5765ae7b5cbd100a2e218b9",
     "native-source/moe2/kernel.cpp": "cb3026664fe8946f333fdc3785bf5564fb27a5e481244cec44252790bc979e66",
     "native-recipes/htr_moe2.ninja.in": "75e613ee26f8a1bd7cbea13726e176d99354e72be3b8e775865b7db45f663594",
     "native-source/prefill/htr_moe_prefill_v6.cpp": "c666c17b76f31eb7ce8b90d2589d33aa2df159d6f2c7e479de7a00f9d8b7e1a3",
-    "native-source/prefill/htr_moe_prefill_v6.hip": "610974736304e1f50f18bb30c97f1d7b37d03915d16af37637ed991562f54bff",
+    "native-source/prefill/htr_moe_prefill_v6.hip": "02a6b58d68128567e6ecce7972439d03027a5b83bc6b79db579629b94ad02144",
     "native-recipes/htr_moe_prefill_v3.ninja.in": "99fc621ff88552f1f884f02092511ff7f44d21dee4508863072562995a9d00c8",
-    "native-source/moe/htr_moe.hip": "75522bc9a720ff3e24f080d823317677c731bc2640cfea0210b1d2bf5001cc02",
+    "native-source/moe/htr_moe.hip": "f913bc593586a6205c0517f90b8699cd6d29075e1573f53957842105fd626b36",
     "native-source/moe/htr_moe.cpp": "52868f187ef8953540ef9288849362af58f803f4d96d2458daa49bb64abaf063",
     "native-recipes/htr_moe_serve_k.ninja.in": "3cd01bbd030130627ff4dddc40286763a7dfde5bad816e28c20f8e2d59b5ed64",
     "native-source/moe/dq_arena.hip": "87cc348cf7c165c410e8ac24a5c5ccd637b03188278a30014c7237a1af2e391e",
     "native-source/moe/dq_arena.cpp": "79146ce1e3e72899e7bd7eb7681bb1b4e6c5e4655c4df21653c893a3a7b92bb4",
     "native-recipes/htr_dq_arena.ninja.in": "d81da28cf270e7073a8d46346737bfe3842594295bce0645c56044b6d67ae35e",
-    "native-source/moe/htr_moe_prefill.hip": "0c1293faf215efb32b00057a9c6cf7cfac564cddf682ea2cb351e7a69106f133",
+    "native-source/moe/htr_moe_prefill.hip": "541ee05a1bd25f038a1e638813c43f1fee0bfb31dbf9101824494116600a6f75",
     "native-source/moe/htr_moe_prefill.cpp": "e372f0b8f8811b89aeb01d6506b12733c37f8ff68fbfdde6e1a9001851a44c6f",
     "native-recipes/htr_moe_prefill.ninja.in": "496cf2dfacc309cf56373f28ebf4f9dd5810663ca27c28405a3a3dcc9f04b6ee",
     "native-source/moe/htr_moe_prefill_v2.cpp": "b95eb50597aecb0c23635b9d675338ab63c6c8035873ed368611594794bc35ab",
-    "native-source/moe/htr_moe_prefill_v2.hip": "10889f65222b87868dfac62dc53a800be9c600707c176be2b09e9c5ed4caef90",
+    "native-source/moe/htr_moe_prefill_v2.hip": "f6bba90f1056c2b9d635740da31b0c90557387444506816458f5aea552c83a81",
     "native-recipes/htr_moe_prefill_v2.ninja.in": "6d855d1ae5ddac3634c887140bf8fc4f2dfa3496688b293f04048bab8e91bd2d",
     "native-source/ple-device/e59_ple_dev.hip": "4818d98a18814249652fc6d2eda78be8212115545fb85f589954ec6519a95936",
     "native-recipes/e59_pledev_ext.ninja.in": "893449acb4b30e1edb3c333e31467cd083a72aabd59dcc23f6929edb55e48bba",
@@ -151,8 +151,8 @@
     "native-source/ple-gather/ple_gather_v2.c": "e148fc97e8326b14ce57fe480f95a1f39c483493118efed5ca53c8a048c6e869",
     "native-source/qsa_tau/qsa_tau_v2.hip": "581bee354a25c61c7e1167c1e18dba9757d457ffacacadfb3433086ea0315e9c",
     "native-source/moe2/k6/gen_k6.py": "a0fadaada6066357b7e039b88fda246dcfe7ed67ed446836753abab3d318a9ce",
-    "native-source/moe2/k6/inc_moe2.inc": "c349c2688854c227b8727a9ddd8895502df1dabbb6c942aaf3dcc5a65e117b80",
-    "native-source/moe2/k6/k6.hip": "4a6bd56201368942fce6a8fcaa54b86a5538a358e912ad0296b0d6f894ee2eea",
+    "native-source/moe2/k6/inc_moe2.inc": "5492b870d96672531dbd17aeed9e9efc79920453e87188f09cb12bfeb7c52f18",
+    "native-source/moe2/k6/k6.hip": "cdfbbf2d040d09318c2a5e847205d43acf3043917e117cc84f0b4b8ffb2acfe2",
     "native-source/moe2/k6/k6.cpp": "25e05aeabb4bd0f591ddbe76bad8759af73cad14e0fed2c5bb16e47e94735da6",
     "native-source/moe2/k6/k6_host.inc": "ddab67e48aa4d357b04cf204d57733e9de694564764ef0d6d61024fd819a4077",
     "native-recipes/htr_moe_k6.ninja.in": "34c28c64983f82ff49140bddf30b4ae7fa241abc65f5f04f415f5dbbaf7fcdc2"

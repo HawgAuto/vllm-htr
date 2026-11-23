@@ -13,7 +13,7 @@ import json
 import os
 import sys
 
-MOE2_SHA256 = '583bd74640272a6bbac492e1769e5fbaac82f01e80198872bac27e7fef915cac'
+MOE2_SHA256 = 'd08fd7da77cc0f365c1a3768442a01f46bfd6b145f0f873ee7303e22ce4307f8'
 _SEEN = set()
 
 

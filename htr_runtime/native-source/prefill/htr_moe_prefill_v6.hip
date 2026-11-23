@@ -108,6 +108,10 @@ template <int M> __device__ __forceinline__ uint32_t win(uint32_t hi, uint32_t m
 }
 // f16 bits of 1024 + u, u = bytesum(s * A + B) in [0, 1020]  (0x6400 = f16 1024, carried in the sad accumulator)
 __device__ __forceinline__ uint32_t tv16(uint32_t s) { return __builtin_amdgcn_sad_u8(s * GEN_A + GEN_B, 0u, 0x6400u); }
+// v0.2.5 sad_hi pair decode, bit-identical: tv16(a) | (tv16(b) << 16) (halves never carry: byte sums <= 1020)
+__device__ __forceinline__ uint32_t tv16x2(uint32_t a, uint32_t b) {
+  return __builtin_amdgcn_sad_hi_u8(b * GEN_A + GEN_B, 0u, __builtin_amdgcn_sad_u8(a * GEN_A + GEN_B, 0u, 0x64006400u));
+}
 
 template <int I> __device__ __forceinline__ uint32_t sym(uint32_t hi, uint32_t mid, uint32_t lo, uint32_t hi4, uint32_t mid4, uint32_t lo4) {
   if constexpr ((I & 1) == 0) return win<I / 2>(hi, mid, lo);
@@ -118,9 +122,7 @@ __device__ __forceinline__ void decode_row(uint32_t hi, uint32_t mid, uint32_t l
   const uint32_t lo4 = __builtin_amdgcn_alignbit(mid, lo, 4), mid4 = __builtin_amdgcn_alignbit(hi, mid, 4), hi4 = hi >> 4;
 #define HPF2_PAIR(JJ)                                                                                          \
   {                                                                                                            \
-    const uint32_t a = tv16(sym<15 - 2 * (JJ)>(hi, mid, lo, hi4, mid4, lo4));                                  \
-    const uint32_t b = tv16(sym<14 - 2 * (JJ)>(hi, mid, lo, hi4, mid4, lo4));                                  \
-    o[JJ] = a | (b << 16);                                                                                     \
+    o[JJ] = tv16x2(sym<15 - 2 * (JJ)>(hi, mid, lo, hi4, mid4, lo4), sym<14 - 2 * (JJ)>(hi, mid, lo, hi4, mid4, lo4)); \
   }
   HPF2_PAIR(0) HPF2_PAIR(1) HPF2_PAIR(2) HPF2_PAIR(3) HPF2_PAIR(4) HPF2_PAIR(5) HPF2_PAIR(6) HPF2_PAIR(7)
 #undef HPF2_PAIR

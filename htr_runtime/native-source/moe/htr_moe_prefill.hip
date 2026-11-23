@@ -71,6 +71,11 @@ __device__ __forceinline__ uint32_t tval(uint32_t s) {
   const uint32_t x = s * GEN_A + GEN_B;
   return __builtin_amdgcn_sad_u8(x, 0u, 0u);
 }
+// v0.2.5 sad_hi pair decode, bit-identical: (tval(a) | 0x6400) | (tval(b) | 0x6400) << 16 (u < 1024 never overlaps
+// 0x6400 and the halves never carry)
+__device__ __forceinline__ uint32_t tval2_f16(uint32_t a, uint32_t b) {
+  return __builtin_amdgcn_sad_hi_u8(b * GEN_A + GEN_B, 0u, __builtin_amdgcn_sad_u8(a * GEN_A + GEN_B, 0u, 0x64006400u));
+}
 
 // ------------------------------------------------------------------ 1/3: activation prologues (one WG = one sorted pair)
 // MODE 0 (act_in): src = x bf16 [T, 2560], row = token(p); dst A1 f16 [P, 2560]; su offset 0 (gate/up share su).
@@ -169,9 +174,9 @@ __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8))) voi
         const int j = 2 * jj + q, b = 20 + 4 * j, wi = b >> 5, off = b & 31;
         const uint64_t comb = ((uint64_t)W[wi] << 32) | (uint64_t)W[wi + 1];
         const uint32_t s = (uint32_t)(comb >> (48 - off)) & 0xFFFFu;
-        u2[q] = tval(s) | 0x6400u;                      // f16 bits of 1024 + u (exact, u < 1024)
+        u2[q] = s;                                      // trellis state; pair-decoded below
       }
-      const h2 hv = __builtin_bit_cast(h2, u2[0] | (u2[1] << 16));
+      const h2 hv = __builtin_bit_cast(h2, tval2_f16(u2[0], u2[1]));   // f16 bits of 1024 + u, both halves
       const h2 vv = hv + (h2){(_Float16)-1534.0f, (_Float16)-1534.0f};   // 1024 + u - 1534 = v (exact)
       o[jj] = __builtin_bit_cast(uint32_t, vv);
     }

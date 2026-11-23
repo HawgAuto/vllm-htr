@@ -52,9 +52,7 @@ __device__ __forceinline__ void tile_loop_n(const uint32_t* __restrict__ qm, siz
     }
 #define HTR_PAIRM(U)                                                                       \
     {                                                                                      \
-      uint32_t lo = val_f16bits(ext16<16 + ((U) + 1) * K>(V));                             \
-      uint32_t hi = val_f16bits(ext16<16 + ((U) + 2) * K>(V));                             \
-      h2v w2 = as_h2(lo | (hi << 16));                                                     \
+      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
       _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
         if ((U) < 16) d0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], d0[r], false); \
         else d1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], d1[r], false);      \

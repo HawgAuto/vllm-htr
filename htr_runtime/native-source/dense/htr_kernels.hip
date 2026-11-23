@@ -34,6 +34,15 @@ __device__ __forceinline__ uint32_t ext16(const uint32_t* V) {
 __device__ __forceinline__ uint32_t val_f16bits(uint32_t s) {
   return sad_bytesum(s * GEN_A + GEN_B, 0x6400u);
 }
+// v0.2.5 sad_hi pair decode, bit-identical: val_f16bits(a) | (val_f16bits(b) << 16) in one v_sad_u8 + one
+// v_sad_hi_u8 (each byte sum is <= 1020, so the 16-bit halves never carry; saves the v_lshl_or_b32 per pair).
+__device__ __forceinline__ uint32_t val_f16bits2(uint32_t a, uint32_t b) {
+#if defined(__HIP_DEVICE_COMPILE__) || defined(__HIPCC__)
+  return __builtin_amdgcn_sad_hi_u8(b * GEN_A + GEN_B, 0u, __builtin_amdgcn_sad_u8(a * GEN_A + GEN_B, 0u, 0x64006400u));
+#else
+  return val_f16bits(a) | (val_f16bits(b) << 16);
+#endif
+}
 __device__ __forceinline__ h2v as_h2(uint32_t u) { return __builtin_bit_cast(h2v, u); }
 __device__ __forceinline__ float to_f(float v) { return v; }
 __device__ __forceinline__ float to_f(__half v) { return __half2float(v); }
@@ -93,9 +102,7 @@ __global__ __launch_bounds__(256) void k_gemv(const uint32_t* __restrict__ qw, c
     }
 #define HTR_PAIR(U)                                                                        \
     {                                                                                      \
-      uint32_t lo = val_f16bits(ext16<16 + ((U) + 1) * K>(V));                             \
-      uint32_t hi = val_f16bits(ext16<16 + ((U) + 2) * K>(V));                             \
-      h2v w2 = as_h2(lo | (hi << 16));                                                     \
+      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
       _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
         if ((U) < 16) a0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a0[r], false); \
         else a1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a1[r], false);      \
@@ -372,9 +379,7 @@ __global__ __launch_bounds__(256) void k_e82_gemv_epi(const uint32_t* __restrict
     }
 #define HTR_PAIR(U)                                                                        \
     {                                                                                      \
-      uint32_t lo = val_f16bits(ext16<16 + ((U) + 1) * K>(V));                             \
-      uint32_t hi = val_f16bits(ext16<16 + ((U) + 2) * K>(V));                             \
-      h2v w2 = as_h2(lo | (hi << 16));                                                     \
+      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
       _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
         if ((U) < 16) a0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a0[r], false); \
         else a1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a1[r], false);      \
@@ -473,9 +478,7 @@ __global__ __launch_bounds__(256) void k_e82_gemv_epi8(const uint32_t* __restric
     }
 #define HTR_PAIR(U)                                                                        \
     {                                                                                      \
-      uint32_t lo = val_f16bits(ext16<16 + ((U) + 1) * K>(V));                             \
-      uint32_t hi = val_f16bits(ext16<16 + ((U) + 2) * K>(V));                             \
-      h2v w2 = as_h2(lo | (hi << 16));                                                     \
+      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
       _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
         if ((U) < 16) a0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a0[r], false); \
         else a1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a1[r], false);      \
@@ -603,9 +606,7 @@ __global__ __launch_bounds__(256) void k_gemv_fused(const uint32_t* __restrict__
     }
 #define HTR_PAIRF(U)                                                                       \
     {                                                                                      \
-      uint32_t lo = val_f16bits(ext16<16 + ((U) + 1) * K>(V));                             \
-      uint32_t hi = val_f16bits(ext16<16 + ((U) + 2) * K>(V));                             \
-      h2v w2 = as_h2(lo | (hi << 16));                                                     \
+      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
       _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
         if ((U) < 16) d0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], d0[r], false); \
         else d1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], d1[r], false);      \

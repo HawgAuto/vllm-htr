@@ -3,10 +3,10 @@
   "target": "gfx1151",
   "files": {
     "native-source/dense-wmma/wm.cpp": "f5ef60ac1c9be5c57d794722660717b9eef93b36d1cca2486f35cc83637bb81c",
-    "native-source/dense-wmma/wm.hip": "ed8984f5aa30e68a504a1dee34cdcecd640503c947bf757fa6f39206fb25d745",
+    "native-source/dense-wmma/wm.hip": "9a183cac42c460294005deed006608c2b53bc089bb725e349f4d3ddd6131d0d6",
     "native-recipes/htr_dense_wmma.ninja.in": "a9ecf36fc455a2ea81c2fafd538d03b9d0e8aabc9303e988b356c5c805467ca8"
   },
   "output": "htr_dense_wmma.so",
   "extension_module": "htr_wm",
-  "required_binary_sha256": "d015e97814ce3fc98eb56f3e2e5cf7f931d48ba5d734ae400c92da7c00a288f2"
+  "required_binary_sha256": "77e2bafbcced5670d6476bd177cca209b6e4f4d3c8cd388a20a85bc701d1437e"
 }
