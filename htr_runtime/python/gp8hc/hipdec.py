@@ -24,6 +24,10 @@ PLYB = int(os.environ.get('GP8HC_HIPP_LYB', '0'))
 PUP = json.loads(os.environ.get('GP8HC_HIPP_UP', '[8,0]'))  # ugmqq MW, RF
 # V5-A4: opt-in closing of the M=9..255 HC dead zone ('off' | 'hipp' | 'chunk8')
 M9_MODE = os.environ.get('GP8HC_HIP_M9_MODE', 'off')
+V2_ENABLED = os.environ.get('GP8HC_HIP_V2', '0') == '1'
+V2_COMBINE = os.environ.get('GP8HC_HIP_V2_COMBINE', '1') == '1'
+V2_SO = os.environ.get('GP8HC_HIP_V2_SO', '/opt/vllm-htr/native-bin/hiphc_v2.so')
+_mod2 = [None]
 if M9_MODE not in ('off', 'hipp', 'chunk8'):
     raise ValueError(f'GP8HC_HIP_M9_MODE must be off/hipp/chunk8, got {M9_MODE!r}')
 _HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -47,6 +51,19 @@ def _hip():
         _mod[0] = hiphc
         print('GP8HC_HIP_LOAD ' + json.dumps(dict(build=json.load(open(os.path.join(_BUILD, 'BUILD.json'))), dcfg=DCFG, uvar=UVAR)), flush=True)
     return _mod[0]
+
+
+def _hip2():
+    if _mod2[0] is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location('hiphc_v2', V2_SO)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f'GP8HC_HIP_V2: cannot load {V2_SO}')
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _mod2[0] = mod
+        print('GP8HC_HIP_V2_LOAD ' + json.dumps(dict(so=V2_SO, combine=V2_COMBINE)), flush=True)
+    return _mod2[0]
 
 
 def _hipp():
@@ -83,7 +100,7 @@ def _p_ok(M, K, merged_w, up_w, hidden, hc):
 
 
 def install():
-    if not (ENABLED or PENABLED):
+    if not (ENABLED or PENABLED or V2_ENABLED):
         return
     import direct_nb1 as nb
     if getattr(nb._hcv3_ok, '_gp8hip', False):
@@ -92,6 +109,10 @@ def install():
 
     def ok(hidden, blk, inj, norm_w, merged_w, up_w, hc):
         M, K = hidden.shape
+        if (V2_ENABLED and 1 <= M <= 16 and hc == 4 and merged_w.dtype == torch.uint8 and up_w.dtype == torch.uint8
+                and tuple(merged_w.shape) == (336, K) and tuple(up_w.shape) == (K, 320)
+                and hidden.dtype == torch.bfloat16 and hidden.is_contiguous()):
+            return True
         if (ENABLED and 1 <= M <= 8 and hc == 4 and merged_w.dtype == torch.uint8 and up_w.dtype == torch.uint8
                 and tuple(merged_w.shape) == (336, K) and tuple(up_w.shape) == (K, 320)
                 and hidden.dtype == torch.bfloat16 and hidden.is_contiguous()):
@@ -108,6 +129,20 @@ def install():
         dn, up = mod.input_mix_weight_down_block_inject, mod.input_mix_weight_up
         if not (hasattr(dn, 'gp8_sz') and hasattr(up, 'gp8_sz')):
             raise RuntimeError(f'GP8HC_HIP: layer {layer_id} has uint8 carriers but no packed sz buffers')
+        if V2_ENABLED and 1 <= M <= 16:
+            h2 = _hip2()
+            if V2_COMBINE and hasattr(h2, 'combine_norm'):
+                out, xn = h2.combine_norm(hidden, blk, inj, norm_w, eps, hc)
+            else:
+                from vllm.models.qwen4_exp.amd.ops.hc import hc_combine_norm
+                out, xn = hc_combine_norm(hidden, blk, inj, norm_w, eps, hc)
+            cfg = 0 if M > 8 else DCFG.get(M, 2)
+            lora, d = h2.down_silu(xn, dn.gp8_qweight, dn.gp8_sz, 336, mod.lora_rank, hc, cfg)
+            y = h2.up_gatemix(lora, up.gp8_qweight, up.gp8_sz, xn, hc, 0)
+            if ('v2', M) not in _seen:
+                _seen.add(('v2', M))
+                print('GP8HC_HIP_V2_ROUTE ' + json.dumps(dict(m=M, layer_id=layer_id, cfg=cfg, combine=V2_COMBINE)), flush=True)
+            return out, y, d[:, mod.lora_rank:mod.lora_rank + hc]
         if ENABLED and 1 <= M <= 8:
             from vllm.models.qwen4_exp.amd.ops.hc import hc_combine_norm
             h = _hip()
