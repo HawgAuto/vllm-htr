@@ -33,6 +33,61 @@ _HTR_QSA_CE_HSACO = os.environ.get(
 _HTR_QSA_CE_SHA256 = "3d36e7f5f20c1d67bcd0b8cd0d18aa76c1aad16ad2649555380c7f1e5ff2af05"
 _CE_MOD = {}
 
+# V5-I3: opt-in fused Wave32 QSA Top-K + Canonicalize + Expand (6 launches -> 1 launch, 0 temp allocs, 100% bitwise)
+_HTR_QSA_TOPK_CE_FUSED = os.environ.get("HTR_QSA_TOPK_CE_FUSED", "0") == "1"
+_HTR_QSA_TCE_HSACO = os.environ.get(
+    "HTR_QSA_TCE_HSACO",
+    os.path.join(os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "qsa_topk_canon_expand_fused.hsaco"),
+)
+_HTR_QSA_TCE_SHA256 = "09168ad8ccac920173f24a744e0f92d3982c57a8ce413da5f59203205d45400e"
+_TCE_MOD = {}
+
+
+def _topk_ce_fused_eligible(logits, visible_blocks, query_positions, sequence_lengths, token_to_req, out, block_topk):
+    return (
+        _HTR_QSA_TOPK_CE_FUSED
+        and current_platform.is_rocm()
+        and logits.is_cuda
+        and 1 <= block_topk <= 512
+        and logits.dtype == torch.float32
+        and visible_blocks.dtype == torch.int32
+        and query_positions.dtype == torch.int64
+        and sequence_lengths.dtype == torch.int32
+        and token_to_req.dtype == torch.int32
+        and out.dtype == torch.int32
+        and query_positions.is_contiguous()
+        and sequence_lengths.is_contiguous()
+        and token_to_req.is_contiguous()
+    )
+
+
+def _topk_ce_fused_run(logits, visible_blocks, query_positions, sequence_lengths, token_to_req, out, block_topk, compress_ratio):
+    import ctypes, hashlib
+    if "m" not in _TCE_MOD:
+        import direct_hip_module_v1 as hm
+        with open(_HTR_QSA_TCE_HSACO, "rb") as _f:
+            sha = hashlib.sha256(_f.read()).hexdigest()
+        if sha != _HTR_QSA_TCE_SHA256:
+            raise RuntimeError(f"HTR_QSA_TOPK_CE_FUSED: unexpected {_HTR_QSA_TCE_HSACO} ({sha})")
+        m = hm.Module(_HTR_QSA_TCE_HSACO)
+        _TCE_MOD.update(m=m, hm=hm)
+    m, hm = _TCE_MOD["m"], _TCE_MOD["hm"]
+    I32, I64 = ctypes.c_int32, ctypes.c_int64
+    rows, W = int(logits.shape[0]), int(logits.shape[1])
+    out_w = int(out.shape[1])
+    with torch.cuda.device(logits.device):
+        m.launch(
+            "qsa_topk_canon_expand_fused", (rows, 1, 1), (256, 1, 1),
+            [
+                hm.ptr(logits), hm.ptr(visible_blocks),
+                hm.ptr(query_positions), hm.ptr(sequence_lengths), hm.ptr(token_to_req), hm.ptr(out),
+                I64(logits.stride(0)), I64(logits.stride(1)), I64(visible_blocks.stride(0)),
+                I64(out.stride(0)), I64(out.stride(1)),
+                I32(rows), I32(W), I32(block_topk), I32(sequence_lengths.shape[0]),
+                I32(compress_ratio), I32(out_w),
+            ],
+        )
+
 
 def _canon_expand_fused_eligible(blocks, logits, visible_blocks, query_positions, sequence_lengths, token_to_req, out, block_topk):
     return (
@@ -1067,10 +1122,11 @@ def qsa_select_paged_tokens(
     block_topk = token_topk // compress_ratio
     rows_per_chunk = max(1, _LOGITS_WORKSPACE_BYTES // max(columns * 4, 1))
     chunk_rows = min(rows, rows_per_chunk)
-    blocks_buffer = torch.empty(
+    _use_tce_fast = _HTR_QSA_TOPK_CE_FUSED and current_platform.is_rocm() and 1 <= block_topk <= 512
+    blocks_buffer = None if _use_tce_fast else torch.empty(
         (chunk_rows, block_topk), dtype=torch.int32, device=q.device
     )
-    topk_workspace = torch.empty(
+    topk_workspace = None if _use_tce_fast else torch.empty(
         (_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device
     )
     for row_start in range(0, rows, rows_per_chunk):
@@ -1085,6 +1141,20 @@ def qsa_select_paged_tokens(
             sequence_lengths,
             compress_ratio,
         )
+        if _topk_ce_fused_eligible(
+            logits, visible_blocks,
+            query_positions[row_slice], sequence_lengths, token_to_req[row_slice],
+            out[row_slice], block_topk,
+        ):
+            _topk_ce_fused_run(
+                logits, visible_blocks,
+                query_positions[row_slice], sequence_lengths, token_to_req[row_slice],
+                out[row_slice], block_topk, compress_ratio,
+            )
+            continue
+        if blocks_buffer is None:
+            blocks_buffer = torch.empty((chunk_rows, block_topk), dtype=torch.int32, device=q.device)
+            topk_workspace = torch.empty((_TOPK_WORKSPACE_BYTES,), dtype=torch.uint8, device=q.device)
         blocks = blocks_buffer[: row_end - row_start]
         use_cooperative_topk = (
             current_platform.is_cuda()
