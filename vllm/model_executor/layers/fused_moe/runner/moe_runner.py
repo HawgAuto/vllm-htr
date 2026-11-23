@@ -153,6 +153,50 @@ def _moe_forward_fake(
 
 import os as _dmf_os
 _DIRECT_MOE_SHARED_FOLD = _dmf_os.environ.get("DIRECT_MOE_SHARED_FOLD") == "1"
+_HTR_MOE_ROUTER_FUSED = _dmf_os.environ.get("HTR_MOE_ROUTER_FUSED", "0") == "1"
+_HTR_MOE_ROUTER_SO = _dmf_os.environ.get(
+    "HTR_MOE_ROUTER_SO", "/opt/vllm-htr/native-bin/htr_moe_router_fused.so"
+)
+_HTR_ROUTER_MOD = None
+_HTR_ROUTER_SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
+def _load_htr_router_fused():
+    global _HTR_ROUTER_MOD
+    if _HTR_ROUTER_MOD is None:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("htr_moe_router_fused", _HTR_MOE_ROUTER_SO)
+        if spec is None or spec.loader is None:
+            raise RuntimeError(f"HTR_MOE_ROUTER_FUSED: cannot load {_HTR_MOE_ROUTER_SO}")
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _HTR_ROUTER_MOD = mod
+    return _HTR_ROUTER_MOD
+
+
+def _run_htr_router_fused(
+    hidden_states: torch.Tensor,
+    weight: torch.Tensor,
+    top_k: int,
+    renormalize: bool,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    dev = hidden_states.device
+    idx = dev.index if dev.index is not None else 0
+    buf = _HTR_ROUTER_SCRATCH.get(idx)
+    if buf is None:
+        buf = (
+            torch.empty((16, 512), dtype=torch.float32, device=dev),
+            torch.zeros((1,), dtype=torch.int32, device=dev),
+        )
+        _HTR_ROUTER_SCRATCH[idx] = buf
+    ls, cnt = buf
+    M = hidden_states.shape[0]
+    tw = torch.empty((M, top_k), dtype=torch.float32, device=dev)
+    ti = torch.empty((M, top_k), dtype=torch.int32, device=dev)
+    _load_htr_router_fused().moe_router_fused(
+        hidden_states, weight, ls, cnt, tw, ti, int(top_k), bool(renormalize)
+    )
+    return tw, ti
 
 
 def _moe_forward_shared(
@@ -613,6 +657,7 @@ class MoERunner(MoERunnerInterface):
         input_ids: torch.Tensor | None = None,
         shared_experts_overlapping: bool = False,
         k6_shared_folded: bool = False,
+        prefused_topk: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -638,12 +683,15 @@ class MoERunner(MoERunnerInterface):
             )
         else:
             # Modular kernels: select experts first, then call routed_experts
-            topk_weights, topk_ids = self.router.select_experts(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                topk_indices_dtype=self._quant_method.topk_indices_dtype,
-                input_ids=input_ids,
-            )
+            if prefused_topk is not None:
+                topk_weights, topk_ids = prefused_topk
+            else:
+                topk_weights, topk_ids = self.router.select_experts(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    topk_indices_dtype=self._quant_method.topk_indices_dtype,
+                    input_ids=input_ids,
+                )
 
             fused_out = self.routed_experts.forward_modular(
                 x=hidden_states,
@@ -930,8 +978,36 @@ class MoERunner(MoERunnerInterface):
         # If the Runner holds the gate, apply it after the stream sync,
         # so it can run overlapped with the
         # NOTE: in future PR, MoE runner will always hold the gate.
+        _prefused_topk: tuple[torch.Tensor, torch.Tensor] | None = None
         if self.gate is not None:
-            if self._fse_fuse_gate:
+            if (
+                _HTR_MOE_ROUTER_FUSED
+                and not self._fse_fuse_gate
+                and not self.routed_experts.quant_method.is_monolithic
+                and not self.do_naive_dispatch_combine
+                and self.moe_config.pcp_size == 1
+                and hidden_states.ndim == 2
+                and 1 <= hidden_states.shape[0] <= 16
+                and hidden_states.dtype == torch.bfloat16
+                and hidden_states.stride(1) == 1
+                and getattr(self.gate, "bias", None) is None
+                and hasattr(self.gate, "weight")
+                and self.gate.weight.dtype == torch.bfloat16
+                and tuple(self.gate.weight.shape) == (512, 2560)
+                and self.gate.weight.is_contiguous()
+                and type(self.router).__name__ == "FusedTopKRouter"
+                and getattr(self.router, "scoring_func", None) == "softmax"
+                and getattr(self.router, "eplb_state", None) is None
+                and 1 <= getattr(self.router, "top_k", 0) <= 16
+                and self._quant_method.topk_indices_dtype in (None, torch.int32)
+            ):
+                _prefused_topk = _run_htr_router_fused(
+                    hidden_states,
+                    self.gate.weight,
+                    self.router.top_k,
+                    getattr(self.router, "renormalize", True),
+                )
+            elif self._fse_fuse_gate:
                 self._maybe_fuse_gate_weights()
                 router_logits = dispatch_unquantized_gemm()(
                     self, hidden_states, self._combined_gate_weight, None
@@ -955,6 +1031,7 @@ class MoERunner(MoERunnerInterface):
                 input_ids=input_ids,
                 shared_experts_overlapping=shared_experts_overlapping,
                 k6_shared_folded=_k6_sh_folded,
+                prefused_topk=_prefused_topk,
             )
 
             return self._maybe_combine(
