@@ -66,6 +66,7 @@ EPI8 = os.environ.get("HTR_EPI8", "1") == "1"
 GEMV_LOOP_MAX = int(os.environ.get("HTR_GEMV_LOOP_MAX", "64"))
 # V5-W3: opt-in K5 16B+4B split-plane aligned global_load_b128 GEMV (bit-exact vs gemv_epi, 0 extra weight bytes).
 K5_SPLITPLANE = os.environ.get("HTR_K5_SPLITPLANE") == "1"
+K4_B128 = os.environ.get("HTR_K4_B128") == "1"
 _K5SP_MOD = None
 _K5SP_CACHE = {}
 
@@ -122,6 +123,8 @@ def _linear_impl(x2, qweight, scales, su, sv, bias):
             if K5_SPLITPLANE and qweight.shape[2] == 40:
                 p16, p4 = _k5sp_planes(qweight)
                 outs.append(_k5sp_ext().gemv_k5_sp16_epi(p16, p4, xt[r0:r1], xs[r0:r1], tok[r0:r1], scales, CB, sv, bias, cnt, ns, od, _e8))
+            elif K4_B128 and qweight.shape[2] == 32:
+                outs.append(_k5sp_ext().gemv_k4_b128_epi(qweight, xt[r0:r1], xs[r0:r1], tok[r0:r1], scales, CB, sv, bias, cnt, ns, od, _e8))
             else:
                 outs.append(E.gemv_epi(qweight, xt[r0:r1], xs[r0:r1], tok[r0:r1], scales, CB, sv, bias, cnt, ns, od, _e8))
         return torch.cat(outs)
@@ -140,6 +143,8 @@ def _linear_impl(x2, qweight, scales, su, sv, bias):
         if K5_SPLITPLANE and qweight.shape[2] == 40:
             p16, p4 = _k5sp_planes(qweight)
             return _k5sp_ext().gemv_k5_sp16_epi(p16, p4, xt, xs, tok, scales, CB, sv, bias, counters(x2.device), ns, od, _e8)
+        if K4_B128 and qweight.shape[2] == 32:
+            return _k5sp_ext().gemv_k4_b128_epi(qweight, xt, xs, tok, scales, CB, sv, bias, counters(x2.device), ns, od, _e8)
         return E.gemv_epi(qweight, xt, xs, tok, scales, CB, sv, bias, counters(x2.device), ns, od, _e8)
     if M <= GEMV_MAX_M:
         part = E.gemv_partials(qweight, xt, nsplit_for(mt, nt, M))
