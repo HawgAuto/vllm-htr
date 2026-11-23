@@ -149,6 +149,53 @@ def _method_class():
                 with torch.cuda.device(x.device):
                     torch.cuda.empty_cache()
 
+        def _k6_shared_can_fold(self, x, shared_experts):
+            if not (K6W_ON and K6W_SHARED and self._ready and shared_experts is not None):
+                return False
+            T = x.shape[0]
+            if T not in K6W_ROWS or x.dtype != torch.bfloat16 or x.ndim != 2 or x.shape[1] != 2560:
+                return False
+            ar = self.ar
+            if ar.get('sh_g', -1) == 512:
+                return True
+            if ar.get('_k6_sh_ineligible', False):
+                return False
+            if torch.cuda.is_current_stream_capturing():
+                return False
+            # Lazily append HTR K5 shared_expert (gate_up_proj + down_proj + expert_gate) as expert 512
+            mlp = getattr(shared_experts, '_layer', shared_experts)
+            gu = getattr(mlp, 'gate_up_proj', None)
+            dn = getattr(mlp, 'down_proj', None)
+            eg = getattr(mlp, 'expert_gate', None)
+            if (gu is None or dn is None or eg is None
+                    or not hasattr(gu, 'htr_qweight') or not hasattr(dn, 'htr_qweight')
+                    or tuple(gu.htr_qweight.shape) != (80, 160, 40)
+                    or tuple(dn.htr_qweight.shape) != (160, 40, 40)):
+                ar['_k6_sh_ineligible'] = True
+                return False
+            spad5 = int(R.spadk(ar)[2])
+            off = ar['qw'].numel()
+            words, sh_off = [ar['qw']], []
+            g_qw, u_qw, d_qw = gu.htr_qweight[:40], gu.htr_qweight[40:], dn.htr_qweight
+            for q0 in (g_qw, u_qw, d_qw):
+                q = q0.contiguous().view(q0.shape[0], -1)
+                if spad5 > 0:
+                    q = torch.cat([q, torch.zeros(q.shape[0], spad5, dtype=q.dtype, device=q.device)], dim=1)
+                q = q.reshape(-1)
+                sh_off.append(off)
+                words.append(q)
+                off += q.numel()
+            ar['qw'] = torch.cat(words).contiguous()
+            ar['qoff'] = torch.cat([ar['qoff'], torch.tensor([sh_off], dtype=torch.int64, device=ar['qoff'].device)], dim=0).contiguous()
+            ar['scales'] = torch.cat([ar['scales'], gu.htr_scales[:640], gu.htr_scales[640:], dn.htr_scales]).contiguous()
+            ar['sv'] = torch.cat([ar['sv'], gu.htr_sv[:80], gu.htr_sv[80:], dn.htr_sv]).contiguous()
+            ar['su'] = torch.cat([ar['su'], gu.htr_su, dn.htr_su]).contiguous()
+            ar['kexp'] = torch.cat([ar['kexp'], torch.tensor([5], dtype=torch.int32, device=ar['kexp'].device)]).contiguous()
+            ar['sh_g'] = 512
+            ar['wsg'] = eg.weight.detach().view(-1).to(torch.bfloat16).contiguous()
+            _log('HTR_MOE_K6_SHARED_ATTACHED', L=self.L, sh_e=512, spad5=spad5)
+            return True
+
         def apply(self, layer, x, topk_weights, topk_ids, shared_experts, shared_experts_input):
             if x.device.type != 'cuda':
                 raise ValueError('HTR MoE requires a GPU tensor; no CPU fallback')
@@ -347,13 +394,19 @@ def decode_route_k6(ar, x, ids32, w32):
     T = x.shape[0]
     assert 1 <= T <= 16 and T in K6W_ROWS and ids32.shape == (T, R.TOPK) and w32.shape == (T, R.TOPK)
     E, s, M = k6_ext(), _k6w_scratch(x.device), _k6w_bucket(T)
-    A_, nsh = T * R.TOPK, (-(-T // M) if K6W_SHARED else 0)
+    sh_e = int(ar.get('sh_g', -1))
+    use_sh = K6W_SHARED and sh_e >= 0
+    A_, nsh = T * R.TOPK, (-(-T // M) if use_sh else 0)
     # phase A passes x twice: k6_plan never reads x/wsg when nsh == 0
-    ge, gr, gn, slot, ng, sg = E.k6_plan(ids32, M, int(ar.get('sh_g', -1)), nsh, x, ar.get('wsg', x))
+    ge, gr, gn, slot, ng, sg = E.k6_plan(ids32, M, sh_e if use_sh else -1, nsh, x, ar['wsg'] if use_sh else x)
     kf = ar['_kf']
     sp = R.spadk(ar)
-    E.k6_gemv(kf, M, ar['qw'], ar['qoff'], ar['kexp'], ar['scales'], ar['su'], ar['sv'], ge, gr, gn, x, s['part'],
-              s['cnt_gu'], s['gu'], R.cbscale(), *sp, R.FENCE_RA)
+    if use_sh:
+        E.k6_gemv_shx(kf, M, ar['qw'], ar['qoff'], ar['kexp'], ar['scales'], ar['su'], ar['sv'], ge, gr, gn, x, s['part'],
+                      s['cnt_gu'], s['gu'], R.cbscale(), *sp, R.FENCE_RA, A_)
+    else:
+        E.k6_gemv(kf, M, ar['qw'], ar['qoff'], ar['kexp'], ar['scales'], ar['su'], ar['sv'], ge, gr, gn, x, s['part'],
+                  s['cnt_gu'], s['gu'], R.cbscale(), *sp, R.FENCE_RA)
     return E.k6_gemv_dn_fused(kf, M, ar['qw'], ar['qoff'], ar['kexp'], ar['scales'], ar['su'], ar['sv'], ge, gr, gn, s['gu'],
                               s['part'], s['cnt_dn'], s['dn'], R.cbscale(), *sp, R.FENCE_RA, slot, w32, ng, s['cnt_c2'], sg,
                               A_)   # sh_g = A: first shared group (== the group count in phase A, so never hit)

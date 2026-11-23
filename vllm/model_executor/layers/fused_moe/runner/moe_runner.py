@@ -612,6 +612,7 @@ class MoERunner(MoERunnerInterface):
         shared_experts_input: torch.Tensor | None,
         input_ids: torch.Tensor | None = None,
         shared_experts_overlapping: bool = False,
+        k6_shared_folded: bool = False,
     ) -> tuple[torch.Tensor | None, torch.Tensor | UnfinalizedMoEOutput]:
         """Run expert routing and the fused MoE kernel via the quant method.
 
@@ -623,9 +624,10 @@ class MoERunner(MoERunnerInterface):
         overlap. Then the shared expert was already launched in a separate
         stream, so the results only have to be awaited here.
         """
-        self._maybe_apply_shared_experts(
-            shared_experts_input, SharedExpertsOrder.NO_OVERLAP
-        )
+        if not k6_shared_folded:
+            self._maybe_apply_shared_experts(
+                shared_experts_input, SharedExpertsOrder.NO_OVERLAP
+            )
 
         if self.routed_experts.quant_method.is_monolithic:
             # Monolithic kernels: pass router_logits to routed_experts
@@ -655,6 +657,11 @@ class MoERunner(MoERunnerInterface):
             assert self._shared_experts is not None
             self._shared_experts.wait()
 
+        if k6_shared_folded:
+            import direct_moe_reduction as _dmr
+            if _dmr._CTX:
+                _dmr._CTX[-1]["folded"] = True
+            return (fused_out, fused_out)
         return (
             self._shared_experts.output if self._shared_experts is not None else None,
             fused_out,
@@ -901,8 +908,21 @@ class MoERunner(MoERunnerInterface):
 
         # If using multi-stream overlap for shared experts, we must launch it
         # before routed expert dispatch.
+        # V5-W2: opt-in HTR_MOE_K6_SHARED=1 folds shared expert + gate into K6
+        # (checked before maybe_forward_async so aux-stream shared launch is also skipped)
+        _k6_sh_fn = (
+            getattr(self._quant_method, "_k6_shared_can_fold", None)
+            if (_DIRECT_MOE_SHARED_FOLD and self._shared_experts is not None)
+            else None
+        )
+        _k6_sh_folded = bool(
+            _k6_sh_fn is not None
+            and shared_experts_input is not None
+            and shared_experts_input.data_ptr() == hidden_states.data_ptr()
+            and _k6_sh_fn(hidden_states, self._shared_experts)
+        )
         shared_experts_overlapping = False
-        if self._shared_experts is not None:
+        if self._shared_experts is not None and not _k6_sh_folded:
             shared_experts_overlapping = self._shared_experts.maybe_forward_async(
                 shared_experts_input
             )
@@ -934,6 +954,7 @@ class MoERunner(MoERunnerInterface):
                 shared_experts_input=shared_experts_input,
                 input_ids=input_ids,
                 shared_experts_overlapping=shared_experts_overlapping,
+                k6_shared_folded=_k6_sh_folded,
             )
 
             return self._maybe_combine(
