@@ -3,8 +3,36 @@
 
 from collections.abc import Sequence
 
+import os
 import numpy as np
 import torch
+
+_TARGET_SAMPLE_FUSED_EXT = None
+
+
+def _target_sample_fused_enabled() -> bool:
+    return os.environ.get("HTR_TARGET_SAMPLE_FUSED") == "1"
+
+
+def _target_sample_fused_ext():
+    global _TARGET_SAMPLE_FUSED_EXT
+    if _TARGET_SAMPLE_FUSED_EXT is None:
+        import importlib.util
+        cand = os.environ.get("HTR_Q38_FILTER_SO")
+        if not cand:
+            for d in (os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"),
+                      "/opt/vllm-htr/native-proto"):
+                p_so = os.path.join(d, "htr_q38_filter.so")
+                if os.path.isfile(p_so):
+                    cand = p_so
+                    break
+        if not cand or not os.path.isfile(cand):
+            raise FileNotFoundError(f"HTR_TARGET_SAMPLE_FUSED=1 requires htr_q38_filter.so (checked {cand})")
+        spec = importlib.util.spec_from_file_location("htr_q38_filter", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _TARGET_SAMPLE_FUSED_EXT = mod
+    return _TARGET_SAMPLE_FUSED_EXT
 
 import vllm.envs as envs
 from vllm.config import VllmConfig
@@ -220,6 +248,38 @@ class Sampler:
         )
         return sampler_output
 
+    def _can_use_target_sample_fused(
+        self, logits: torch.Tensor, idx_mapping_np: np.ndarray
+    ) -> bool:
+        if not (
+            _target_sample_fused_enabled()
+            and logits.is_cuda
+            and logits.dim() == 2
+            and logits.dtype in (torch.bfloat16, torch.float32)
+            and logits.shape[1] >= 256
+            and idx_mapping_np.size > 0
+        ):
+            return False
+        ss = self.sampling_states
+        tk = ss.top_k.np[idx_mapping_np]
+        tp = ss.top_p.np[idx_mapping_np]
+        mp = ss.min_p.np[idx_mapping_np]
+        return bool(np.all((tk <= 64) | ((tk >= logits.shape[1]) & (tp >= 1.0) & (mp == 0.0))))
+
+    def _has_active_logits_processors(self, idx_mapping_np: np.ndarray) -> bool:
+        if len(self.logits_processors) > 3:
+            return True
+        if np.any(self.logits_processors[0].use_logit_bias[idx_mapping_np]):
+            return True
+        if np.any(self.penalties_state.use_penalty[idx_mapping_np]):
+            return True
+        if int(self.logits_processors[2].num_bad_words.np[idx_mapping_np].max()) > 0:
+            return True
+        tb = self.thinking_budget_state
+        if tb.enabled and np.any(tb.use_thinking_budget[idx_mapping_np]):
+            return True
+        return False
+
     def apply_sampling_params(
         self,
         logits: torch.Tensor,
@@ -234,6 +294,22 @@ class Sampler:
     ) -> torch.Tensor:
         if not np.any(self.needs_logits_processing[idx_mapping_np]):
             return logits
+
+        # V5-S2 fast path 1: 1-launch 40-CU fused bf16/fp32->fp32 + temp + min_p + top_k + top_p
+        can_fuse = (not skip_top_k_top_p) and self._can_use_target_sample_fused(
+            logits, idx_mapping_np
+        )
+        if can_fuse and not self._has_active_logits_processors(idx_mapping_np):
+            ss = self.sampling_states
+            return _target_sample_fused_ext().target_sample_filter_native(
+                logits.contiguous(),
+                expanded_idx_mapping,
+                ss.temperature.gpu,
+                ss.min_p.gpu,
+                ss.top_k.gpu,
+                ss.top_p.gpu,
+                False,
+            )
 
         # Copy logits to a new FP32 tensor.
         logits = torch.empty_like(logits, dtype=torch.float32).copy_(logits)
@@ -255,6 +331,19 @@ class Sampler:
         # Forcing runs last so no stage can overwrite the forced end marker
         # or weaken it by scaling.
         self.thinking_budget_state.apply(logits, ctx)
+
+        # V5-S2 fast path 2 (after active processors): 1-launch 40-CU in-place temp + min_p + top_k + top_p
+        if can_fuse:
+            ss = self.sampling_states
+            return _target_sample_fused_ext().target_sample_filter_native(
+                logits.contiguous(),
+                expanded_idx_mapping,
+                ss.temperature.gpu,
+                ss.min_p.gpu,
+                ss.top_k.gpu,
+                ss.top_p.gpu,
+                True,
+            )
 
         # Apply temperature in place.
         self.sampling_states.apply_temperature(
@@ -284,6 +373,11 @@ class Sampler:
         seq_lens_upper_bound_np: np.ndarray,
         return_logprobs: bool = False,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        v5s2_done = (
+            not self.use_flashinfer
+            and not self.use_xpu_sampler
+            and self._can_use_target_sample_fused(logits, idx_mapping_np)
+        )
         processed_logits = self.apply_sampling_params(
             logits,
             expanded_idx_mapping,
@@ -293,8 +387,20 @@ class Sampler:
             input_ids,
             expanded_local_pos,
             seq_lens_upper_bound_np,
-            skip_top_k_top_p=True,
+            skip_top_k_top_p=not v5s2_done,
         )
+        if v5s2_done:
+            sampled = gumbel_sample(
+                processed_logits,
+                expanded_idx_mapping,
+                self.sampling_states.temperature.gpu,
+                self.sampling_states.seeds.gpu,
+                pos,
+                apply_temperature=False,
+                is_drafting=False,
+                use_fp64=self.use_fp64_gumbel,
+            )
+            return sampled, processed_logits
         top_k, top_p, has_topp_only_rows = self.sampling_states.get_top_k_top_p(
             expanded_idx_mapping, idx_mapping_np, logits.shape[-1]
         )
