@@ -1024,15 +1024,22 @@ class MoERunner(MoERunnerInterface):
                 router_logits,
             )
 
-            shared_output, hidden_states = self._apply_quant_method(
-                hidden_states=hidden_states,
-                router_logits=router_logits,
-                shared_experts_input=shared_experts_input,
-                input_ids=input_ids,
-                shared_experts_overlapping=shared_experts_overlapping,
-                k6_shared_folded=_k6_sh_folded,
-                prefused_topk=_prefused_topk,
-            )
+            _k6_ar = getattr(self._quant_method, "ar", None) if _k6_sh_folded else None
+            if _k6_ar is not None:
+                _k6_ar["_k6_sh_fold_active"] = True
+            try:
+                shared_output, hidden_states = self._apply_quant_method(
+                    hidden_states=hidden_states,
+                    router_logits=router_logits,
+                    shared_experts_input=shared_experts_input,
+                    input_ids=input_ids,
+                    shared_experts_overlapping=shared_experts_overlapping,
+                    k6_shared_folded=_k6_sh_folded,
+                    prefused_topk=_prefused_topk,
+                )
+            finally:
+                if _k6_ar is not None:
+                    _k6_ar["_k6_sh_fold_active"] = False
 
             return self._maybe_combine(
                 shared_output,

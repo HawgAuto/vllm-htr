@@ -126,12 +126,17 @@ def _method_class():
             key = route
             if key in self._checked or torch.cuda.is_current_stream_capturing():
                 return
-            if route == 'v2':      # v2 must be checked on >= V2_MIN rows (R.forward on <= 8 rows would take the decode route)
-                n = min(x.shape[0], 1024)
-                a = R.v2_route(self.ar, x[:n].contiguous(), ids[:n], w[:n]).float()
-            else:
-                n = min(x.shape[0], R.MAXT)
-                a = R.forward(self.ar, x[:n].contiguous(), ids[:n], w[:n]).float()
+            _prev_sh_active = self.ar.get('_k6_sh_fold_active', False)
+            self.ar['_k6_sh_fold_active'] = False
+            try:
+                if route == 'v2':      # v2 must be checked on >= V2_MIN rows (R.forward on <= 8 rows would take the decode route)
+                    n = min(x.shape[0], 1024)
+                    a = R.v2_route(self.ar, x[:n].contiguous(), ids[:n], w[:n]).float()
+                else:
+                    n = min(x.shape[0], R.MAXT)
+                    a = R.forward(self.ar, x[:n].contiguous(), ids[:n], w[:n]).float()
+            finally:
+                self.ar['_k6_sh_fold_active'] = _prev_sh_active
             try:
                 b = R.dequant_route(self.ar, x[:n].contiguous(), ids[:n], w[:n], persistent_scratch=False).float()
                 rel = float((a - b).norm() / b.norm().clamp_min(1e-30))
@@ -398,7 +403,7 @@ def decode_route_k6(ar, x, ids32, w32):
     assert 1 <= T <= 16 and T in K6W_ROWS and ids32.shape == (T, R.TOPK) and w32.shape == (T, R.TOPK)
     E, s, M = k6_ext(), _k6w_scratch(x.device), _k6w_bucket(T)
     sh_e = int(ar.get('sh_g', -1))
-    use_sh = K6W_SHARED and sh_e >= 0
+    use_sh = K6W_SHARED and sh_e >= 0 and bool(ar.get('_k6_sh_fold_active', False))
     A_, nsh = T * R.TOPK, (-(-T // M) if use_sh else 0)
     # phase A passes x twice: k6_plan never reads x/wsg when nsh == 0
     ge, gr, gn, slot, ng, sg = E.k6_plan(ids32, M, sh_e if use_sh else -1, nsh, x, ar['wsg'] if use_sh else x)
