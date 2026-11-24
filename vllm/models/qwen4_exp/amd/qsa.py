@@ -441,12 +441,16 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
         if _kv4_mode(self.kv_cache_dtype):
             from htr_qsa_kv4 import attention
             attention(query[:num_tokens], kv_cache, logical_indices,
-                      attn_metadata.block_table, token_to_req, output[:num_tokens])
+                      attn_metadata.block_table, token_to_req, output[:num_tokens],
+                      gate=gate[:num_tokens] if gate is not None else None,
+                      gate_applied_out=gate_applied_out)
             return output
         if _kv8_mode(self.kv_cache_dtype):
             from htr_qsa_kv8 import attention
             attention(query[:num_tokens], kv_cache, logical_indices,
-                      attn_metadata.block_table, token_to_req, output[:num_tokens])
+                      attn_metadata.block_table, token_to_req, output[:num_tokens],
+                      gate=gate[:num_tokens] if gate is not None else None,
+                      gate_applied_out=gate_applied_out)
             return output
         if self.octave_fmt is not None:
             assert self._octave_positions is not None

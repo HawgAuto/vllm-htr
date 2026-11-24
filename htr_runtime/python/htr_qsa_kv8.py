@@ -6,7 +6,10 @@ import atexit,ctypes,hashlib,json,os,pathlib,sys
 import torch
 from htr_kv8 import cache_views
 from htr_qsa_kv8_ops import attention_int8 as _split,write_int8 as _write
-_STATE={'writes':0,'split_calls':0,'tau_calls':0,'selfchecks':0}
+_STATE={'writes':0,'split_calls':0,'tau_calls':0,'dec_union_calls':0,'selfchecks':0}
+DECODE_UNION=os.environ.get('HTR_QSA_DECODE_UNION','0')=='1'
+DECODE_UNION_MAX_ROWS=int(os.environ.get('HTR_QSA_DECODE_UNION_MAX_ROWS','256'))
+_DEC_MOD=None; _DEC_SCRATCH={}
 _SEEN=set(); _MODULE=None; _ARCH={}
 TAU_V3=os.environ.get('HTR_QSA_TAU_V3','0')=='1'
 HSACO_SHA256='0256a9ee6bca58221ac7ddb32860c3d10d41f48299a645971dd8ea3934f9087e' if TAU_V3 else 'f5fac9f0c0424d1b4856e24431a50ca6b45d1011ac884baf31d49b95362f5def'
@@ -62,10 +65,80 @@ def _launch(q,k,v,idx,bt,t2r,out):
          *[I64(x) for x in [q.stride(0),q.stride(1),k.stride(0),k.stride(1),k.stride(2),v.stride(0),v.stride(1),v.stride(2),out.stride(0),out.stride(1),idx.stride(0),bt.stride(0)]],
          *[I32(x) for x in [q.shape[0],k.shape[0],k.shape[1],bt.shape[1],bt.shape[0],2]]])
 
-def attention(q,cache,idx,bt,t2r,out=None):
+
+def _dec_module():
+    global _DEC_MOD
+    if _DEC_MOD is None:
+        import direct_hip_module_v1 as hm
+        path = os.environ.get('HTR_KV8_DECODE_UNION_HSACO')
+        if not path:
+            for d in (os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'), '/opt/vllm-htr/native-proto'):
+                cand = os.path.join(d, 'qsa_decode_union_kv8.hsaco')
+                if os.path.isfile(cand):
+                    path = cand; break
+        if not path or not os.path.isfile(path):
+            raise FileNotFoundError(f'HTR_QSA_DECODE_UNION=1 (KV8) requires qsa_decode_union_kv8.hsaco (checked {path})')
+        mod = hm.Module(path); mod.fn('qsa_decode_union_kv8')
+        _DEC_MOD = (hm, mod)
+    return _DEC_MOD
+
+def _dec_scratch(dev):
+    idx = dev.index
+    buf = _DEC_SCRATCH.get(idx)
+    if buf is None:
+        buf = (
+            torch.empty((64 * 48, 256), dtype=torch.float32, device=dev),
+            torch.empty((64 * 48,), dtype=torch.float32, device=dev),
+            torch.zeros((64 * 2,), dtype=torch.int32, device=dev),
+        )
+        _DEC_SCRATCH[idx] = buf
+    return buf
+
+def _dec_admitted(q, k, v, idx, bt, t2r, out, gate):
+    if not DECODE_UNION: return False
+    n = q.shape[0] if q.ndim == 3 else 0
+    if not (q.is_cuda and 1 <= n <= DECODE_UNION_MAX_ROWS and q.shape[1:] == (24, 256) and q.dtype == torch.bfloat16): return False
+    if not (k.shape == v.shape and k.shape[2:] == (2, 256) and k.dtype == torch.int8 and v.dtype == torch.int8): return False
+    if not (k.stride()[1:] == v.stride()[1:] == (1040, 520, 1) and k.stride(0) == v.stride(0) and k.stride(0) >= k.shape[1] * 1040): return False
+    if not (idx.shape == (n, 2051) and idx.dtype == torch.int32 and idx.stride(1) == 1): return False
+    if not (bt.ndim == 2 and all(bt.shape) and bt.dtype == torch.int32 and bt.stride(1) == 1 and t2r.dtype == torch.int32 and t2r.stride(0) == 1): return False
+    if out is None or out.shape != q.shape or out.dtype != torch.bfloat16 or out.stride(2) != 1 or q.stride(2) != 1: return False
+    if any(s % 8 for s in (q.stride(0), q.stride(1), out.stride(0), out.stride(1))): return False
+    if (q.data_ptr() % 16) or (out.data_ptr() % 16) or (k.data_ptr() % 4) or (v.data_ptr() % 4): return False
+    if gate is not None and (gate.shape != q.shape or gate.dtype != torch.bfloat16 or gate.stride(2) != 1): return False
+    dev = q.device.index
+    if dev not in _ARCH: _ARCH[dev] = torch.cuda.get_device_properties(dev).gcnArchName.split(':')[0]
+    return _ARCH[dev] == 'gfx1151'
+
+def _dec_launch(q, k, v, idx, bt, t2r, out, gate):
+    hm, mod = _dec_module()
+    part_o, part_lse, counters = _dec_scratch(q.device)
+    rows = int(q.shape[0])
+    nprog = (rows + 3) // 4
+    nsplits = 16 if nprog <= 2 else (8 if nprog <= 4 else (4 if nprog <= 8 else (2 if nprog <= 16 else 1)))
+    I64, I32 = ctypes.c_int64, ctypes.c_int32
+    gp = hm.ptr(gate) if gate is not None else ctypes.c_void_p(0)
+    sg0 = int(gate.stride(0)) if gate is not None else 0
+    sg1 = int(gate.stride(1)) if gate is not None else 0
+    with torch.cuda.device(q.device):
+        mod.launch('qsa_decode_union_kv8', (nprog, int(k.shape[2]), nsplits), (384, 1, 1),
+            [hm.ptr(q), hm.ptr(k), hm.ptr(v), hm.ptr(idx), hm.ptr(bt), hm.ptr(t2r),
+             hm.ptr(out), gp, hm.ptr(part_o), hm.ptr(part_lse), hm.ptr(counters),
+             *[I64(x) for x in [q.stride(0), q.stride(1), k.stride(0), k.stride(1), k.stride(2),
+                                v.stride(0), v.stride(1), v.stride(2), out.stride(0), out.stride(1),
+                                sg0, sg1, idx.stride(0), bt.stride(0)]],
+             *[I32(x) for x in [rows, k.shape[0], k.shape[1], bt.shape[1], bt.shape[0], 2]]])
+
+def attention(q,cache,idx,bt,t2r,out=None,*,gate=None,gate_applied_out=None):
     if cache.dtype!=torch.int8:raise ValueError('INT8 bridge requires packed INT8 main cache')
     k,v,_,_=cache_views(cache,q.shape[-1])
     if out is None:out=torch.empty_like(q)
+    if _dec_admitted(q,k,v,idx,bt,t2r,out,gate):
+        _dec_launch(q,k,v,idx,bt,t2r,out,gate)
+        _STATE['dec_union_calls']+=1
+        if gate_applied_out is not None and gate is not None:
+            gate_applied_out.append(True)
+        return out
     if os.environ.get('HTR_KV8_TAU','1')!='1' or not admitted(q,k,v,idx,bt,t2r,out):
         _STATE['split_calls']+=1
         return _split(q,cache,idx,bt,t2r,out)
