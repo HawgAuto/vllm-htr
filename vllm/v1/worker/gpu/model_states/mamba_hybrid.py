@@ -93,6 +93,13 @@ class MambaHybridModelState(DefaultModelState):
         self.recoverssm = (
             RecoverSSMState() if self.cache_config.use_kda_recoverssm else None
         )
+        import os as _os
+        self._htr_gdn_defer_enabled = (
+            _os.environ.get("HTR_GDN_FUSED_SPEC", "0") == "1"
+            and _os.environ.get("HTR_GDN_DEFER_COMMIT", "0") == "1"
+        )
+        self._htr_gdn_defer_cap_tokens = int(_os.environ.get("HTR_GDN_DEFER_CAP_TOKENS", "128"))
+        self._htr_gdn_defer_step = None
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -336,6 +343,32 @@ class MambaHybridModelState(DefaultModelState):
             self.recoverssm.record_step(
                 attn_metadata, attn_groups, for_capture=for_capture
             )
+        if self._htr_gdn_defer_enabled:
+            if for_capture:
+                self._htr_gdn_defer_step = None
+            else:
+                gdn_md = None
+                for group_list in attn_groups:
+                    for group in group_list:
+                        md0 = attn_metadata[group.layer_names[0]]
+                        if hasattr(md0, "spec_state_indices_tensor") and hasattr(md0, "non_spec_state_indices_tensor"):
+                            gdn_md = md0
+                            break
+                    if gdn_md is not None:
+                        break
+                if (
+                    gdn_md is not None
+                    and gdn_md.spec_sequence_masks is not None
+                    and gdn_md.num_prefills == 0
+                    and gdn_md.num_decodes == 0
+                    and gdn_md.num_spec_decodes > 0
+                    and gdn_md.spec_state_indices_tensor is not None
+                    and gdn_md.spec_state_indices_tensor.size(1) > 1
+                    and gdn_md.num_actual_tokens <= self._htr_gdn_defer_cap_tokens
+                ):
+                    self._htr_gdn_defer_step = gdn_md
+                else:
+                    self._htr_gdn_defer_step = None
         return attn_metadata
 
     def postprocess_state(
@@ -371,6 +404,21 @@ class MambaHybridModelState(DefaultModelState):
                 state_indices=(self._mamba_state_idx_gpu if self._align_mode else None),
                 num_accepted_tokens=self.num_accepted_tokens_gpu,
             )
+
+        if self._htr_gdn_defer_enabled:
+            gdn_md = self._htr_gdn_defer_step
+            self._htr_gdn_defer_step = None
+            if gdn_md is not None and not isinstance(num_sampled, int):
+                from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+                    commit_deferred_gdn_spec_step,
+                )
+                commit_deferred_gdn_spec_step(
+                    state_indices=gdn_md.spec_state_indices_tensor,
+                    cu_seqlens=gdn_md.spec_query_start_loc,
+                    prev_num_accepted=gdn_md.num_accepted_tokens,
+                    new_num_sampled=num_sampled,
+                    num_spec_decodes=gdn_md.num_spec_decodes,
+                )
 
         if not num_reqs:
             return

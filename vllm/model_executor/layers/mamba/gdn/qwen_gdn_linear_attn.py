@@ -95,6 +95,9 @@ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 
 
 _HTR_GDN_FUSED_SPEC = os.environ.get("HTR_GDN_FUSED_SPEC", "0") == "1"
+_HTR_GDN_DEFER_COMMIT = os.environ.get("HTR_GDN_DEFER_COMMIT", "0") == "1"
+_HTR_GDN_DEFER_CAP_TOKENS = int(os.environ.get("HTR_GDN_DEFER_CAP_TOKENS", "128"))
+_HTR_GDN_DEFER_COMMIT_VB = os.environ.get("HTR_GDN_DEFER_COMMIT_VB", "2").strip().lower()
 _HTR_GDN_FUSED_VB = os.environ.get("HTR_GDN_FUSED_VB", "auto").strip().lower()
 _HTR_GDN_FUSED_SO = os.environ.get(
     "HTR_GDN_FUSED_SO",
@@ -103,6 +106,10 @@ _HTR_GDN_FUSED_SO = os.environ.get(
 _HTR_GDN_MOD = None
 _HTR_GDN_SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _HTR_GDN_CU_CACHE: dict[tuple[int, int], torch.Tensor] = {}
+# V5-G5 deferred commit state: keyed by (device_idx, state_data_ptr) -> (state, vr_k, vr_v, vr_d, vr_b, H, HV)
+_HTR_GDN_DEFER_SLOTS: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]] = {}
+# Cached device pointer table per (device_idx, tuple_of_state_ptrs) -> (int64[num_layers, 6], H, HV)
+_HTR_GDN_DEFER_PTR_CACHE: dict[tuple[int, tuple[int, ...]], tuple[torch.Tensor, int, int]] = {}
 
 
 def _load_htr_gdn_fused():
@@ -125,11 +132,11 @@ def _load_htr_gdn_fused():
 def _get_htr_gdn_scratch(dev: torch.device, need_slots: int):
     idx = dev.index if dev.index is not None else 0
     buf = _HTR_GDN_SCRATCH.get(idx)
-    if buf is None or buf[1].numel() < need_slots:
-        cap = max(need_slots, 64 * 48 * 8)  # 24576 slots (~12.6 MB), avoids realloc during HIP graph capture
+    if buf is None or buf[2].numel() < need_slots:
+        cap = max(need_slots, 64 * 48 * 8)  # 24576 slots (~13 MB), avoids realloc during HIP graph capture
         buf = (
             torch.empty((cap, 128), dtype=torch.float32, device=dev),
-            torch.zeros((cap,), dtype=torch.float32, device=dev),
+            torch.empty((cap * 4,), dtype=torch.float32, device=dev),
             torch.zeros((cap,), dtype=torch.int32, device=dev),
         )
         _HTR_GDN_SCRATCH[idx] = buf
@@ -184,6 +191,35 @@ def _htr_gdn_spec_fused_impl(
         vb = 4 if num_reqs <= 1 else (2 if num_reqs == 2 else 1)
     so, ssq, cnt = _get_htr_gdn_scratch(out.device, num_reqs * HV * max_T)
     act_mode = 0 if output_gate_activation == "sigmoid" else 1
+    use_defer = (
+        _HTR_GDN_DEFER_COMMIT
+        and max_T > 1
+        and num_accepted_tokens is not None
+        and mixed_qkv.size(0) <= _HTR_GDN_DEFER_CAP_TOKENS
+    )
+    if use_defer:
+        dev_i = out.device.index if out.device.index is not None else 0
+        slot_key = (dev_i, state.data_ptr())
+        entry = _HTR_GDN_DEFER_SLOTS.get(slot_key)
+        if entry is None:
+            cap_t = max(_HTR_GDN_DEFER_CAP_TOKENS, 64)
+            vr_k = torch.empty((cap_t, H, 128), dtype=torch.float32, device=out.device)
+            vr_v = torch.empty((cap_t, HV, 128), dtype=torch.bfloat16, device=out.device)
+            vr_d = torch.empty((cap_t, HV), dtype=torch.float32, device=out.device)
+            vr_b = torch.empty((cap_t, HV), dtype=torch.float32, device=out.device)
+            entry = (state, vr_k, vr_v, vr_d, vr_b, H, HV)
+            _HTR_GDN_DEFER_SLOTS[slot_key] = entry
+            _HTR_GDN_DEFER_PTR_CACHE.clear()
+        _, vr_k, vr_v, vr_d, vr_b, _, _ = entry
+        mod.gdn_spec_fused_defer(
+            mixed_qkv, a, b, A_log, dt_bias,
+            state_indices, cu_seqlens, num_accepted_tokens,
+            state, output_gate, norm_weight, out,
+            so, ssq, cnt,
+            vr_k, vr_v, vr_d, vr_b,
+            H, HV, float(scale), float(norm_eps), act_mode, vb,
+        )
+        return out
     mod.gdn_spec_fused(
         mixed_qkv, a, b, A_log, dt_bias,
         state_indices, cu_seqlens, num_accepted_tokens,
@@ -192,6 +228,50 @@ def _htr_gdn_spec_fused_impl(
         H, HV, float(scale), float(norm_eps), act_mode, vb,
     )
     return out
+
+
+def commit_deferred_gdn_spec_step(
+    state_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor,
+    prev_num_accepted: torch.Tensor | None,
+    new_num_sampled: torch.Tensor,
+    num_spec_decodes: int,
+) -> bool:
+    """V5-G5: Single-launch multi-layer GDN state commit across all deferred layers."""
+    if not (_HTR_GDN_FUSED_SPEC and _HTR_GDN_DEFER_COMMIT) or num_spec_decodes <= 0:
+        return False
+    dev = state_indices.device
+    dev_i = dev.index if dev.index is not None else 0
+    slots = [v for (di, _), v in _HTR_GDN_DEFER_SLOTS.items() if di == dev_i]
+    if not slots:
+        return False
+    ptr_sig = tuple(s[0].data_ptr() for s in slots)
+    cache_key = (dev_i, ptr_sig)
+    cached = _HTR_GDN_DEFER_PTR_CACHE.get(cache_key)
+    if cached is None:
+        rows = [
+            [s[0].data_ptr(), s[1].data_ptr(), s[2].data_ptr(),
+             s[3].data_ptr(), s[4].data_ptr(), int(s[0].stride(0))]
+            for s in slots
+        ]
+        ptr_tbl = torch.tensor(rows, dtype=torch.int64, device=dev)
+        H0, HV0 = slots[0][5], slots[0][6]
+        cached = (ptr_tbl, H0, HV0)
+        _HTR_GDN_DEFER_PTR_CACHE[cache_key] = cached
+    ptr_tbl, H0, HV0 = cached
+    vb = int(_HTR_GDN_DEFER_COMMIT_VB) if _HTR_GDN_DEFER_COMMIT_VB in ("1", "2", "4") else 2
+    mod = _load_htr_gdn_fused()
+    mod.gdn_commit_all_layers(
+        ptr_tbl,
+        state_indices[:num_spec_decodes],
+        cu_seqlens[: num_spec_decodes + 1],
+        prev_num_accepted[:num_spec_decodes] if prev_num_accepted is not None else None,
+        new_num_sampled[:num_spec_decodes],
+        H0,
+        HV0,
+        vb,
+    )
+    return True
 
 
 def supports_fused_mtp_decode() -> bool:
@@ -1040,7 +1120,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and self.norm.weight.dtype in (torch.bfloat16, torch.float32)
         )
         if use_fused_gdn_spec_decode:
-            core_attn_out = torch.zeros(
+            core_attn_out = (torch.empty if (_DIRECT_GDN_EMPTY or _HTR_GDN_FUSED_SPEC) else torch.zeros)(
                 (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),
                 dtype=hidden_states.dtype,
                 device=hidden_states.device,
