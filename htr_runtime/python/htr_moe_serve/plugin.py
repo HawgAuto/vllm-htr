@@ -158,7 +158,7 @@ def _method_class():
             if not (K6W_ON and K6W_SHARED and self._ready and shared_experts is not None):
                 return False
             T = x.shape[0]
-            if T not in K6W_ROWS or x.dtype != torch.bfloat16 or x.ndim != 2 or x.shape[1] != 2560:
+            if T > K6W_SHARED_MAX_T or T not in K6W_ROWS or x.dtype != torch.bfloat16 or x.ndim != 2 or x.shape[1] != 2560:
                 return False
             ar = self.ar
             if ar.get('sh_g', -1) == 512:
@@ -349,6 +349,7 @@ def register():
 # Default OFF: with HTR_MOE_K6 unset no wrapper is installed and routing is byte-identical.
 K6W_ON = os.environ.get('HTR_MOE_K6') == '1'
 K6W_SHARED = os.environ.get('HTR_MOE_K6_SHARED') == '1'
+K6W_SHARED_MAX_T = int(os.environ.get('HTR_MOE_K6_SHARED_MAX_T', '4'))
 _K6W_SCR = {}
 
 
