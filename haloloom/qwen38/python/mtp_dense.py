@@ -26,9 +26,32 @@ DDN_LARGE_SHAPES=frozenset({(320,10240),(640,2560),(1280,2560),(2560,640),(2560,
 # (M=1..64, 53-75 VGPRs, 0 spills, 12-16w/SIMD, split-K) + fused MTP HC + skip 54x/step isfinite asserts.
 _HTR_MTP_DDN_V2 = _ddn_os.environ.get("HTR_MTP_DDN_V2") == "1"
 _HTR_MTP_DDN_V2_MAX_M = int(_ddn_os.environ.get("HTR_MTP_DDN_V2_MAX_M", "64"))
+_HTR_MTP_DDN_WMMA = _ddn_os.environ.get("HTR_MTP_DDN_WMMA") == "1"
 _V2_EXT = None
+_WMMA_EXT = None
 _V2_REGISTRY = []
 _V2_OPS_REGISTERED = False
+
+
+def _mtp_ddn_wmma_ext():
+    global _WMMA_EXT
+    if _WMMA_EXT is None:
+        import importlib.util
+        cand = _ddn_os.environ.get("HTR_MTP_DDN_WMMA_SO")
+        if not cand:
+            for d in (_ddn_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"),
+                      "/opt/vllm-htr/native-proto"):
+                p_so = _ddn_os.path.join(d, "htr_mtp_ddn_wmma.so")
+                if _ddn_os.path.isfile(p_so):
+                    cand = p_so
+                    break
+        if not cand or not _ddn_os.path.isfile(cand):
+            raise FileNotFoundError(f"HTR_MTP_DDN_WMMA=1 requires htr_mtp_ddn_wmma.so (checked {cand})")
+        spec = importlib.util.spec_from_file_location("htr_mtp_ddn_wmma", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _WMMA_EXT = mod
+    return _WMMA_EXT
 
 def _mtp_ddn_v2_ext():
     global _V2_EXT
@@ -62,6 +85,8 @@ def _ensure_v2_ops():
             return a.new_empty((0, w.shape[0]))
         if m <= _HTR_MTP_DDN_V2_MAX_M:
             return _mtp_ddn_v2_ext().ddn_gemv_v2(a, w, s)
+        if _HTR_MTP_DDN_WMMA:
+            return _mtp_ddn_wmma_ext().ddn_prefill_wmma_v2(a.contiguous(), w, s)
         method = _V2_REGISTRY[layer_id]
         return method._ddn_reference(method.layer, a)
 
@@ -78,6 +103,10 @@ def _ensure_v2_ops():
             lora, inj = _mtp_ddn_v2_ext().ddn_hc_down_inject_silu_v2(xn, w_dn, s_dn, w_in, s_in, hc_count)
             return lora, inj
         from vllm.models.qwen4_exp.amd.ops.hc import hc_silu
+        if _HTR_MTP_DDN_WMMA:
+            ext = _mtp_ddn_wmma_ext()
+            xnc = xn.contiguous()
+            return hc_silu(ext.ddn_prefill_wmma_v2(xnc, w_dn, s_dn), hc_count), ext.ddn_prefill_wmma_v2(xnc, w_in, s_in)
         m_dn = _V2_REGISTRY[dn_id]
         m_in = _V2_REGISTRY[in_id]
         lora = hc_silu(m_dn._ddn_reference(m_dn.layer, xn), hc_count)
@@ -99,6 +128,8 @@ def _ensure_v2_ops():
             lora, _ = _mtp_ddn_v2_ext().ddn_hc_down_inject_silu_v2(xn, w_dn, s_dn, None, None, hc_count)
             return lora
         from vllm.models.qwen4_exp.amd.ops.hc import hc_silu
+        if _HTR_MTP_DDN_WMMA:
+            return hc_silu(_mtp_ddn_wmma_ext().ddn_prefill_wmma_v2(xn.contiguous(), w_dn, s_dn), hc_count)
         m_dn = _V2_REGISTRY[dn_id]
         return hc_silu(m_dn._ddn_reference(m_dn.layer, xn), hc_count)
 
@@ -115,6 +146,9 @@ def _ensure_v2_ops():
         if m <= _HTR_MTP_DDN_V2_MAX_M and hc_count == 4 and lora.shape[1] == 320:
             return _mtp_ddn_v2_ext().ddn_hc_up_gatemix_v2(xn, lora, w_up, s_up)
         from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix
+        if _HTR_MTP_DDN_WMMA:
+            gate = _mtp_ddn_wmma_ext().ddn_prefill_wmma_v2(lora.contiguous(), w_up, s_up)
+            return hc_gate_mix(xn, gate, hc_count)
         m_up = _V2_REGISTRY[up_id]
         gate = m_up._ddn_reference(m_up.layer, lora)
         return hc_gate_mix(xn, gate, hc_count)
@@ -142,15 +176,13 @@ def _ensure_v2_ops():
                 hidden_states.contiguous(), nw_hid.contiguous(), w_hid, s_hid,
                 hc_count, float(eps),
             )
-        # Prefill fallback (T > 16): exact unfused GemmaRMSNorm + _ddn_reference + broadcast add
+        # Prefill fallback (T > 16): GemmaRMSNorm + V2/WMMA or _ddn_reference + broadcast add
         ie_f = inputs_embeds.float()
-        ie_n = (ie_f * torch.rsqrt(ie_f.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + nw_emb.float())).to(inputs_embeds.dtype)
-        m_emb = _V2_REGISTRY[emb_id]
-        emb_out = m_emb._ddn_reference(m_emb.layer, ie_n)
+        ie_n = (ie_f * torch.rsqrt(ie_f.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + nw_emb.float())).to(inputs_embeds.dtype).contiguous()
+        emb_out = _run_ddn_v2(ie_n, w_emb, s_emb, emb_id)
         hs_f = hidden_states.float()
-        hs_n = (hs_f * torch.rsqrt(hs_f.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + nw_hid.float())).to(hidden_states.dtype)
-        m_hid = _V2_REGISTRY[hid_id]
-        hid_out = m_hid._ddn_reference(m_hid.layer, hs_n.view(t * hc_count, -1)).view(t, hc_count, -1)
+        hs_n = (hs_f * torch.rsqrt(hs_f.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + nw_hid.float())).to(hidden_states.dtype).contiguous()
+        hid_out = _run_ddn_v2(hs_n.view(t * hc_count, -1), w_hid, s_hid, hid_id).view(t, hc_count, -1)
         return (emb_out.unsqueeze(-2) + hid_out).flatten(-2)
 
     def _fake_prefc_fuse(
