@@ -1,4 +1,54 @@
-# vLLM HTR — v0.2.4
+# vLLM HTR — v0.2.5
+
+Native HTR serving for **AMD Strix Halo / gfx1151**, shipping the full clean-slate
+Wave32 HIP/HSACO optimization stack (**18 new native binaries** + **38 runtime updates**):
+**K6 routed-MoE `rows=1..16` with zero-realloc shared-expert folding (`T<=4`)**,
+**HPF4 MoE prefill**, **nontemporal `global_load_b128` K4 `lm_head`**, **dense WMMA**,
+**fused GDN MTP spec decode**, **`hiphc_v2` fused HyperConnection**, **QSA native decode
+union (BF16 / INT8 / INT4 KV) & fused canon-expand**, **`ple_gather_v25` + native PLE
+short-conv/gate-norm**, **MTP DDN v2/WMMA + BF16 GEMV**, and **native Q38 filter +
+Gumbel + sparse rejection sampling**. Weights, tokenizer/configuration and checkpoint
+sampling defaults are unchanged.
+
+[Run v0.2.5](htr_runtime/docs/optimized-serving.md) · [Htr5Core model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Exact results and release notes](htr_runtime/releases/v0.2.5/README.md) · [Release history](RELEASES.md)
+
+```sh
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:daa6b2847bf9678e2de39b8b216105ffe13313e50db889f002f5f918e581d193
+```
+
+Version alias: `ghcr.io/hawgauto/vllm-htr:v0.2.5`. Ordinary `vllm serve` receives all
+v0.2.5 optimizations by default via `runtime-env.json` with zero extra `-e` flags.
+
+## What v0.2.5 brings
+
+Verified back-to-back on exclusive AMD Strix Halo (`gfx1151`), Htr5Core, MTP3, `max-model-len=32768`, `4 GiB` KV cache:
+
+### BF16 KV (`--max-num-seqs 4`, `--max-num-batched-tokens 3200`)
+| Workload | Stock v0.2.4 | **v0.2.5 (ARM 7g)** | **v0.2.5 Zero-Overlay Gate** | **Change vs v0.2.4** |
+|---|---:|---:|---:|---:|
+| Greedy `c=1` decode (`128 tok`) | 42.21 tok/s (`55.7 ms/st`) | **44.60 tok/s** (`51.8 ms/st`) | 43.05 tok/s | **+5.7% tok/s / +7.6% step** |
+| `c=1` decode step latency (`256 tok`) | 58.0–58.4 ms/st | **54.6–55.0 ms/st** | — | **+6.2%–+6.3% step speed** |
+| `4K` decode (`5,812` ctx, `128 tok`) | 54.59 tok/s | 59.21 tok/s | **59.56 tok/s** | **+8.5%–+9.1%** |
+| `4K` prefill (`5,812 tok`) | 977.7 tok/s | **983.9 tok/s** | 907.0 tok/s | **+0.6%** |
+| `c=4` concurrent (`t=0.7`, `4×256`) — sum decode | 71.33 tok/s | 91.61 tok/s | **100.50 tok/s** | **+28.4%–+40.9%** |
+| `c=4` concurrent (`t=0.7`, `4×256`) — wall agg | 51.44 tok/s (`19.91 s`) | **69.99 tok/s** (`14.63 s`) | 68.66 tok/s (`14.91 s`) | **+33.5%–+36.1%** |
+| `c=4` greedy (`t=0.0`, `4×256`) — sum decode | 80.37 tok/s (`15.59 s`) | 97.94 tok/s (`12.73 s`) | **109.90 tok/s** (`11.68 s`) | **+21.9%–+36.7%** |
+| MTP3 acceptance rate | 69.96% (`3.10 tok/st`) | **73.80%** (`3.21 tok/st`) | 71.60% (`3.15 tok/st`) | **+1.6–+3.8 pp** |
+
+### INT8 KV Long-Context & High-Concurrency (`--kv-cache-dtype int8_per_token_head`, `--max-num-seqs 8`)
+| Workload | v0.2.4 KV8 | **v0.2.5 KV8 (+ V5-Q4)** | **Change** |
+|---|---:|---:|---:|
+| Greedy `c=1` decode (`128 tok`) | 43.18 tok/s | **45.05 tok/s** | **+4.3%** |
+| `13K` long-context prefill (`13,017 tok`) | 409.6 tok/s (`31.78 s`) | **551.9 tok/s** (`23.58 s`) | **+34.7%** |
+| `13K` long-context decode (`13,017` ctx) | 43.39 tok/s | **63.92 tok/s** | **+47.3%** |
+| `c=4 × 4K` (`16,702` ctx) — wall time / agg | 33.99 s (`15.06 tok/s`) | **23.82 s** (`21.49 tok/s`) | **+42.7%** |
+| `c=8` high-concurrency — sum decode (`8×128`) | 103.96 tok/s | **132.18 tok/s** | **+27.1%** |
+| `c=8` high-concurrency — wall agg (`8×128`) | 44.76 tok/s (`22.88 s`) | **53.80 tok/s** (`19.03 s`) | **+20.2%** |
+
+Executable source: [`c427a3851ac6e84177a236c17e9ed38303504814`](https://github.com/HawgAuto/vllm-htr/tree/c427a3851ac6e84177a236c17e9ed38303504814).
+Full manifest & notes: [v0.2.5 README](htr_runtime/releases/v0.2.5/README.md) · [V025-NATIVE-MANIFEST.json](htr_runtime/V025-NATIVE-MANIFEST.json).
+
+## Preserved v0.2.4 release
 
 Native HTR serving for **AMD Strix Halo / gfx1151**, with **K6 routed-MoE decode**,
 **dense WMMA at eligible 9–15 rows**, and the **PLE zero-row startup repair**.

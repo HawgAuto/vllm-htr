@@ -1,5 +1,13 @@
 # vLLM HTR release history
 
+## v0.2.5
+
+- **Image:** `ghcr.io/hawgauto/vllm-htr@sha256:daa6b2847bf9678e2de39b8b216105ffe13313e50db889f002f5f918e581d193` (alias `ghcr.io/hawgauto/vllm-htr:v0.2.5`)
+- **Executable source:** `c427a3851ac6e84177a236c17e9ed38303504814`
+- **Highlights:** 18 new native `gfx1151` Wave32 `.so`/`.hsaco` binaries + 38 runtime updates enabled by default (`runtime-env.json`).
+- **Verified served gains vs `v0.2.4`:** BF16 KV `c=1` `+5.7%` (`+7.6%` step speed), `4K` decode `+8.5%–+9.1%`, `c=4` `+28.4%–+40.9%` sum decode / `+33.5%–+36.1%` wall agg; INT8 KV (`int8_per_token_head` + `V5-Q4` decode union) `13K` prefill `+34.7%`, `13K` decode `+47.3%`, `c=4×4K` wall `+42.7%`, `c=8` sum decode `+27.1%`.
+- **Details:** [htr_runtime/releases/v0.2.5/README.md](htr_runtime/releases/v0.2.5/README.md)
+
 ## v0.2.4 — single-stream decode and PLE startup repair
 
 K6 routed-MoE decode at2–4 rows and dense WMMA at eligible9–15 rows are now runtime defaults. Async PLE row limit0 safely disables its path; the self-check wait is bounded. The empty-workspace cold-start repair is included. Weights, tokenizer/configuration and sampling defaults are unchanged.

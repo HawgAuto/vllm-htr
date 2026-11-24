@@ -1,4 +1,4 @@
-# HTR v0.2.4 optimized serving
+# HTR v0.2.5 optimized serving
 
 This serving update keeps the v0.2.2 engine, model weights, KV formats and native
 vLLM interface. It makes the retained concurrency stack the runtime default:
@@ -23,7 +23,7 @@ unfinished concurrency changes and persistent unpacked weight shadows are not
 part of this release. v0.2.4 improves single-stream decode in the selected-stack
 screens; 2–4-stream changes vary by workload, including a −5.60% steady two-stream
 result. No multi-stream or prefill win is established. See the [versioned
-release evidence](../releases/v0.2.4/README.md) for exact conditions and the known
+release evidence](../releases/v0.2.5/README.md) for exact conditions and the known
 seed42 looping limitation. The historical throughput targets remain unmet.
 
 ## Native controls
@@ -33,7 +33,7 @@ sampling, context, KV budget, concurrency and speculation flags remain native.
 Pull the qualified image first (no registry login required):
 
 ```sh
-docker pull ghcr.io/hawgauto/vllm-htr@sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:daa6b2847bf9678e2de39b8b216105ffe13313e50db889f002f5f918e581d193
 ```
 
 Then start it:
@@ -41,9 +41,9 @@ Then start it:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5
+IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:daa6b2847bf9678e2de39b8b216105ffe13313e50db889f002f5f918e581d193
 MODEL=${MODEL:-"$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"}
-WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v024"}
+WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v025"}
 mkdir -p "$WORKSPACE"
 exec docker run --rm --init --pull=never --name vllm-htr \
   --device /dev/kfd --device /dev/dri/renderD128 \
