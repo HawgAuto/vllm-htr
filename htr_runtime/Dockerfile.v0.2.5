@@ -1,0 +1,13 @@
+ARG BASE=ghcr.io/hawgauto/vllm-htr@sha256:cbd537589cc7f2e6e9d73940d5da49a9d956ffbfd795277f54b15787284eeab5
+FROM ${BASE}
+USER root
+COPY payload /payload
+RUN /opt/venv/bin/python3 /payload/install_v025.py
+ARG SOURCE_REVISION=unknown
+LABEL org.opencontainers.image.version="0.2.5" \
+      org.opencontainers.image.source="https://github.com/HawgAuto/vllm-htr" \
+      org.opencontainers.image.revision="${SOURCE_REVISION}" \
+      org.opencontainers.image.description="HTR v0.2.5 gfx1151 clean-slate optimization stack: K6 1-16 + zero-realloc shared fold, HPF4 prefill, K4 B128 lm_head, dense WMMA, GDN fused MTP spec, hiphc_v2, QSA decode union (BF16/INT8/INT4 KV) & canon-expand, PLE v2.5 + native conv/norm, MTP DDN v2/WMMA, BF16 GEMV, native Q38 filter & sparse rejection"
+USER 1000:1000
+WORKDIR /workspace
+ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]

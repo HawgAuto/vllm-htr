@@ -1,0 +1,78 @@
+{
+  "schema": "htr-v025-native-manifest-v1",
+  "target": "gfx1151",
+  "binaries": {
+    "htr_moe_k6_shx.so": {
+      "sha256": "7f8c06c0b16662de0e347a70e46fa166fa7fa9b340a4d36fafccb65615844a86",
+      "bytes": 987384
+    },
+    "hpf4_bm16.so": {
+      "sha256": "fccd201a398431a33e556e41328440bedcf804248dc1b7c9bda64d79295844a9",
+      "bytes": 380840
+    },
+    "k5_splitplane.so": {
+      "sha256": "9ab6c784c7cbf39f2ed81b248d925da669039fd3091736a8f39d7a0b9de41ff3",
+      "bytes": 1204928
+    },
+    "htr_dense_prefill_wmma.so": {
+      "sha256": "1485f2307d8c7c3bd30a796d87f371874aab24dfd4aca440c5ab2887fd029718",
+      "bytes": 391232
+    },
+    "htr_gdn_spec_fused.so": {
+      "sha256": "2d8b45675832fcea62748909f8d234ea0e09f743175e67cb9a9acc3870facf6a",
+      "bytes": 625408
+    },
+    "htr_causal_conv1d_update.so": {
+      "sha256": "4138b91046bafccd58dcdff9d09a8267ab37b5e179fe632aea2b54ddee376b3c",
+      "bytes": 335016
+    },
+    "hiphc_v2.so": {
+      "sha256": "15c5f70a6faaf03e47ae50f42030be088615557b516e1944a3b5013b8d9ba324",
+      "bytes": 1185608
+    },
+    "qsa_decode_union.hsaco": {
+      "sha256": "1db342131f05a00e9f3474fc3d14fac218ff631890b57d9d3cd9d3b0bf64b056",
+      "bytes": 47336
+    },
+    "qsa_decode_union_kv8.hsaco": {
+      "sha256": "e3ad10a0ffee3ca88436e677c4562736768c16db109141e0aa6a8223ec003a6b",
+      "bytes": 50928
+    },
+    "qsa_decode_union_kv4.hsaco": {
+      "sha256": "60022aade79de348a057021c74449e40fc1781e59843495fde95cbb5c77fd0d1",
+      "bytes": 83016
+    },
+    "qsa_canon_expand_fused.hsaco": {
+      "sha256": "3d36e7f5f20c1d67bcd0b8cd0d18aa76c1aad16ad2649555380c7f1e5ff2af05",
+      "bytes": 13560
+    },
+    "htr_ple_short_conv.so": {
+      "sha256": "ca8c2f8f9fc986d10e0a6a3ca2c535d855c78ba1daf1f32343f4a4d3262e22ce",
+      "bytes": 334232
+    },
+    "ple_gather_v25.so": {
+      "sha256": "03f76e9a1f66ba67b2cf56da9dd1cd85b3dacefd249bab9f5bf261d09cf99b1e",
+      "bytes": 26160
+    },
+    "htr_mtp_ddn_v2.so": {
+      "sha256": "0c7ee015516ac3f4d40a119a8f57bef6aa2a443a4bc0ec421c3673562eb58cdb",
+      "bytes": 607280
+    },
+    "htr_mtp_ddn_wmma.so": {
+      "sha256": "666a5ae8f92c42321aed215250b77680841ea50fef4c78dc61888c74b05e5d27",
+      "bytes": 288544
+    },
+    "htr_bf16_gemv.so": {
+      "sha256": "dfe27e0a906ae875833982765b02801022ee689f2a5f53f33e62eef790378d77",
+      "bytes": 326016
+    },
+    "htr_q38_filter.so": {
+      "sha256": "1e6dddb0d8b4e746d9e52b746a233c5588e35cddeee55b92e0edfbb2ccc440a5",
+      "bytes": 410216
+    },
+    "htr_spec_sample.so": {
+      "sha256": "5ad527b60215ae96650f8c746ea791c393038eed57828200e86c29c0f398305b",
+      "bytes": 737480
+    }
+  }
+}
