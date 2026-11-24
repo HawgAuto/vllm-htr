@@ -23,8 +23,34 @@ import sys
 
 _PATCHED = False
 KC = 64
-_STATE = {"sampling_states": None}
+_STATE = {"sampling_states": None, "draft_sparse": {}}
 _Q38_FILTER_NATIVE_EXT = None
+_SPEC_SAMPLE_EXT = None
+
+
+def _q38_filter_gumbel_fused_enabled():
+    return os.environ.get("HTR_Q38_FILTER_GUMBEL_FUSED") == "1"
+
+
+def _spec_sample_ext():
+    global _SPEC_SAMPLE_EXT
+    if _SPEC_SAMPLE_EXT is None:
+        import importlib.util
+        cand = os.environ.get("HTR_SPEC_SAMPLE_SO")
+        if not cand:
+            for d in (os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"),
+                      "/opt/vllm-htr/native-proto"):
+                p_so = os.path.join(d, "htr_spec_sample.so")
+                if os.path.isfile(p_so):
+                    cand = p_so
+                    break
+        if not cand or not os.path.isfile(cand):
+            raise FileNotFoundError(f"HTR_Q38_FILTER_GUMBEL_FUSED=1 requires htr_spec_sample.so (checked {cand})")
+        spec = importlib.util.spec_from_file_location("htr_spec_sample", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _SPEC_SAMPLE_EXT = mod
+    return _SPEC_SAMPLE_EXT
 
 
 def _q38_filter_native_enabled():
@@ -136,6 +162,40 @@ def _patch_mrv2():
                                draft_logits)
         tk, tp = _bufs(self)
         logits = self.model.compute_logits(hidden_states)
+        if (
+            _q38_filter_gumbel_fused_enabled()
+            and self.draft_watermarker is None
+            and getattr(self, "acceptance_estimator", None) is None
+            and logits.is_cuda
+            and logits.dim() == 2
+            and logits.dtype in (torch.bfloat16, torch.float32)
+            and logits.shape[1] >= 256
+        ):
+            max_reqs, num_steps = draft_logits.shape[0], draft_logits.shape[1]
+            sp = getattr(self, "_q38_sparse_bufs", None)
+            if sp is None or sp[0].shape[0] != max_reqs or sp[0].shape[1] != num_steps:
+                dev = draft_logits.device
+                sp = (
+                    torch.full((max_reqs, num_steps, KC), -1, dtype=torch.int32, device=dev),
+                    torch.full((max_reqs, num_steps, KC), float("-inf"), dtype=torch.float32, device=dev),
+                    torch.zeros((max_reqs, num_steps), dtype=torch.int32, device=dev),
+                )
+                self._q38_sparse_bufs = sp
+            _STATE["draft_sparse"][draft_logits.data_ptr()] = sp
+            write_dense = os.environ.get("HTR_SPARSE_REJECTION_ZERO_DENSE") != "1"
+            sampled = _spec_sample_ext().q38_filter_gumbel_sample_native(
+                logits.contiguous(),
+                draft_logits if write_dense else None,
+                draft_step,
+                sp[0], sp[1], sp[2],
+                idx_mapping, self.temperature, tk, tp, seeds, sample_src_positions,
+                int(num_steps), bool(write_dense), bool(self.use_fp64_gumbel),
+            )
+            if calls["n"] < 4:
+                calls["n"] += 1
+                capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+                _log(f"Q38SPEC V5-S3 fused_filter_gumbel rows={logits.shape[0]} capturing={capturing} write_dense={write_dense}")
+            return sampled
         logits = q38_filter_logits(logits, idx_mapping, self.temperature, tk, tp, in_place=True)
         sampled = sp_mod.gumbel_sample(
             logits, idx_mapping, temperature, seeds, sample_src_positions,
