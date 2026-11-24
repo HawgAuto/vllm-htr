@@ -120,7 +120,7 @@ def dequant_layer(ar, w13, w2):
     for role, (dst, row) in enumerate(((w13, 0), (w13, A.I), (w2, 0))):
         r = A.ROLES[role]
         m, n = A.GEOM[r]
-        D.dq_arena(ar['qw'], ar['qoff'], ar['scales'], ar['su'], ar['sv'], cb, K, role, pad, m, n, A.SC_OFF[r], A.SC_ES,
+        D.dq_arena(ar['qw'], ar['qoff'][:A.NE], ar['scales'], ar['su'], ar['sv'], cb, K, role, pad, m, n, A.SC_OFF[r], A.SC_ES,
                    A.SU_OFF[r], A.SU_ES, A.SV_OFF[r], A.SV_ES, dst, dst.stride(0), row)
     return w13, w2
 
