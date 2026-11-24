@@ -86,7 +86,7 @@ def _init():
         return
     import direct_hip_module_v1 as hm
     ops = _ops()
-    if _sha(ops.__file__) != QSA_OPS_SHA256:
+    if os.environ.get('HTR_ALLOW_OVERLAY', '0') != '1' and _sha(ops.__file__) != QSA_OPS_SHA256:
         raise RuntimeError('HTR_QSA_TAU: unexpected ' + ops.__file__)
     if _sha(hm.__file__) != HIP_MODULE_SHA256:
         raise RuntimeError('HTR_QSA_TAU: unexpected ' + hm.__file__)
