@@ -35,6 +35,30 @@ from vllm.transformers_utils.configs.qwen4_exp import (
 )
 from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
+import os
+_HTR_PLE_SHORT_CONV_NATIVE = os.environ.get("HTR_PLE_SHORT_CONV_NATIVE") == "1"
+_PLE_SC_EXT = None
+
+def _ple_short_conv_ext():
+    global _PLE_SC_EXT
+    if _PLE_SC_EXT is None:
+        import importlib.util
+        cand = os.environ.get("HTR_PLE_SHORT_CONV_SO")
+        if not cand:
+            for d in (os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"),
+                      "/opt/vllm-htr/native-proto"):
+                p_so = os.path.join(d, "htr_ple_short_conv.so")
+                if os.path.isfile(p_so):
+                    cand = p_so
+                    break
+        if not cand or not os.path.isfile(cand):
+            raise FileNotFoundError(f"HTR_PLE_SHORT_CONV_NATIVE=1 requires htr_ple_short_conv.so (checked {cand})")
+        spec = importlib.util.spec_from_file_location("htr_ple_short_conv", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _PLE_SC_EXT = mod
+    return _PLE_SC_EXT
+
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
@@ -921,6 +945,29 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         state_indices_tensor_d: torch.Tensor,
         has_initial_states_d: torch.Tensor | None,
     ) -> torch.Tensor:
+        if (
+            _HTR_PLE_SHORT_CONV_NATIVE
+            and self.short_conv_dilation == 3
+            and self.conv_state_len == 9
+            and x_d.is_cuda
+            and x_d.dtype == torch.bfloat16
+            and conv_weights.dtype == torch.bfloat16
+            and conv_weights.shape[-1] == 4
+            and conv_state.dtype in (torch.bfloat16, torch.float32)
+        ):
+            init_slice = (
+                has_initial_states_d[: state_indices_tensor_d.numel()]
+                if has_initial_states_d is not None
+                else None
+            )
+            return _ple_short_conv_ext().ple_short_conv_decode_k4d3(
+                x_d.contiguous(),
+                conv_state,
+                conv_weights.contiguous(),
+                state_indices_tensor_d,
+                init_slice,
+                NULL_BLOCK_ID,
+            )
         state_indices = state_indices_tensor_d.to(
             device=conv_state.device, dtype=torch.int64
         )
@@ -1130,6 +1177,32 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         num_accepted_tokens: torch.Tensor,
         spec_query_len: int,
     ) -> torch.Tensor:
+        if (
+            _HTR_PLE_SHORT_CONV_NATIVE
+            and self.short_conv_dilation == 3
+            and self.conv_state_len == 9
+            and x_spec.is_cuda
+            and x_spec.dtype == torch.bfloat16
+            and conv_weights.dtype == torch.bfloat16
+            and conv_weights.shape[-1] == 4
+            and conv_state.dtype in (torch.bfloat16, torch.float32)
+        ):
+            num_reqs = spec_state_indices_tensor.numel()
+            if conv_state.size(-1) < self.conv_state_len + spec_query_len - 1:
+                raise RuntimeError(
+                    "PLE short-conv cache cannot retain speculative tokens: "
+                    f"got {conv_state.size(-1)}, need {self.conv_state_len + spec_query_len - 1}."
+                )
+            return _ple_short_conv_ext().ple_short_conv_spec_k4d3(
+                x_spec.contiguous(),
+                conv_state,
+                conv_weights.contiguous(),
+                spec_state_indices_tensor,
+                spec_query_start_loc[: num_reqs + 1],
+                num_accepted_tokens[:num_reqs],
+                spec_query_len,
+                NULL_BLOCK_ID,
+            )
         """Dilated short-conv for speculative-decode (MTP) requests.
 
         Each spec request feeds multiple (draft + 1) query tokens. The conv

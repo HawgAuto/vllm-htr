@@ -2,7 +2,32 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """AMD ROCm HyperConnection kernels for Qwen4Exp."""
 
+import os
 import torch
+
+_HIPHC_V2_COMBINE = os.environ.get("GP8HC_HIP_V2_COMBINE") == "1"
+_HIPHC_V2_EXT = None
+
+def _hiphc_v2_ext():
+    global _HIPHC_V2_EXT
+    if _HIPHC_V2_EXT is None:
+        import importlib.util
+        cand = os.environ.get("GP8HC_HIP_V2_SO")
+        if not cand:
+            for d in (os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"),
+                      "/opt/vllm-htr/native-proto"):
+                p_so = os.path.join(d, "hiphc_v2.so")
+                if os.path.isfile(p_so):
+                    cand = p_so
+                    break
+        if cand and os.path.isfile(cand):
+            spec = importlib.util.spec_from_file_location("hiphc_v2", cand)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _HIPHC_V2_EXT = mod
+        else:
+            _HIPHC_V2_EXT = False
+    return _HIPHC_V2_EXT or None
 
 from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
@@ -355,6 +380,21 @@ def _hc_combine_norm(
     assert norm_weight.is_contiguous()
     assert norm_weight.numel() in (hc_dim, DIM)
 
+    if (
+        _HIPHC_V2_COMBINE
+        and hc_count == 4
+        and hc_dim == 2560
+        and norm_weight.numel() == DIM
+        and residual.dtype == torch.bfloat16
+        and residual.is_contiguous()
+        and block_output.is_contiguous()
+        and injection_logits.is_contiguous()
+        and N <= 64
+    ):
+        ext = _hiphc_v2_ext()
+        if ext is not None:
+            out_h, y_h = ext.combine_norm(residual, block_output, injection_logits, norm_weight, float(eps), int(hc_count))
+            return out_h, y_h
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
     BLOCK_SIZE = 512
