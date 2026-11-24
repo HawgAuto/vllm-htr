@@ -133,8 +133,10 @@ class Qwen2MoeMLP(nn.Module):
                 and x.dtype == torch.bfloat16
                 and hasattr(self.expert_gate, "weight")
                 and getattr(self.expert_gate, "bias", None) is None
+                and self.expert_gate.weight.dtype == torch.bfloat16
                 and self.expert_gate.weight.ndim == 2
                 and self.expert_gate.weight.shape[0] == 1
+                and self.expert_gate.weight.shape[1] == x.shape[-1]
             ):
                 if _DIRECT_MOE_SHARED_FOLD:
                     import direct_moe_reduction as _dmr
