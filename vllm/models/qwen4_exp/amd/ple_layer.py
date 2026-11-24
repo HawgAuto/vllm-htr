@@ -60,6 +60,48 @@ def _ple_short_conv_ext():
         _PLE_SC_EXT = mod
     return _PLE_SC_EXT
 
+
+def _htr_ple_gate_norm_fused_impl(
+    key: torch.Tensor,
+    query: torch.Tensor,
+    value: torch.Tensor,
+    w_key: torch.Tensor,
+    w_query: torch.Tensor,
+    w_conv: torch.Tensor,
+    hc_count: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return _ple_short_conv_ext().ple_gate_norm_fused(
+        key.contiguous(),
+        query.contiguous(),
+        value.contiguous(),
+        w_key.contiguous(),
+        w_query.contiguous(),
+        w_conv.contiguous(),
+        hc_count,
+        eps,
+    )
+
+
+def _htr_ple_gate_norm_fused_fake(
+    key: torch.Tensor,
+    query: torch.Tensor,
+    value: torch.Tensor,
+    w_key: torch.Tensor,
+    w_query: torch.Tensor,
+    w_conv: torch.Tensor,
+    hc_count: int,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return (torch.empty_like(query), torch.empty_like(query))
+
+
+direct_register_custom_op(
+    op_name="htr_ple_gate_norm_fused",
+    op_func=_htr_ple_gate_norm_fused_impl,
+    fake_impl=_htr_ple_gate_norm_fused_fake,
+)
+
 from vllm.v1.attention.backends.short_conv_attn import (
     PleShortConvAttentionBackend,
     PleShortConvAttentionMetadata,
@@ -1517,13 +1559,13 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
             and key.dtype == torch.bfloat16
             and value.dtype == torch.bfloat16
         ):
-            gv_flat, normalized = _ple_short_conv_ext().ple_gate_norm_fused(
-                key.contiguous(),
-                hidden_states.contiguous(),
-                value.contiguous(),
-                self.norm_key.weight.contiguous(),
-                self.norm_query.weight.contiguous(),
-                self.norm_conv.weight.contiguous(),
+            gv_flat, normalized = torch.ops.vllm.htr_ple_gate_norm_fused(
+                key,
+                hidden_states,
+                value,
+                self.norm_key.weight,
+                self.norm_query.weight,
+                self.norm_conv.weight,
                 self.hc_count,
                 float(self.norm_key.eps),
             )
