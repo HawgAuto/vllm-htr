@@ -152,6 +152,9 @@ from vllm.v1.worker.gpu.spec_decode.adaptive_verification import (
     maybe_create_adaptive_verification_manager,
     resolve_adaptive_cudagraph_mode,
 )
+from vllm.v1.worker.gpu.spec_decode.autoregressive.speculator import (
+    AutoRegressiveSpeculator,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     verify_supports_aux_hidden_states_over_pp,
@@ -2018,6 +2021,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         finished_req_ids = scheduler_output.finished_req_ids
         self.execute_model_state = ExecuteModelState(
+            num_spec_tokens_to_schedule=scheduler_output.num_spec_tokens_to_schedule,
             input_batch=input_batch,
             attn_metadata=attn_metadata,
             slot_mappings_by_layer=slot_mappings_by_layer,
@@ -2056,6 +2060,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         finished_req_ids = self.execute_model_state.finished_req_ids
         ec_connector_output = self.execute_model_state.ec_connector_output
         cudagraph_stats = self.execute_model_state.cudagraph_stats
+        next_draft_depth = self.execute_model_state.num_spec_tokens_to_schedule
         self.execute_model_state = None
 
         if not self.is_last_pp_rank:
@@ -2187,13 +2192,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                     self.sampler._get_contexts(input_batch.idx_mapping),
                     self.sampler.watermarking.gpu[input_batch.idx_mapping],
                 )
-            # V5-D0: honor dynamic speculative depth from scheduler_output when present
-            _sched_spec = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
             _propose_kw = {"dp_sync": dp_sync, "mm_inputs": mm_inputs}
-            if _sched_spec is not None and isinstance(self.speculator, AutoRegressiveSpeculator):
-                _propose_kw["num_spec_tokens"] = int(_sched_spec)
+            if isinstance(self.speculator, AutoRegressiveSpeculator):
+                _propose_kw["num_spec_tokens"] = next_draft_depth
             with use_workspace_lane(self._draft_workspace_lane):
-                if _sched_spec == 0 and isinstance(self.speculator, AutoRegressiveSpeculator):
+                if next_draft_depth == 0 and isinstance(self.speculator, AutoRegressiveSpeculator):
                     draft_tokens = None
                 else:
                     draft_tokens = self.speculator.propose(
@@ -2228,13 +2231,11 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # Spec-decode and diffusion LLMs both use draft tokens but the latter does
             # not have a speculator (i.e. self.speculator is None)
             _dth_drafts = self.req_states.draft_tokens[input_batch.idx_mapping]
-            _dth_k = getattr(scheduler_output, "num_spec_tokens_to_schedule", None)
             if (
-                _dth_k is not None
-                and isinstance(self.speculator, AutoRegressiveSpeculator)
-                and 0 <= int(_dth_k) < _dth_drafts.shape[1]
+                isinstance(self.speculator, AutoRegressiveSpeculator)
+                and 0 <= next_draft_depth < _dth_drafts.shape[1]
             ):
-                _dth_drafts = _dth_drafts[:, : int(_dth_k)]
+                _dth_drafts = _dth_drafts[:, :next_draft_depth]
             self.draft_tokens_handler.set_draft_tokens(
                 input_batch,
                 _dth_drafts,
@@ -2379,6 +2380,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
 
 class ExecuteModelState(NamedTuple):
+    num_spec_tokens_to_schedule: int
     input_batch: InputBatch
     attn_metadata: dict[str, Any] | None
     slot_mappings_by_layer: dict[str, torch.Tensor] | None
