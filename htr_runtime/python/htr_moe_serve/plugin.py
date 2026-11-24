@@ -186,6 +186,9 @@ def _method_class():
                 words.append(q)
                 off += q.numel()
             ar['qw'] = torch.cat(words).contiguous()
+            del words
+            with torch.cuda.device(ar['qw'].device):
+                torch.cuda.empty_cache()
             ar['qoff'] = torch.cat([ar['qoff'], torch.tensor([sh_off], dtype=torch.int64, device=ar['qoff'].device)], dim=0).contiguous()
             ar['scales'] = torch.cat([ar['scales'], gu.htr_scales[:640], gu.htr_scales[640:], dn.htr_scales]).contiguous()
             ar['sv'] = torch.cat([ar['sv'], gu.htr_sv[:80], gu.htr_sv[80:], dn.htr_sv]).contiguous()
