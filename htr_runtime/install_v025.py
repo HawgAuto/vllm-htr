@@ -60,19 +60,8 @@ def main() -> None:
         actual = sha(Path(path_str))
         assert actual == expected, f'grouped-bindings mismatch: {path_str}: {actual} != {expected}'
 
-    # 4. Reconcile installed-files.json, native-policy-bindings.json, quantized-kv-bindings.json, BASE_MANIFEST
-    inst_path = ROOT / 'installed-files.json'
-    if inst_path.is_file():
-        inst = json.loads(inst_path.read_text())
-        for k in list(inst.keys()):
-            p = ROOT / k
-            if p.is_file():
-                inst[k] = sha(p)
-        for name in nat_manifest['binaries']:
-            inst[f'native-bin/{name}'] = sha(nat_dir / name)
-        inst['V025-NATIVE-MANIFEST.json'] = sha(ROOT / 'V025-NATIVE-MANIFEST.json')
-        inst_path.write_text(json.dumps(inst, indent=2, sort_keys=True) + '\n')
-
+    # 4. Reconcile native-policy-bindings.json & quantized-kv-bindings.json FIRST,
+    #    then installed-files.json LAST (since installed-files.json hashes the binding JSONs!)
     for bp_name in ('native-policy-bindings.json', 'quantized-kv-bindings.json'):
         bp = ROOT / bp_name
         if bp.is_file():
@@ -86,6 +75,18 @@ def main() -> None:
                     obj[str(nat_dir / name)] = sha(nat_dir / name)
             bp.write_text(json.dumps(obj, indent=2, sort_keys=True) + '\n')
 
+    inst_path = ROOT / 'installed-files.json'
+    if inst_path.is_file():
+        inst = json.loads(inst_path.read_text())
+        for k in list(inst.keys()):
+            p = ROOT / k
+            if p.is_file():
+                inst[k] = sha(p)
+        for name in nat_manifest['binaries']:
+            inst[f'native-bin/{name}'] = sha(nat_dir / name)
+        inst['V025-NATIVE-MANIFEST.json'] = sha(ROOT / 'V025-NATIVE-MANIFEST.json')
+        inst_path.write_text(json.dumps(inst, indent=2, sort_keys=True) + '\n')
+
     if BASE_MANIFEST.is_file():
         base = json.loads(BASE_MANIFEST.read_text())
         for row in base.get('files', []):
@@ -97,8 +98,12 @@ def main() -> None:
                         row[field] = p.stat().st_size
         BASE_MANIFEST.write_text(json.dumps(base, indent=2) + '\n')
 
-    # Clean up /payload so image stays lean
+    # Clean up /payload and run live verify_installation() self-check at build time!
     shutil.rmtree(PAYLOAD, ignore_errors=True)
+    import sys
+    sys.path.insert(0, str(ROOT / 'python'))
+    import htr_native_policy
+    htr_native_policy.verify_installation()
     print(f'v0.2.5 install complete: {len(file_map)} Python files + {len(nat_manifest["binaries"])} native binaries verified.')
 
 
