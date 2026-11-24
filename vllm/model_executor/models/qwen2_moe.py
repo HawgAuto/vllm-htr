@@ -75,6 +75,11 @@ logger = init_logger(__name__)
 
 import os as _dmf_os
 _DIRECT_MOE_SHARED_FOLD = _dmf_os.environ.get("DIRECT_MOE_SHARED_FOLD") == "1"
+import os as _htr_moe_os
+_HTR_MOE_SHARED_GATE_FUSED = _htr_moe_os.environ.get("HTR_MOE_SHARED_GATE_FUSED") == "1"
+if _HTR_MOE_SHARED_GATE_FUSED:
+    from vllm.models.qwen4_exp.amd.low_latency_gemm import _ensure_bf16_gemv_op
+    _ensure_bf16_gemv_op()
 
 
 class Qwen2MoeMLP(nn.Module):
