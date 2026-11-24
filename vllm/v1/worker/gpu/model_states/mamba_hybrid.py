@@ -99,7 +99,7 @@ class MambaHybridModelState(DefaultModelState):
             and _os.environ.get("HTR_GDN_DEFER_COMMIT", "0") == "1"
         )
         self._htr_gdn_defer_cap_tokens = int(_os.environ.get("HTR_GDN_DEFER_CAP_TOKENS", "128"))
-        self._htr_gdn_defer_step = None
+        self._htr_gdn_defer_steps = []
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.zeros(
                 self.max_num_reqs, dtype=torch.int32, device=self.device
@@ -345,30 +345,26 @@ class MambaHybridModelState(DefaultModelState):
             )
         if self._htr_gdn_defer_enabled:
             if for_capture:
-                self._htr_gdn_defer_step = None
+                self._htr_gdn_defer_steps = []
             else:
-                gdn_md = None
+                steps = []
                 for group_list in attn_groups:
                     for group in group_list:
                         md0 = attn_metadata[group.layer_names[0]]
-                        if hasattr(md0, "spec_state_indices_tensor") and hasattr(md0, "non_spec_state_indices_tensor"):
-                            gdn_md = md0
-                            break
-                    if gdn_md is not None:
-                        break
-                if (
-                    gdn_md is not None
-                    and gdn_md.spec_sequence_masks is not None
-                    and gdn_md.num_prefills == 0
-                    and gdn_md.num_decodes == 0
-                    and gdn_md.num_spec_decodes > 0
-                    and gdn_md.spec_state_indices_tensor is not None
-                    and gdn_md.spec_state_indices_tensor.size(1) > 1
-                    and gdn_md.num_actual_tokens <= self._htr_gdn_defer_cap_tokens
-                ):
-                    self._htr_gdn_defer_step = gdn_md
-                else:
-                    self._htr_gdn_defer_step = None
+                        if (
+                            hasattr(md0, "spec_state_indices_tensor")
+                            and hasattr(md0, "non_spec_state_indices_tensor")
+                            and md0.spec_sequence_masks is not None
+                            and md0.num_prefills == 0
+                            and md0.num_decodes == 0
+                            and md0.num_spec_decodes > 0
+                            and md0.spec_state_indices_tensor is not None
+                            and md0.spec_state_indices_tensor.ndim == 2
+                            and md0.spec_state_indices_tensor.size(1) > 1
+                            and md0.num_actual_tokens <= self._htr_gdn_defer_cap_tokens
+                        ):
+                            steps.append((tuple(group.layer_names), md0))
+                self._htr_gdn_defer_steps = steps
         return attn_metadata
 
     def postprocess_state(
@@ -406,19 +402,21 @@ class MambaHybridModelState(DefaultModelState):
             )
 
         if self._htr_gdn_defer_enabled:
-            gdn_md = self._htr_gdn_defer_step
-            self._htr_gdn_defer_step = None
-            if gdn_md is not None and not isinstance(num_sampled, int):
+            steps = self._htr_gdn_defer_steps
+            self._htr_gdn_defer_steps = []
+            if steps and not isinstance(num_sampled, int):
                 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
                     commit_deferred_gdn_spec_step,
                 )
-                commit_deferred_gdn_spec_step(
-                    state_indices=gdn_md.spec_state_indices_tensor,
-                    cu_seqlens=gdn_md.spec_query_start_loc,
-                    prev_num_accepted=gdn_md.num_accepted_tokens,
-                    new_num_sampled=num_sampled,
-                    num_spec_decodes=gdn_md.num_spec_decodes,
-                )
+                for layer_keys, gdn_md in steps:
+                    commit_deferred_gdn_spec_step(
+                        state_indices=gdn_md.spec_state_indices_tensor,
+                        cu_seqlens=gdn_md.spec_query_start_loc,
+                        prev_num_accepted=gdn_md.num_accepted_tokens,
+                        new_num_sampled=num_sampled,
+                        num_spec_decodes=gdn_md.num_spec_decodes,
+                        layer_keys=layer_keys,
+                    )
 
         if not num_reqs:
             return

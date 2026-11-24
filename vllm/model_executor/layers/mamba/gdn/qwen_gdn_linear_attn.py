@@ -106,10 +106,10 @@ _HTR_GDN_FUSED_SO = os.environ.get(
 _HTR_GDN_MOD = None
 _HTR_GDN_SCRATCH: dict[int, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = {}
 _HTR_GDN_CU_CACHE: dict[tuple[int, int], torch.Tensor] = {}
-# V5-G5 deferred commit state: keyed by (device_idx, state_data_ptr) -> (state, vr_k, vr_v, vr_d, vr_b, H, HV)
-_HTR_GDN_DEFER_SLOTS: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]] = {}
-# Cached device pointer table per (device_idx, tuple_of_state_ptrs) -> (int64[num_layers, 6], H, HV)
-_HTR_GDN_DEFER_PTR_CACHE: dict[tuple[int, tuple[int, ...]], tuple[torch.Tensor, int, int]] = {}
+# V5-G5 deferred commit state: keyed by (device_idx, layer_key) -> (state, vr_k, vr_v, vr_d, vr_b, H, HV)
+_HTR_GDN_DEFER_SLOTS: dict[tuple[int, str | int], tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, int, int]] = {}
+# Cached device pointer table per (device_idx, layer_keys_or_ptrs) -> (int64[num_layers, 6], H, HV)
+_HTR_GDN_DEFER_PTR_CACHE: dict[tuple[int, tuple[str | int, ...]], tuple[torch.Tensor, int, int]] = {}
 
 
 def _load_htr_gdn_fused():
@@ -159,6 +159,8 @@ def _htr_gdn_spec_fused_impl(
     scale: float,
     norm_eps: float,
     output_gate_activation: str,
+    layer_key: str | None = None,
+    allow_defer: bool = True,
 ) -> torch.Tensor:
     HV, V = out.shape[-2:]
     K = state.shape[-1]
@@ -197,6 +199,7 @@ def _htr_gdn_spec_fused_impl(
     act_mode = 0 if output_gate_activation == "sigmoid" else 1
     use_defer = (
         _HTR_GDN_DEFER_COMMIT
+        and allow_defer
         and max_T > 1
         and num_accepted_tokens is not None
         and mixed_qkv.size(0) <= _HTR_GDN_DEFER_CAP_TOKENS
@@ -205,7 +208,7 @@ def _htr_gdn_spec_fused_impl(
         if not _HTR_GDN_DEFER_SLOTS:
             print(f"HTR_GDN_V5G5_DEFER_ACTIVE num_reqs={num_reqs} max_T={max_T} vb={vb} state_stride0={state.stride(0)}", flush=True)
         dev_i = out.device.index if out.device.index is not None else 0
-        slot_key = (dev_i, state.data_ptr())
+        slot_key = (dev_i, layer_key if layer_key is not None else state.data_ptr())
         entry = _HTR_GDN_DEFER_SLOTS.get(slot_key)
         if entry is None:
             cap_t = max(_HTR_GDN_DEFER_CAP_TOKENS, 64)
@@ -242,17 +245,26 @@ def commit_deferred_gdn_spec_step(
     prev_num_accepted: torch.Tensor | None,
     new_num_sampled: torch.Tensor,
     num_spec_decodes: int,
+    layer_keys: tuple[str, ...] | None = None,
 ) -> bool:
-    """V5-G5: Single-launch multi-layer GDN state commit across all deferred layers."""
+    """V5-G5: Single-launch multi-layer GDN state commit across all deferred layers in a KV-cache group."""
     if not (_HTR_GDN_FUSED_SPEC and _HTR_GDN_DEFER_COMMIT) or num_spec_decodes <= 0:
         return False
     dev = state_indices.device
     dev_i = dev.index if dev.index is not None else 0
-    slots = [v for (di, _), v in _HTR_GDN_DEFER_SLOTS.items() if di == dev_i]
+    if layer_keys is not None:
+        slots = [
+            _HTR_GDN_DEFER_SLOTS[(dev_i, lk)]
+            for lk in layer_keys
+            if (dev_i, lk) in _HTR_GDN_DEFER_SLOTS
+        ]
+        cache_sig: tuple[str | int, ...] = layer_keys
+    else:
+        slots = [v for (di, _), v in _HTR_GDN_DEFER_SLOTS.items() if di == dev_i]
+        cache_sig = tuple(s[0].data_ptr() for s in slots)
     if not slots:
         return False
-    ptr_sig = tuple(s[0].data_ptr() for s in slots)
-    cache_key = (dev_i, ptr_sig)
+    cache_key = (dev_i, cache_sig)
     cached = _HTR_GDN_DEFER_PTR_CACHE.get(cache_key)
     if cached is None:
         rows = [
@@ -1977,7 +1989,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         assert num_accepted_tokens is not None
 
         num_requests = attn_metadata.num_spec_decodes
-        fused_mtp_decode_impl()(
+        impl = fused_mtp_decode_impl()
+        extra_kw = (
+            {
+                "layer_key": self.prefix,
+                "allow_defer": (
+                    attn_metadata.num_prefills == 0
+                    and attn_metadata.num_decodes == 0
+                ),
+            }
+            if impl is _htr_gdn_spec_fused_impl
+            else {}
+        )
+        impl(
             mixed_qkv=mixed_qkv,
             a=a,
             b=b,
@@ -1993,6 +2017,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             scale=self.head_k_dim**-0.5,
             norm_eps=self.layer_norm_epsilon,
             output_gate_activation=self.norm.activation,
+            **extra_kw,
         )
 
     def _forward_core_fused_norm_packed(

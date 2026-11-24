@@ -179,21 +179,34 @@ def _method_class():
                 ar['_k6_sh_ineligible'] = True
                 return False
             spad5 = int(R.spadk(ar)[2])
-            off = ar['qw'].numel()
-            words, sh_off = [ar['qw']], []
             g_qw, u_qw, d_qw = gu.htr_qweight[:40], gu.htr_qweight[40:], dn.htr_qweight
+            sh_parts = []
             for q0 in (g_qw, u_qw, d_qw):
                 q = q0.contiguous().view(q0.shape[0], -1)
                 if spad5 > 0:
                     q = torch.cat([q, torch.zeros(q.shape[0], spad5, dtype=q.dtype, device=q.device)], dim=1)
-                q = q.reshape(-1)
-                sh_off.append(off)
-                words.append(q)
-                off += q.numel()
-            ar['qw'] = torch.cat(words).contiguous()
-            del words
-            with torch.cuda.device(ar['qw'].device):
-                torch.cuda.empty_cache()
+                sh_parts.append(q.reshape(-1))
+            sh_need = sum(p.numel() for p in sh_parts)
+            pre_off = ar.get('_sh_qw_off')
+            if pre_off is not None and pre_off + sh_need <= ar['qw'].numel():
+                off = int(pre_off)
+                sh_off = []
+                for p in sh_parts:
+                    n_p = p.numel()
+                    ar['qw'][off:off + n_p].copy_(p)
+                    sh_off.append(off)
+                    off += n_p
+            else:
+                off = ar['qw'].numel()
+                words, sh_off = [ar['qw']], []
+                for p in sh_parts:
+                    sh_off.append(off)
+                    words.append(p)
+                    off += p.numel()
+                ar['qw'] = torch.cat(words).contiguous()
+                del words
+                with torch.cuda.device(ar['qw'].device):
+                    torch.cuda.empty_cache()
             ar['qoff'] = torch.cat([ar['qoff'], torch.tensor([sh_off], dtype=torch.int64, device=ar['qoff'].device)], dim=0).contiguous()
             ar['scales'] = torch.cat([ar['scales'], gu.htr_scales[:640], gu.htr_scales[640:], dn.htr_scales]).contiguous()
             ar['sv'] = torch.cat([ar['sv'], gu.htr_sv[:80], gu.htr_sv[80:], dn.htr_sv]).contiguous()

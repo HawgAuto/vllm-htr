@@ -93,6 +93,12 @@ def build_arena_cpu(experts, spadk=DEFAULT_SPADK):
             q = q.reshape(-1)
             o.append(off); words.append(q); off += q.numel()
         qoff.append(o)
+    sh_qw_off = None
+    if os.environ.get('HTR_MOE_K6_SHARED') == '1':
+        spad5 = int(spadk.get(5, 0))
+        sh_words = (40 + 40) * (160 * 40 + spad5) + 160 * (40 * 40 + spad5)
+        sh_qw_off = off
+        words.append(torch.zeros(sh_words, dtype=torch.int32))
     out = dict(
         qw=torch.cat(words),
         qoff=torch.tensor(qoff, dtype=torch.int64),
@@ -101,6 +107,8 @@ def build_arena_cpu(experts, spadk=DEFAULT_SPADK):
         su=torch.cat([torch.cat([per[e]['gate']['su'], per[e]['down']['su']]) for e in range(NE)]),
         kexp=torch.tensor([kk[e] for e in range(NE)], dtype=torch.int32))
     assert out['scales'].numel() == NE * SC_ES and out['sv'].numel() == NE * SV_ES and out['su'].numel() == NE * SU_ES
+    if sh_qw_off is not None:
+        out['_sh_qw_off'] = sh_qw_off
     return out
 
 
@@ -111,7 +119,7 @@ def load_layer(spec, L, man, dev=None):
         raise ValueError(f'HTR MoE L{L}: chunk widths {info["K"]} != spec K {spec["K"]}')
     t1 = time.time()
     if dev is not None:
-        a = {k: v.to(dev) for k, v in a.items()}
+        a = {k: (v.to(dev) if isinstance(v, torch.Tensor) else v) for k, v in a.items()}
     # uniform layer -> fixed-K kernel launch (e12: mixed vs fixed within 1 us for uniform recipes); spad per K (e12 v2)
     a['_K'] = a['_kf'] = int(spec['K'])
     a['_spad'] = {int(k): int(v) for k, v in spec['spad'].items()}
