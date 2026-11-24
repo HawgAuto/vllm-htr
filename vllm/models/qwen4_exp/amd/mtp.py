@@ -330,7 +330,7 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
                     self.pre_fc_norm_embedding.weight,
                     self.fc_embedding.weight,
                     self.fc_embedding.weight_scale,
-                    hidden_states.flatten(-2),
+                    hidden_states.reshape(inputs_embeds.shape[0], -1),
                     self.pre_fc_norm_hidden.weight,
                     self.fc_hidden.weight,
                     self.fc_hidden.weight_scale,

@@ -170,17 +170,18 @@ def _ensure_v2_ops():
         t = inputs_embeds.shape[0]
         if t == 0:
             return hidden_states.new_empty((0, hc_count * w_emb.shape[0]))
+        hs2d = hidden_states.reshape(t, -1)
         if t <= 16 and hc_count == 4:
             return _mtp_ddn_v2_ext().ddn_mtp_prefc_fuse_v2(
                 inputs_embeds.contiguous(), nw_emb.contiguous(), w_emb, s_emb,
-                hidden_states.contiguous(), nw_hid.contiguous(), w_hid, s_hid,
+                hs2d.contiguous(), nw_hid.contiguous(), w_hid, s_hid,
                 hc_count, float(eps),
             )
         # Prefill fallback (T > 16): GemmaRMSNorm + V2/WMMA or _ddn_reference + broadcast add
         ie_f = inputs_embeds.float()
         ie_n = (ie_f * torch.rsqrt(ie_f.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + nw_emb.float())).to(inputs_embeds.dtype).contiguous()
         emb_out = _run_ddn_v2(ie_n, w_emb, s_emb, emb_id)
-        hs_f = hidden_states.float()
+        hs_f = hs2d.float()
         hs_n = (hs_f * torch.rsqrt(hs_f.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + nw_hid.float())).to(hidden_states.dtype).contiguous()
         hid_out = _run_ddn_v2(hs_n.view(t * hc_count, -1), w_hid, s_hid, hid_id).view(t, hc_count, -1)
         return (emb_out.unsqueeze(-2) + hid_out).flatten(-2)
