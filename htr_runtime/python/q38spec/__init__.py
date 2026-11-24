@@ -24,6 +24,32 @@ import sys
 _PATCHED = False
 KC = 64
 _STATE = {"sampling_states": None}
+_Q38_FILTER_NATIVE_EXT = None
+
+
+def _q38_filter_native_enabled():
+    return os.environ.get("HTR_Q38_FILTER_NATIVE") == "1"
+
+
+def _q38_filter_native_ext():
+    global _Q38_FILTER_NATIVE_EXT
+    if _Q38_FILTER_NATIVE_EXT is None:
+        import importlib.util
+        cand = os.environ.get("HTR_Q38_FILTER_SO")
+        if not cand:
+            for d in (os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"),
+                      "/opt/vllm-htr/native-proto"):
+                p_so = os.path.join(d, "htr_q38_filter.so")
+                if os.path.isfile(p_so):
+                    cand = p_so
+                    break
+        if not cand or not os.path.isfile(cand):
+            raise FileNotFoundError(f"HTR_Q38_FILTER_NATIVE=1 requires htr_q38_filter.so (checked {cand})")
+        spec = importlib.util.spec_from_file_location("htr_q38_filter", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _Q38_FILTER_NATIVE_EXT = mod
+    return _Q38_FILTER_NATIVE_EXT
 
 
 def _log(msg):
@@ -31,13 +57,19 @@ def _log(msg):
 
 
 # ---------------------------------------------------------------- shared mask (pure torch, graph-capturable)
-def q38_filter_logits(logits, idx_mapping, temperature, top_k, top_p, kc=KC):
+def q38_filter_logits(logits, idx_mapping, temperature, top_k, top_p, kc=KC, in_place=False):
     """Return logits with -inf outside each row's top-k/top-p set (computed on logits/T, vLLM order and tie rule).
 
     logits [rows, V] (any float dtype; returned in the same dtype); idx_mapping [rows] request-state index (-1 = pad row);
     temperature/top_k/top_p [max_num_reqs] indexed by request-state index. Rows with idx<0 or top_k>kc are returned unchanged.
     """
     import torch
+    if (_q38_filter_native_enabled() and logits.is_cuda and logits.dim() == 2
+            and logits.dtype in (torch.bfloat16, torch.float32)
+            and kc == 64 and logits.shape[1] >= 256):
+        return _q38_filter_native_ext().q38_filter_logits_native(
+            logits.contiguous(), idx_mapping, temperature, top_k, top_p, int(kc), bool(in_place)
+        )
     rows, V = logits.shape
     kc = min(kc, V)
     safe = idx_mapping.clamp_min(0).long()
@@ -104,7 +136,7 @@ def _patch_mrv2():
                                draft_logits)
         tk, tp = _bufs(self)
         logits = self.model.compute_logits(hidden_states)
-        logits = q38_filter_logits(logits, idx_mapping, self.temperature, tk, tp)
+        logits = q38_filter_logits(logits, idx_mapping, self.temperature, tk, tp, in_place=True)
         sampled = sp_mod.gumbel_sample(
             logits, idx_mapping, temperature, seeds, sample_src_positions,
             apply_temperature=True, is_drafting=True, logits_cache=draft_logits, logits_cache_col=draft_step,
