@@ -403,7 +403,8 @@ class MTPDenseMethod(LinearMethodBase):
         if self.test_recorder is not None and (not isinstance(self.test_recorder,TestCallRecorder) or x.device.type!='cpu'):raise ValueError('explicit CPU test recorder only')
         if self._v2_id >= 0:
             a=x.reshape(-1,self.k).contiguous()
-            return torch.ops.vllm.htr_mtp_ddn_v2(a,layer.weight,layer.weight_scale,self._v2_id).reshape(*x.shape[:-1],self.n)
+            if self.n <= 512 or a.shape[0] >= 5 or self._ddn_id < 0:
+                return torch.ops.vllm.htr_mtp_ddn_v2(a,layer.weight,layer.weight_scale,self._v2_id).reshape(*x.shape[:-1],self.n)
         if not _HTR_MTP_DDN_V2:
             torch._assert_async(torch.isfinite(x).all(), 'activations must be finite')
         a=x.reshape(-1,self.k).contiguous();m=a.shape[0]

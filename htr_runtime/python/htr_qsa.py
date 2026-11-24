@@ -52,6 +52,7 @@ DECODE_UNION_HSACO = os.environ.get(
     os.path.join(os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'), 'qsa_decode_union.hsaco'),
 )
 DECODE_UNION_SHA256 = '1db342131f05a00e9f3474fc3d14fac218ff631890b57d9d3cd9d3b0bf64b056'
+DECODE_UNION_MIN_ROWS = int(os.environ.get('HTR_QSA_DECODE_UNION_MIN_ROWS', '5'))
 DECODE_UNION_MAX_ROWS = int(os.environ.get('HTR_QSA_DECODE_UNION_MAX_ROWS', '256'))
 _DEC_MOD = {}
 _DEC_SCRATCH = {}
@@ -260,7 +261,7 @@ def _dec_scratch(dev):
 def _dec_admitted(q, k, v, idx, bt, t2r, out, gate):
     if not DECODE_UNION:
         return False
-    if not (q.is_cuda and q.ndim == 3 and 1 <= q.shape[0] <= DECODE_UNION_MAX_ROWS):
+    if not (q.is_cuda and q.ndim == 3 and DECODE_UNION_MIN_ROWS <= q.shape[0] <= DECODE_UNION_MAX_ROWS):
         return False
     if not (q.shape[1:] == (24, 256) and q.dtype == torch.bfloat16):
         return False

@@ -72,7 +72,7 @@ _K5SP_CACHE = {}
 # V5-W4: opt-in fused on-the-fly K4/K5 prefill WMMA (0 BF16 weight materialization, 91 VGPRs, 16w/SIMD)
 DENSE_PREFILL_WMMA = os.environ.get("HTR_DENSE_PREFILL_WMMA", "0") == "1"
 DENSE_PREFILL_WMMA_MIN_M = int(os.environ.get("HTR_DENSE_PREFILL_WMMA_MIN_M", "65"))
-DENSE_PREFILL_WMMA_MAX_M = int(os.environ.get("HTR_DENSE_PREFILL_WMMA_MAX_M", "1600"))
+DENSE_PREFILL_WMMA_MAX_M = int(os.environ.get("HTR_DENSE_PREFILL_WMMA_MAX_M", "256"))
 _DPW_MOD = None
 
 

@@ -25,6 +25,7 @@ V2_MIN = int(os.environ.get('HTR_MOE_V2_MIN', '0'))      # 0 = v2 route disabled
 FUSE = os.environ.get('HTR_MOE_FUSE_COMBINE') == '1'   # E29: fused down+combine decode route (bitwise == decode_route)
 HPF3 = os.environ.get('HTR_MOE_HPF3') == '1'           # E31: v2 route through hpf3_forward (bitwise == hpf2_forward)
 HPF4 = os.environ.get('HTR_MOE_HPF4') == '1'           # V5-F1: BM=16 optimal 8-block pairing (bitwise == hpf3)
+HPF4_MAX_M = int(os.environ.get('HTR_MOE_HPF4_MAX_M', '2048'))
 _SCR, _BF, _CB, _V2 = {}, {}, {}, {}
 
 
@@ -138,13 +139,14 @@ def v2_route(ar, x, ids, w):
     valid = ids >= 0
     idc = torch.where(valid, ids, torch.zeros_like(ids)).to(torch.int32)
     wc = torch.where(valid, w, torch.zeros_like(w)).to(torch.float32).contiguous()
-    bm = 16 if HPF4 else 64
+    use_hpf4 = HPF4 and x.shape[0] <= HPF4_MAX_M
+    bm = 16 if use_hpf4 else 64
     sid, eid, ntpp = moe_align_block_size(idc, bm, A.NE, pad_sorted_ids=True)
     dev, Pn = x.device, sid.numel()
     sc = _V2.setdefault(str(dev), {})
     need = dict(A1=(Pn * A.H, torch.float16), Y1=(Pn * 2 * A.I, torch.bfloat16), A2=(Pn * A.I, torch.float16),
                 Y2=(Pn * A.H, torch.bfloat16), S=(Pn, torch.float32), inv=(idc.numel(), torch.int32))
-    if HPF4:
+    if use_hpf4:
         nb = Pn // 16
         need['grp_y'] = (nb, torch.int32)
         need['grp_nblk'] = (nb, torch.int32)

@@ -97,7 +97,7 @@ FUSED_GDN_STATE_DTYPES = (torch.float32, torch.bfloat16)
 _HTR_GDN_FUSED_SPEC = os.environ.get("HTR_GDN_FUSED_SPEC", "0") == "1"
 _HTR_GDN_DEFER_COMMIT = os.environ.get("HTR_GDN_DEFER_COMMIT", "0") == "1"
 _HTR_GDN_DEFER_CAP_TOKENS = int(os.environ.get("HTR_GDN_DEFER_CAP_TOKENS", "128"))
-_HTR_GDN_DEFER_COMMIT_VB = os.environ.get("HTR_GDN_DEFER_COMMIT_VB", "2").strip().lower()
+_HTR_GDN_DEFER_COMMIT_VB = os.environ.get("HTR_GDN_DEFER_COMMIT_VB", "4").strip().lower()
 _HTR_GDN_FUSED_VB = os.environ.get("HTR_GDN_FUSED_VB", "auto").strip().lower()
 _HTR_GDN_FUSED_SO = os.environ.get(
     "HTR_GDN_FUSED_SO",
