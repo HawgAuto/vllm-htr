@@ -3,8 +3,46 @@
 from collections.abc import Iterable, Iterator
 from typing import Any
 
+import os
 import numpy as np
 import torch
+
+_SPEC_REJ_EXT = None
+
+
+def _sparse_rejection_enabled() -> bool:
+    return os.environ.get("HTR_SPARSE_REJECTION") == "1"
+
+
+def _spec_rej_ext():
+    global _SPEC_REJ_EXT
+    if _SPEC_REJ_EXT is None:
+        import importlib.util
+        cand = os.environ.get("HTR_SPEC_SAMPLE_SO")
+        if not cand:
+            for d in (os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"),
+                      "/opt/vllm-htr/native-proto"):
+                p_so = os.path.join(d, "htr_spec_sample.so")
+                if os.path.isfile(p_so):
+                    cand = p_so
+                    break
+        if not cand or not os.path.isfile(cand):
+            raise FileNotFoundError(f"HTR_SPARSE_REJECTION=1 requires htr_spec_sample.so (checked {cand})")
+        spec = importlib.util.spec_from_file_location("htr_spec_sample", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _SPEC_REJ_EXT = mod
+    return _SPEC_REJ_EXT
+
+
+def _lookup_draft_sparse(draft_logits):
+    if draft_logits is None:
+        return None
+    try:
+        import q38spec
+        return q38spec._STATE.get("draft_sparse", {}).get(draft_logits.data_ptr())
+    except Exception:
+        return None
 
 from vllm.config import SpeculativeConfig
 from vllm.config.model import PROCESSED_LOGPROBS_MODES
@@ -164,6 +202,66 @@ class RejectionSampler:
             "watermark_key": self.watermark_key,
         }
 
+    def _can_use_sparse_rejection(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+        max_num_logprobs: int,
+    ) -> bool:
+        if not (
+            _sparse_rejection_enabled()
+            and max_num_logprobs == NO_LOGPROBS
+            and not self.use_block_verification
+            and self.synthetic_conditional_rates is None
+            and self.watermark_key is None
+            and logits.is_cuda
+            and logits.dim() == 2
+            and logits.dtype in (torch.bfloat16, torch.float32)
+            and logits.shape[1] >= 256
+            and input_batch.idx_mapping_np.size > 0
+        ):
+            return False
+        idx_np = input_batch.idx_mapping_np
+        if hasattr(self.sampler, "_has_active_logits_processors") and self.sampler._has_active_logits_processors(idx_np):
+            return False
+        ss = self.sampler.sampling_states
+        tk = ss.top_k.np[idx_np]
+        temp = ss.temperature.np[idx_np]
+        if not bool(np.all((temp == 0.0) | (tk <= 64))):
+            return False
+        if draft_logits is not None and _lookup_draft_sparse(draft_logits) is None:
+            return False
+        return True
+
+    def _verify_sparse(
+        self,
+        logits: torch.Tensor,
+        input_batch: InputBatch,
+        draft_logits: torch.Tensor | None,
+        draft_sampled: torch.Tensor,
+        pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        ext = _spec_rej_ext()
+        ss = self.sampler.sampling_states
+        t_ids, t_vals, t_lse = ext.target_sample_sparse_native(
+            logits.contiguous(),
+            input_batch.expanded_idx_mapping,
+            ss.temperature.gpu,
+            ss.min_p.gpu,
+            ss.top_k.gpu,
+            ss.top_p.gpu,
+        )
+        sp = _lookup_draft_sparse(draft_logits)
+        d_ids = sp[0] if sp is not None else None
+        d_vals = sp[1] if sp is not None else None
+        return ext.sparse_rejection_sample_native(
+            t_ids, t_vals, t_lse, d_ids, d_vals,
+            draft_sampled, input_batch.cu_num_logits, pos,
+            input_batch.idx_mapping, ss.temperature.gpu, ss.seeds.gpu,
+            int(self.num_speculative_steps), bool(self.sampler.use_fp64_gumbel),
+        )
+
     def _verify(
         self,
         logits: torch.Tensor,
@@ -303,15 +401,21 @@ class RejectionSampler:
             input_batch.idx_mapping_np
         )
         chunk_logit_limit = get_max_chunk_logits(logits.shape[1])
-        sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
-            logits,
-            input_batch,
-            draft_logits,
-            draft_sampled,
-            pos,
-            chunk_logit_limit,
-            max_num_logprobs,
-        )
+        if self._can_use_sparse_rejection(logits, input_batch, draft_logits, max_num_logprobs):
+            sampled, num_sampled = self._verify_sparse(
+                logits, input_batch, draft_logits, draft_sampled, pos
+            )
+            logprobs_tensors = None
+        else:
+            sampled, num_sampled, logprobs_tensors = self._verify_in_chunks(
+                logits,
+                input_batch,
+                draft_logits,
+                draft_sampled,
+                pos,
+                chunk_logit_limit,
+                max_num_logprobs,
+            )
 
         num_sampled, num_rejected = get_num_sampled_and_rejected(
             num_sampled,
