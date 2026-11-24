@@ -202,12 +202,12 @@ def prepare_engine(args):
     os.environ['HTR_KV8_ENABLE']='1' if dtype=='int8_per_token_head' else '0'
     os.environ['HTR_KV4_ENABLE']='1' if dtype=='int4_per_token_head' else '0'
     os.environ['HTR_RHT_D256']='triton' if dtype=='int4_per_token_head' else 'pytorch'
+    budget = ple_budget(int(os.environ.get('HTR_PLE_ROW_CACHE_BYTES','0')))
     if os.environ.get('HTR_PLE_V25', '0') == '1':
         library = Path(os.environ.get('HTR_PLE_V25_LIB', str(ROOT / 'native-bin/ple_gather_v25.so')))
         if not library.is_file(): raise FileNotFoundError(library)
         os.environ['DIRECT_PLE_NATIVE_LIB'] = str(library)
     else:
-        budget = ple_budget(int(os.environ.get('HTR_PLE_ROW_CACHE_BYTES','0')))
         if budget or os.environ.get('HTR_PLE_CACHE_OBSERVE','0')=='1':
             library=ROOT/'experimental/ple_row_cache/libple_row_cache.so'
             if not library.is_file(): raise FileNotFoundError(library)
