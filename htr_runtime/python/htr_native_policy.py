@@ -53,9 +53,14 @@ def environment_defaults(env=None, *, root=ROOT, base_defaults=None):
                 Path(value).mkdir(parents=True, exist_ok=True)
             except OSError:
                 pass
-    budget=ple_budget(int(env.get('HTR_PLE_ROW_CACHE_BYTES','0')))
-    if budget or env.get('HTR_PLE_CACHE_OBSERVE','0')=='1':
-        env['DIRECT_PLE_NATIVE_LIB']=str(root/'experimental/ple_row_cache/libple_row_cache.so')
+    # V5-P5: unified ple_gather_v25.so (persistent scratch + APU thread cap + parallel scatter + built-in LRU cache)
+    if env.get('HTR_PLE_V25', '0') == '1':
+        v25_lib = env.get('HTR_PLE_V25_LIB', str(root / 'native-bin/ple_gather_v25.so'))
+        env['DIRECT_PLE_NATIVE_LIB'] = v25_lib
+    else:
+        budget=ple_budget(int(env.get('HTR_PLE_ROW_CACHE_BYTES','0')))
+        if budget or env.get('HTR_PLE_CACHE_OBSERVE','0')=='1':
+            env['DIRECT_PLE_NATIVE_LIB']=str(root/'experimental/ple_row_cache/libple_row_cache.so')
     return env
 
 
@@ -195,11 +200,16 @@ def prepare_engine(args):
     os.environ['HTR_KV8_ENABLE']='1' if dtype=='int8_per_token_head' else '0'
     os.environ['HTR_KV4_ENABLE']='1' if dtype=='int4_per_token_head' else '0'
     os.environ['HTR_RHT_D256']='triton' if dtype=='int4_per_token_head' else 'pytorch'
-    budget = ple_budget(int(os.environ.get('HTR_PLE_ROW_CACHE_BYTES','0')))
-    if budget or os.environ.get('HTR_PLE_CACHE_OBSERVE','0')=='1':
-        library=ROOT/'experimental/ple_row_cache/libple_row_cache.so'
+    if os.environ.get('HTR_PLE_V25', '0') == '1':
+        library = Path(os.environ.get('HTR_PLE_V25_LIB', str(ROOT / 'native-bin/ple_gather_v25.so')))
         if not library.is_file(): raise FileNotFoundError(library)
-        os.environ['DIRECT_PLE_NATIVE_LIB']=str(library)
+        os.environ['DIRECT_PLE_NATIVE_LIB'] = str(library)
+    else:
+        budget = ple_budget(int(os.environ.get('HTR_PLE_ROW_CACHE_BYTES','0')))
+        if budget or os.environ.get('HTR_PLE_CACHE_OBSERVE','0')=='1':
+            library=ROOT/'experimental/ple_row_cache/libple_row_cache.so'
+            if not library.is_file(): raise FileNotFoundError(library)
+            os.environ['DIRECT_PLE_NATIVE_LIB']=str(library)
     cc=args.compilation_config
     if cc.cudagraph_capture_sizes is None:
         top=seqs*(mtp+1)
