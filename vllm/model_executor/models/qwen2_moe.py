@@ -122,6 +122,25 @@ class Qwen2MoeMLP(nn.Module):
         out, _ = self.down_proj(out)
 
         if self.expert_gate is not None:
+            if (
+                _HTR_MOE_SHARED_GATE_FUSED
+                and x.is_cuda
+                and x.dtype == torch.bfloat16
+                and hasattr(self.expert_gate, "weight")
+                and getattr(self.expert_gate, "bias", None) is None
+                and self.expert_gate.weight.ndim == 2
+                and self.expert_gate.weight.shape[0] == 1
+                and 1 <= x.reshape(-1, x.shape[-1]).shape[0] <= 16
+            ):
+                if _DIRECT_MOE_SHARED_FOLD:
+                    import direct_moe_reduction as _dmr
+                    g = torch.ops.vllm.htr_bf16_gemv_gate_sigmoid(x, self.expert_gate.weight)
+                    if _dmr.fold_stash_gate(g):
+                        return out
+                    out = g * out
+                else:
+                    torch.ops.vllm.htr_bf16_gemv_gate_scale(x, self.expert_gate.weight, out)
+                return out
             g = F.sigmoid(self.expert_gate(x)[0])
             if _DIRECT_MOE_SHARED_FOLD:
                 import direct_moe_reduction as _dmr

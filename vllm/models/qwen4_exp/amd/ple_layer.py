@@ -37,6 +37,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
 import os
 _HTR_PLE_SHORT_CONV_NATIVE = os.environ.get("HTR_PLE_SHORT_CONV_NATIVE") == "1"
+_HTR_PLE_GATE_NORM_FUSED = os.environ.get("HTR_PLE_GATE_NORM_FUSED") == "1"
 _PLE_SC_EXT = None
 
 def _ple_short_conv_ext():
@@ -1508,6 +1509,31 @@ class Qwen4ExpPLELayer(nn.Module, MambaBase):
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         token_count = hidden_states.shape[0]
+        if (
+            _HTR_PLE_GATE_NORM_FUSED
+            and _HTR_PLE_SHORT_CONV_NATIVE
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and key.dtype == torch.bfloat16
+            and value.dtype == torch.bfloat16
+        ):
+            gv_flat, normalized = _ple_short_conv_ext().ple_gate_norm_fused(
+                key.contiguous(),
+                hidden_states.contiguous(),
+                value.contiguous(),
+                self.norm_key.weight.contiguous(),
+                self.norm_query.weight.contiguous(),
+                self.norm_conv.weight.contiguous(),
+                self.hc_count,
+                float(self.norm_key.eps),
+            )
+            conv_output = torch.zeros_like(normalized)
+            torch.ops.vllm.qwen4_exp_ple_short_conv(
+                normalized,
+                conv_output,
+                self.prefix,
+            )
+            return gv_flat + conv_output
         key = key.reshape(token_count, self.hc_count, self.hidden_size)
         query = hidden_states.reshape(token_count, self.hc_count, self.hidden_size)
         key = self._apply_norm(self.norm_key, key)

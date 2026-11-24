@@ -12,6 +12,7 @@ from vllm.utils.torch_utils import direct_register_custom_op
 _BF16_GEMV_EXT = None
 _BF16_GEMV_OP_REGISTERED = False
 _HTR_BF16_GEMV_MAX_M = int(os.environ.get("HTR_BF16_GEMV_MAX_M", "16"))
+_HTR_BF16_GEMV_N16_MAX_M = int(os.environ.get("HTR_BF16_GEMV_N16_MAX_M", "4"))
 _HTR_BF16_GEMV_MAX_N = int(os.environ.get("HTR_BF16_GEMV_MAX_N", "128"))
 
 
@@ -56,7 +57,8 @@ def _ensure_bf16_gemv_op() -> None:
         ):
             x2 = x.reshape(-1, x.shape[-1])
             m = x2.shape[0]
-            if 1 <= m <= _HTR_BF16_GEMV_MAX_M:
+            lim = _HTR_BF16_GEMV_N16_MAX_M if weight.shape[0] >= 16 else _HTR_BF16_GEMV_MAX_M
+            if 1 <= m <= lim:
                 y = _bf16_gemv_ext().bf16_gemv_smalln(
                     x2.contiguous(), weight.contiguous()
                 )
@@ -71,6 +73,32 @@ def _ensure_bf16_gemv_op() -> None:
         op_func=_run_bf16_gemv,
         fake_impl=_fake_bf16_gemv,
     )
+    def _run_gate_sig(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        x2 = x.reshape(-1, x.shape[-1])
+        if (x2.is_cuda and weight.is_cuda and x2.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16
+                and weight.ndim == 2 and weight.shape[0] == 1 and (weight.shape[1] & 7) == 0
+                and 1 <= x2.shape[0] <= _HTR_BF16_GEMV_MAX_M):
+            return _bf16_gemv_ext().bf16_gemv_gate_sigmoid(x2.contiguous(), weight.contiguous()).reshape(*x.shape[:-1], 1)
+        return torch.sigmoid(torch.nn.functional.linear(x, weight))
+
+    def _fake_gate_sig(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+        return x.new_empty((*x.shape[:-1], 1))
+
+    def _run_gate_scale(x: torch.Tensor, weight: torch.Tensor, out: torch.Tensor) -> None:
+        x2 = x.reshape(-1, x.shape[-1])
+        o2 = out.reshape(-1, out.shape[-1])
+        if (x2.is_cuda and weight.is_cuda and o2.is_cuda
+                and x2.dtype == torch.bfloat16 and weight.dtype == torch.bfloat16 and o2.dtype == torch.bfloat16
+                and weight.ndim == 2 and weight.shape[0] == 1 and (weight.shape[1] & 7) == 0
+                and (o2.shape[1] & 1) == 0 and o2.is_contiguous()
+                and 1 <= x2.shape[0] <= _HTR_BF16_GEMV_MAX_M):
+            _bf16_gemv_ext().bf16_gemv_gate_scale_inplace(x2.contiguous(), weight.contiguous(), o2)
+            return
+        g = torch.sigmoid(torch.nn.functional.linear(x, weight))
+        out.mul_(g)
+
+    direct_register_custom_op(op_name="htr_bf16_gemv_gate_sigmoid", op_func=_run_gate_sig, fake_impl=_fake_gate_sig)
+    direct_register_custom_op(op_name="htr_bf16_gemv_gate_scale", op_func=_run_gate_scale, mutates_args=["out"])
     _BF16_GEMV_OP_REGISTERED = True
 
 
