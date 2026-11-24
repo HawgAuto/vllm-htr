@@ -169,16 +169,20 @@ def _htr_gdn_spec_fused_impl(
         K != 128
         or V != 128
         or state.dtype != torch.float32
-        or not state.is_contiguous()
+        or state.dim() != 4
+        or state.stride(1) != V * K
+        or state.stride(2) != K
+        or state.stride(3) != 1
         or mixed_qkv.dtype != torch.bfloat16
         or out.dtype != torch.bfloat16
         or not out.is_contiguous()
         or output_gate_activation not in ("sigmoid", "silu")
     ):
+        _nacc_fb = num_accepted_tokens if num_accepted_tokens is not None else torch.ones(num_reqs, dtype=torch.int32, device=out.device)
         return fused_gdn_decode_post_conv_mtp_triton(
             mixed_qkv=mixed_qkv, a=a, b=b, A_log=A_log, dt_bias=dt_bias,
             state_indices=state_indices, cu_seqlens=cu_seqlens,
-            num_accepted_tokens=num_accepted_tokens, state=state,
+            num_accepted_tokens=_nacc_fb, state=state,
             output_gate=output_gate, norm_weight=norm_weight, out=out,
             scale=scale, norm_eps=norm_eps,
             output_gate_activation=output_gate_activation,
@@ -198,6 +202,8 @@ def _htr_gdn_spec_fused_impl(
         and mixed_qkv.size(0) <= _HTR_GDN_DEFER_CAP_TOKENS
     )
     if use_defer:
+        if not _HTR_GDN_DEFER_SLOTS:
+            print(f"HTR_GDN_V5G5_DEFER_ACTIVE num_reqs={num_reqs} max_T={max_T} vb={vb} state_stride0={state.stride(0)}", flush=True)
         dev_i = out.device.index if out.device.index is not None else 0
         slot_key = (dev_i, state.data_ptr())
         entry = _HTR_GDN_DEFER_SLOTS.get(slot_key)
