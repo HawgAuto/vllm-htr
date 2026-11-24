@@ -156,7 +156,7 @@ def v2_route(ar, x, ids, w):
             sc[k] = torch.empty(n, dtype=dt, device=dev)
     nsat = sc.setdefault('nsat', torch.zeros(1, dtype=torch.int32, device=dev))
     K = ar['_K']
-    if HPF4:
+    if use_hpf4:
         return hpf4_ext().hpf4_forward(x.contiguous(), sid.to(torch.int32), eid.to(torch.int32), ntpp.to(torch.int32), wc, ar['qw'], ar['qoff'],
                                        ar['scales'], ar['su'], ar['sv'], cbscale(), K, int(ar['_spad'].get(K, 0)), sc['A1'], sc['Y1'],
                                        sc['A2'], sc['Y2'], sc['S'], sc['inv'], nsat, sc['grp_y'], sc['grp_nblk'], sc['grp_cnt'], 31)
