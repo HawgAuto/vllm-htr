@@ -583,7 +583,10 @@ def _direct_gdn_build(self, common_prefix_len, common_attn_metadata, *args, **kw
     if self.kv_cache_spec.num_prefill_checkpoint_blocks > 0 and md.num_prefills > 0:
         import direct_mamba_ckpt_v1 as _direct_mamba_ckpt
 
-        ck = _direct_mamba_ckpt.build_gdn(self, common_attn_metadata, md)
+        nddt_cpu = kwargs.get("num_decode_draft_tokens_cpu")
+        if nddt_cpu is None and len(args) >= 3:
+            nddt_cpu = args[2]
+        ck = _direct_mamba_ckpt.build_gdn(self, common_attn_metadata, md, num_decode_draft_tokens_cpu=nddt_cpu)
         if ck is not None:
             md.direct_ckpt = ck
     return md
