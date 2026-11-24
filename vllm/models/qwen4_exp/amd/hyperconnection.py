@@ -22,8 +22,11 @@ Typical usage inside a transformer decoder layer::
     )
 """
 
+import os
 import torch
 from torch import nn
+
+_HTR_MTP_DDN_V2 = os.environ.get('HTR_MTP_DDN_V2') == '1'
 
 import direct_nb1 as _nb1  # nb1 overlay
 import direct_w8hc as _w8hc  # dense W8A16 K5d-A (k5d-v1/K5D-PLAN.md): INT8 HC layers -> HC fusions via on-the-fly dequant
@@ -160,6 +163,44 @@ class GatedResidual(nn.Module):
         )
         self._nb1_id = _nb1.register_hc(self)
 
+    def _mtp_v2_ready(self) -> bool:
+        if not (self.mtp_unfused and _HTR_MTP_DDN_V2):
+            return False
+        dn_m = getattr(self.input_mix_weight_down, "quant_method", None)
+        up_m = getattr(self.input_mix_weight_up, "quant_method", None)
+        if getattr(dn_m, "_v2_id", -1) < 0 or getattr(up_m, "_v2_id", -1) < 0:
+            return False
+        if self.use_combine:
+            in_m = getattr(self.block_inject_weight, "quant_method", None)
+            if getattr(in_m, "_v2_id", -1) < 0:
+                return False
+        return True
+
+    def _mtp_v2_down_up(
+        self, xn: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        xn_c = xn.contiguous()
+        dn_l = self.input_mix_weight_down
+        up_l = self.input_mix_weight_up
+        if self.use_combine:
+            in_l = self.block_inject_weight
+            lora, injection = torch.ops.vllm.htr_mtp_hc_down_inject_silu_v2(
+                xn_c, dn_l.weight, dn_l.weight_scale,
+                in_l.weight, in_l.weight_scale,
+                self.hc_count, dn_l.quant_method._v2_id, in_l.quant_method._v2_id,
+            )
+        else:
+            lora = torch.ops.vllm.htr_mtp_hc_down_silu_v2(
+                xn_c, dn_l.weight, dn_l.weight_scale,
+                self.hc_count, dn_l.quant_method._v2_id,
+            )
+            injection = None
+        block_input = torch.ops.vllm.htr_mtp_hc_up_gatemix_v2(
+            xn_c, lora, up_l.weight, up_l.weight_scale,
+            self.hc_count, up_l.quant_method._v2_id,
+        )
+        return block_input, injection
+
     def mix(
         self, hidden_states: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor | None]:
@@ -170,6 +211,9 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        if self._mtp_v2_ready():
+            block_input, injection = self._mtp_v2_down_up(xn)
+            return hidden_states, block_input, injection
         if self.mtp_unfused:
             lora = self.input_mix_weight_down(xn)
             injection = self.block_inject_weight(xn) if self.use_combine else None
@@ -233,6 +277,9 @@ class GatedResidual(nn.Module):
             self.hc_count,
         )
 
+        if self._mtp_v2_ready():
+            block_input, injection = self._mtp_v2_down_up(xn)
+            return hidden_states, block_input, injection
         if self.mtp_unfused:
             lora = self.input_mix_weight_down(xn)
             injection = self.block_inject_weight(xn) if self.use_combine else None

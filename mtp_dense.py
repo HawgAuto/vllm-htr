@@ -22,6 +22,119 @@ DDN_LARGE_MIN_M=256
 DDN_LARGE_CONFIG={'BLOCK_SIZE_M':128,'BLOCK_SIZE_N':128,'BLOCK_SIZE_K':64,'GROUP_SIZE_M':8,'SPLIT_K':1,'num_warps':8,'num_stages':2}
 DDN_LARGE_SHAPES=frozenset({(320,10240),(640,2560),(1280,2560),(2560,640),(2560,2560),(2560,6144),(10240,320),(13312,2560)})
 
+# V5-M2 opt-in (HTR_MTP_DDN_V2=1): clean-slate gfx1151 Wave32 coalesced nontemporal W8A16 g64 GEMV/Skinny-GEMM
+# (M=1..64, 53-75 VGPRs, 0 spills, 12-16w/SIMD, split-K) + fused MTP HC + skip 54x/step isfinite asserts.
+_HTR_MTP_DDN_V2 = _ddn_os.environ.get("HTR_MTP_DDN_V2") == "1"
+_HTR_MTP_DDN_V2_MAX_M = int(_ddn_os.environ.get("HTR_MTP_DDN_V2_MAX_M", "64"))
+_V2_EXT = None
+_V2_REGISTRY = []
+_V2_OPS_REGISTERED = False
+
+def _mtp_ddn_v2_ext():
+    global _V2_EXT
+    if _V2_EXT is None:
+        import importlib.util
+        cand = _ddn_os.environ.get("HTR_MTP_DDN_V2_SO")
+        if not cand:
+            for d in (_ddn_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"),
+                      "/opt/vllm-htr/native-proto"):
+                p_so = _ddn_os.path.join(d, "htr_mtp_ddn_v2.so")
+                if _ddn_os.path.isfile(p_so):
+                    cand = p_so
+                    break
+        if not cand or not _ddn_os.path.isfile(cand):
+            raise FileNotFoundError(f"HTR_MTP_DDN_V2=1 requires htr_mtp_ddn_v2.so (checked {cand})")
+        spec = importlib.util.spec_from_file_location("htr_mtp_ddn_v2", cand)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _V2_EXT = mod
+    return _V2_EXT
+
+def _ensure_v2_ops():
+    global _V2_OPS_REGISTERED
+    if _V2_OPS_REGISTERED:
+        return
+    from vllm.utils.torch_utils import direct_register_custom_op
+
+    def _run_ddn_v2(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, layer_id: int) -> torch.Tensor:
+        m = a.shape[0]
+        if m == 0:
+            return a.new_empty((0, w.shape[0]))
+        if m <= _HTR_MTP_DDN_V2_MAX_M:
+            return _mtp_ddn_v2_ext().ddn_gemv_v2(a, w, s)
+        method = _V2_REGISTRY[layer_id]
+        return method._ddn_reference(method.layer, a)
+
+    def _fake_ddn_v2(a: torch.Tensor, w: torch.Tensor, s: torch.Tensor, layer_id: int) -> torch.Tensor:
+        return a.new_empty((a.shape[0], w.shape[0]))
+
+    def _run_hc_down_inj_silu(
+        xn: torch.Tensor, w_dn: torch.Tensor, s_dn: torch.Tensor,
+        w_in: torch.Tensor, s_in: torch.Tensor, hc_count: int,
+        dn_id: int, in_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        m = xn.shape[0]
+        if m <= _HTR_MTP_DDN_V2_MAX_M:
+            lora, inj = _mtp_ddn_v2_ext().ddn_hc_down_inject_silu_v2(xn, w_dn, s_dn, w_in, s_in, hc_count)
+            return lora, inj
+        from vllm.models.qwen4_exp.amd.ops.hc import hc_silu
+        m_dn = _V2_REGISTRY[dn_id]
+        m_in = _V2_REGISTRY[in_id]
+        lora = hc_silu(m_dn._ddn_reference(m_dn.layer, xn), hc_count)
+        inj = m_in._ddn_reference(m_in.layer, xn)
+        return lora, inj
+
+    def _fake_hc_down_inj_silu(
+        xn: torch.Tensor, w_dn: torch.Tensor, s_dn: torch.Tensor,
+        w_in: torch.Tensor, s_in: torch.Tensor, hc_count: int,
+        dn_id: int, in_id: int,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        return xn.new_empty((xn.shape[0], w_dn.shape[0])), xn.new_empty((xn.shape[0], w_in.shape[0]))
+
+    def _run_hc_down_silu(
+        xn: torch.Tensor, w_dn: torch.Tensor, s_dn: torch.Tensor, hc_count: int, dn_id: int,
+    ) -> torch.Tensor:
+        m = xn.shape[0]
+        if m <= _HTR_MTP_DDN_V2_MAX_M:
+            lora, _ = _mtp_ddn_v2_ext().ddn_hc_down_inject_silu_v2(xn, w_dn, s_dn, None, None, hc_count)
+            return lora
+        from vllm.models.qwen4_exp.amd.ops.hc import hc_silu
+        m_dn = _V2_REGISTRY[dn_id]
+        return hc_silu(m_dn._ddn_reference(m_dn.layer, xn), hc_count)
+
+    def _fake_hc_down_silu(
+        xn: torch.Tensor, w_dn: torch.Tensor, s_dn: torch.Tensor, hc_count: int, dn_id: int,
+    ) -> torch.Tensor:
+        return xn.new_empty((xn.shape[0], w_dn.shape[0]))
+
+    def _run_hc_up_gatemix(
+        xn: torch.Tensor, lora: torch.Tensor, w_up: torch.Tensor, s_up: torch.Tensor,
+        hc_count: int, up_id: int,
+    ) -> torch.Tensor:
+        m = xn.shape[0]
+        if m <= _HTR_MTP_DDN_V2_MAX_M and hc_count == 4 and lora.shape[1] == 320:
+            return _mtp_ddn_v2_ext().ddn_hc_up_gatemix_v2(xn, lora, w_up, s_up)
+        from vllm.models.qwen4_exp.amd.ops.hc import hc_gate_mix
+        m_up = _V2_REGISTRY[up_id]
+        gate = m_up._ddn_reference(m_up.layer, lora)
+        return hc_gate_mix(xn, gate, hc_count)
+
+    def _fake_hc_up_gatemix(
+        xn: torch.Tensor, lora: torch.Tensor, w_up: torch.Tensor, s_up: torch.Tensor,
+        hc_count: int, up_id: int,
+    ) -> torch.Tensor:
+        return xn.new_empty((xn.shape[0], xn.shape[1] // hc_count))
+
+    direct_register_custom_op(op_name="htr_mtp_ddn_v2", op_func=_run_ddn_v2, fake_impl=_fake_ddn_v2)
+    direct_register_custom_op(op_name="htr_mtp_hc_down_inject_silu_v2", op_func=_run_hc_down_inj_silu, fake_impl=_fake_hc_down_inj_silu)
+    direct_register_custom_op(op_name="htr_mtp_hc_down_silu_v2", op_func=_run_hc_down_silu, fake_impl=_fake_hc_down_silu)
+    direct_register_custom_op(op_name="htr_mtp_hc_up_gatemix_v2", op_func=_run_hc_up_gatemix, fake_impl=_fake_hc_up_gatemix)
+    _V2_OPS_REGISTERED = True
+
+def mtp_ddn_v2_enabled() -> bool:
+    return _HTR_MTP_DDN_V2
+
+
 RECIPE_SHA='aabce8b815655175f7608a356fba2a2ec1c1396c7bbd622737c7eb54e3240ffd'
 KERNEL_SHA='21860340e4b409b01666e2ba0f0edae66b0f97b859756b174b573bab895cfaf7'
 WIRE='canonical-offset-k-packed-v1'
@@ -160,7 +273,12 @@ class MTPDenseMethod(LinearMethodBase):
         # source-file I/O while TorchDynamo is tracing the full graph.
         self._production_kernel=None
         self._ddn_id=-1
-        if _ddn_os.environ.get("DIRECT_DDN") == "1" and self.bits == 8 and self.group == 64 and self.test_recorder is None:
+        self._v2_id=-1
+        if _HTR_MTP_DDN_V2 and self.bits == 8 and self.group == 64 and self.test_recorder is None:
+            _ensure_v2_ops()
+            self._v2_id=len(_V2_REGISTRY)
+            _V2_REGISTRY.append(self)
+        elif _ddn_os.environ.get("DIRECT_DDN") == "1" and self.bits == 8 and self.group == 64 and self.test_recorder is None:
             from direct_ddn_adapter import register
             self._ddn_id=register(self)
 
@@ -218,7 +336,11 @@ class MTPDenseMethod(LinearMethodBase):
         if x.device!=layer.weight.device or x.device!=layer.weight_scale.device:raise ValueError('device mismatch')
         if self.test_recorder is None and x.device.type!='cuda':raise RuntimeError('GPU dispatch only; CPU oracle is not production fallback')
         if self.test_recorder is not None and (not isinstance(self.test_recorder,TestCallRecorder) or x.device.type!='cpu'):raise ValueError('explicit CPU test recorder only')
-        torch._assert_async(torch.isfinite(x).all(), 'activations must be finite')
+        if self._v2_id >= 0:
+            a=x.reshape(-1,self.k).contiguous()
+            return torch.ops.vllm.htr_mtp_ddn_v2(a,layer.weight,layer.weight_scale,self._v2_id).reshape(*x.shape[:-1],self.n)
+        if not _HTR_MTP_DDN_V2:
+            torch._assert_async(torch.isfinite(x).all(), 'activations must be finite')
         a=x.reshape(-1,self.k).contiguous();m=a.shape[0]
         out=torch.empty((m,1,self.n),dtype=x.dtype,device=x.device)
         if m==0:return out.reshape(*x.shape[:-1],self.n)
