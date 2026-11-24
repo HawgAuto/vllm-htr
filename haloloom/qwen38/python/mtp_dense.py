@@ -128,7 +128,40 @@ def _ensure_v2_ops():
     direct_register_custom_op(op_name="htr_mtp_ddn_v2", op_func=_run_ddn_v2, fake_impl=_fake_ddn_v2)
     direct_register_custom_op(op_name="htr_mtp_hc_down_inject_silu_v2", op_func=_run_hc_down_inj_silu, fake_impl=_fake_hc_down_inj_silu)
     direct_register_custom_op(op_name="htr_mtp_hc_down_silu_v2", op_func=_run_hc_down_silu, fake_impl=_fake_hc_down_silu)
+    def _run_prefc_fuse(
+        inputs_embeds: torch.Tensor, nw_emb: torch.Tensor, w_emb: torch.Tensor, s_emb: torch.Tensor,
+        hidden_states: torch.Tensor, nw_hid: torch.Tensor, w_hid: torch.Tensor, s_hid: torch.Tensor,
+        hc_count: int, eps: float, emb_id: int, hid_id: int,
+    ) -> torch.Tensor:
+        t = inputs_embeds.shape[0]
+        if t == 0:
+            return hidden_states.new_empty((0, hc_count * w_emb.shape[0]))
+        if t <= 16 and hc_count == 4:
+            return _mtp_ddn_v2_ext().ddn_mtp_prefc_fuse_v2(
+                inputs_embeds.contiguous(), nw_emb.contiguous(), w_emb, s_emb,
+                hidden_states.contiguous(), nw_hid.contiguous(), w_hid, s_hid,
+                hc_count, float(eps),
+            )
+        # Prefill fallback (T > 16): exact unfused GemmaRMSNorm + _ddn_reference + broadcast add
+        ie_f = inputs_embeds.float()
+        ie_n = (ie_f * torch.rsqrt(ie_f.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + nw_emb.float())).to(inputs_embeds.dtype)
+        m_emb = _V2_REGISTRY[emb_id]
+        emb_out = m_emb._ddn_reference(m_emb.layer, ie_n)
+        hs_f = hidden_states.float()
+        hs_n = (hs_f * torch.rsqrt(hs_f.pow(2).mean(dim=-1, keepdim=True) + eps) * (1.0 + nw_hid.float())).to(hidden_states.dtype)
+        m_hid = _V2_REGISTRY[hid_id]
+        hid_out = m_hid._ddn_reference(m_hid.layer, hs_n.view(t * hc_count, -1)).view(t, hc_count, -1)
+        return (emb_out.unsqueeze(-2) + hid_out).flatten(-2)
+
+    def _fake_prefc_fuse(
+        inputs_embeds: torch.Tensor, nw_emb: torch.Tensor, w_emb: torch.Tensor, s_emb: torch.Tensor,
+        hidden_states: torch.Tensor, nw_hid: torch.Tensor, w_hid: torch.Tensor, s_hid: torch.Tensor,
+        hc_count: int, eps: float, emb_id: int, hid_id: int,
+    ) -> torch.Tensor:
+        return hidden_states.new_empty((inputs_embeds.shape[0], hc_count * w_emb.shape[0]))
+
     direct_register_custom_op(op_name="htr_mtp_hc_up_gatemix_v2", op_func=_run_hc_up_gatemix, fake_impl=_fake_hc_up_gatemix)
+    direct_register_custom_op(op_name="htr_mtp_prefc_fuse_v2", op_func=_run_prefc_fuse, fake_impl=_fake_prefc_fuse)
     _V2_OPS_REGISTERED = True
 
 def mtp_ddn_v2_enabled() -> bool:

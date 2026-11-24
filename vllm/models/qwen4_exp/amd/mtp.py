@@ -15,7 +15,10 @@ The MTP draft model reuses the Qwen4Exp backbone (PLE/HC/MoE) but:
 
 from collections.abc import Iterable
 
+import os
 import regex as re
+
+_HTR_MTP_DDN_V2 = os.environ.get('HTR_MTP_DDN_V2') == '1'
 import torch
 from torch import nn
 
@@ -313,24 +316,48 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
             if inputs_embeds is None:
                 assert input_ids is not None
                 inputs_embeds = self.embed_input_ids(input_ids)
-            # Embedding branch: pre-norm -> fc_embedding -> [T, H].
-            inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
-            inputs_embeds = self.fc_embedding(inputs_embeds)
+            _emb_m = getattr(self.fc_embedding, "quant_method", None)
+            _hid_m = getattr(self.fc_hidden, "quant_method", None)
+            if (
+                _HTR_MTP_DDN_V2
+                and getattr(_emb_m, "_v2_id", -1) >= 0
+                and getattr(_hid_m, "_v2_id", -1) >= 0
+                and hc_count == 4
+            ):
+                # V5-M3: 5 launches -> 2 zero-padding Wave32 launches (pre_fc_norm_emb+fc_emb + pre_fc_norm_hid+fc_hid+bcast_add)
+                hidden_states = torch.ops.vllm.htr_mtp_prefc_fuse_v2(
+                    inputs_embeds,
+                    self.pre_fc_norm_embedding.weight,
+                    self.fc_embedding.weight,
+                    self.fc_embedding.weight_scale,
+                    hidden_states.flatten(-2),
+                    self.pre_fc_norm_hidden.weight,
+                    self.fc_hidden.weight,
+                    self.fc_hidden.weight_scale,
+                    hc_count,
+                    float(self.pre_fc_norm_hidden.variance_epsilon),
+                    _emb_m._v2_id,
+                    _hid_m._v2_id,
+                )
+            else:
+                # Embedding branch: pre-norm -> fc_embedding -> [T, H].
+                inputs_embeds = self.pre_fc_norm_embedding(inputs_embeds)
+                inputs_embeds = self.fc_embedding(inputs_embeds)
 
-            # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
-            # the main model truly emits the pre-final-mixer multi stream
-            # on the first step; subsequent steps reuse the prior draft
-            # step's multi stream).
-            num_tokens = hidden_states.shape[0]
-            hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
-            hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
-                num_tokens, hc_count, hidden_size
-            )
-            hidden_states = self.fc_hidden(hidden_states)
-            # Add the embedding residual to every branch, then fold back
-            # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
-            hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
-            hidden_states = hidden_states.flatten(-2)
+                # Backbone hidden is multi-stream [T, hc_count*H] (scheme A:
+                # the main model truly emits the pre-final-mixer multi stream
+                # on the first step; subsequent steps reuse the prior draft
+                # step's multi stream).
+                num_tokens = hidden_states.shape[0]
+                hidden_states = hidden_states.view(num_tokens, hc_count, hidden_size)
+                hidden_states = self.pre_fc_norm_hidden(hidden_states.flatten(-2)).view(
+                    num_tokens, hc_count, hidden_size
+                )
+                hidden_states = self.fc_hidden(hidden_states)
+                # Add the embedding residual to every branch, then fold back
+                # to [T, hc_count*H] (HC outer, HS inner) for the HC decoder.
+                hidden_states = inputs_embeds.unsqueeze(-2) + hidden_states
+                hidden_states = hidden_states.flatten(-2)
         else:
             assert intermediate_tensors is not None
             hidden_states = intermediate_tensors["hidden_states"]
