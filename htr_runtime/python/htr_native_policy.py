@@ -233,11 +233,17 @@ def prepare_engine(args):
     revision=(ROOT/'NATIVE-POLICY-REVISION').read_text().strip()
     identity=cache_identity(config,bound_env,revision)
     cache_root=Path(os.environ.get('HTR_CACHE_HOME','/workspace/cache'))/('htr-native-'+identity)
+    shared_root=Path(os.environ.get('HTR_CACHE_HOME','/workspace/cache'))/'htr-shared'
+    shared_root.mkdir(parents=True,exist_ok=True)
     for key in CACHE_KEYS:
-        # Explicit locations are preserved. vLLM/Triton also key their own artifacts.
+        # Explicit locations are preserved. vLLM/Triton/Inductor all content-hash their own artifacts,
+        # so sharing a persistent root avoids 127s modelinfos + 24s inductor + 22s triton cold misses!
         original=json.loads(Path('/opt/haloloom/qwen38/data/runtime-env.json').read_text()).get(key)
         if key not in os.environ or os.environ[key]==original:
-            os.environ[key]=str(cache_root/key.lower())
+            base = shared_root if (os.environ.get('HTR_SHARED_CACHE','1')=='1' and key in ('VLLM_CACHE_ROOT','TRITON_CACHE_DIR','TORCHINDUCTOR_CACHE_DIR','AITER_JIT_DIR')) else cache_root
+            d = base/key.lower()
+            d.mkdir(parents=True,exist_ok=True)
+            os.environ[key]=str(d)
     os.environ['HTR_RUNTIME_CACHE_ROOT']=str(cache_root)
     cache_root.mkdir(parents=True,exist_ok=True)
     for name in ('tmp','config','profiles'): Path('/workspace',name).mkdir(parents=True,exist_ok=True)

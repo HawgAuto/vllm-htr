@@ -946,6 +946,26 @@ def _causal_conv1d_fwd_kernel_gs(  # continuous batching
         tl.store(o_ptrs, acc, mask=mask_1d)
 
 
+
+_CAUSAL_CONV1D_AOT = None
+def _get_causal_conv1d_aot():
+    global _CAUSAL_CONV1D_AOT
+    if _CAUSAL_CONV1D_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_CAUSAL_CONV1D_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_CAUSAL_CONV1D_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "causal_conv1d_fwd_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/causal_conv1d_fwd_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _CAUSAL_CONV1D_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _CAUSAL_CONV1D_AOT is None:
+            _CAUSAL_CONV1D_AOT = False
+    return _CAUSAL_CONV1D_AOT
+
 def causal_conv1d_fn(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -1180,6 +1200,77 @@ def causal_conv1d_fn(
     if batch_ptr.device != x.device:
         batch_ptr = batch_ptr.to(x.device)
         token_chunk_offset_ptr = token_chunk_offset_ptr.to(x.device)
+
+    _aot = _get_causal_conv1d_aot()
+    if (
+        _aot
+        and width == 4
+        and x.dtype == torch.bfloat16
+        and weight.dtype == torch.bfloat16
+        and conv_states is not None
+        and conv_states.dtype == torch.bfloat16
+        and (bias is None or bias.dtype == torch.bfloat16)
+        and stride_x_dim == 1
+        and stride_o_dim == 1
+        and stride_w_width == 1
+        and (dim % 8) == 0
+        and (stride_x_token % 8) == 0
+        and (stride_o_token % 8) == 0
+        and (x.data_ptr() % 16) == 0
+        and (out.data_ptr() % 16) == 0
+        and (bias is None or (bias.data_ptr() % 16) == 0)
+        and cache_indices is not None
+        and has_initial_state is not None
+        and has_initial_state.dtype == torch.bool
+        and query_start_loc.dtype == torch.int32
+        and cache_indices.dtype == torch.int32
+        and (cache_indices.ndim == 1 or cache_indices.stride(1) == 1)
+        and (block_idx_first_scheduled_token is None or (block_idx_first_scheduled_token.dtype == torch.int32 and block_idx_last_scheduled_token.dtype == torch.int32 and initial_state_idx.dtype == torch.int32 and num_computed_tokens.dtype == torch.int32))
+    ):
+        import ctypes as _ct
+        _hm, _m = _aot
+        _meta_tmp = {"BLOCK_M": BLOCK_M, "batch_ptr": batch_ptr, "token_chunk_offset_ptr": token_chunk_offset_ptr, "x_ptr": x}
+        _tot = int(num_program(_meta_tmp, args))
+        if _tot <= 0:
+            return out.to(original_x_dtype)
+        _bp = _meta_tmp["batch_ptr"]
+        _op = _meta_tmp["token_chunk_offset_ptr"]
+        if _bp.device != x.device:
+            _bp = _bp.to(x.device)
+            _op = _op.to(x.device)
+        _is_apc = block_idx_first_scheduled_token is not None
+        _silu = activation in ("silu", "swish")
+        _flags = (1 if bias is not None else 0) | (2 if _silu else 0) | (4 if _is_apc else 0) | (8 if null_block_id is not None else 0)
+        _bsize = int(block_size_to_align) if (block_size_to_align is not None and block_size_to_align > 0) else BLOCK_M
+        _sci = int(stride_cache_indices)
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        with torch.cuda.device(x.device):
+            _m.launch(
+                "causal_conv1d_fwd_w4_bf16_v8",
+                ((dim + 511) // 512, (_tot + 3) // 4, 1),
+                (64, 1, 1),
+                [
+                    _hm.ptr(x), _hm.ptr(weight),
+                    _hm.ptr(bias) if bias is not None else I64(0),
+                    _hm.ptr(conv_states),
+                    _hm.ptr(cache_indices),
+                    _hm.ptr(has_initial_state),
+                    _hm.ptr(query_start_loc),
+                    _hm.ptr(_bp),
+                    _hm.ptr(_op),
+                    _hm.ptr(block_idx_first_scheduled_token) if _is_apc else I64(0),
+                    _hm.ptr(block_idx_last_scheduled_token) if _is_apc else I64(0),
+                    _hm.ptr(initial_state_idx) if _is_apc else I64(0),
+                    _hm.ptr(num_computed_tokens) if _is_apc else I64(0),
+                    _hm.ptr(out),
+                    I32(dim), I32(num_cache_lines), I32(_tot),
+                    I64(stride_x_token), I64(stride_w_dim),
+                    I64(stride_istate_seq), I64(stride_istate_dim), I64(stride_istate_token),
+                    I64(_sci), I64(stride_o_token),
+                    I32(_bsize), I32(pad_slot_id), I32(null_block_id if null_block_id is not None else -1), I32(_flags),
+                ],
+            )
+        return out.to(original_x_dtype)
 
     (_causal_conv1d_fwd_kernel_gs if _gs else _causal_conv1d_fwd_kernel)[grid](
         # Pointers to matrices

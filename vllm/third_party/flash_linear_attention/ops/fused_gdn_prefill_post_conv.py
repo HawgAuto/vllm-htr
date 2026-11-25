@@ -178,6 +178,25 @@ def _fused_post_conv_kernel(
         tl.store(beta_ptr + gb_offsets, beta_vals, mask=mask_t)
 
 
+
+_GDN_POST_CONV_AOT = None
+def _get_gdn_post_conv_aot():
+    global _GDN_POST_CONV_AOT
+    if _GDN_POST_CONV_AOT is None:
+        if _vv_os.environ.get("HTR_GDN_POST_CONV_AOT", "1") == "1":
+            for cand in (
+                _vv_os.environ.get("HTR_GDN_POST_CONV_HSACO", ""),
+                _vv_os.path.join(_vv_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "gdn_post_conv_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/gdn_post_conv_aot.hsaco",
+            ):
+                if cand and _vv_os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _GDN_POST_CONV_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _GDN_POST_CONV_AOT is None:
+            _GDN_POST_CONV_AOT = False
+    return _GDN_POST_CONV_AOT
+
 def fused_post_conv_prep(
     conv_output: torch.Tensor,  # [L, qkv_dim] conv'd mixed_qkv
     a: torch.Tensor,  # [L, HV]
@@ -237,6 +256,50 @@ def fused_post_conv_prep(
     beta = torch.empty(L, HV, dtype=torch.float32, device=device)
 
     if L == 0:
+        return q, k, v, g, beta
+
+    _aot = _get_gdn_post_conv_aot()
+    if (
+        _aot
+        and K == 128
+        and V == 128
+        and dtype == torch.bfloat16
+        and conv_output.stride(1) == 1
+        and a.stride(1) == 1
+        and b.stride(1) == 1
+        and a.dtype in (torch.float32, torch.bfloat16)
+        and b.dtype in (torch.float32, torch.bfloat16)
+        and A_log.dtype in (torch.float32, torch.bfloat16)
+        and dt_bias.dtype in (torch.float32, torch.bfloat16)
+        and A_log.is_contiguous()
+        and dt_bias.is_contiguous()
+    ):
+        import ctypes as _ct
+        _hm, _m = _aot
+        I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+        _flags = (
+            (1 if apply_l2norm else 0)
+            | (2 if output_g_exp else 0)
+            | (4 if not vview else 0)
+            | (8 if a.dtype == torch.bfloat16 else 0)
+            | (16 if b.dtype == torch.bfloat16 else 0)
+            | (32 if A_log.dtype == torch.bfloat16 else 0)
+            | (64 if dt_bias.dtype == torch.bfloat16 else 0)
+        )
+        with torch.cuda.device(device):
+            _m.launch(
+                "gdn_post_conv_bf16_d128",
+                (L, 1, 1),
+                (256, 1, 1),
+                [
+                    _hm.ptr(conv_output), _hm.ptr(a), _hm.ptr(b),
+                    _hm.ptr(A_log), _hm.ptr(dt_bias),
+                    _hm.ptr(q), _hm.ptr(k), _hm.ptr(v), _hm.ptr(g), _hm.ptr(beta),
+                    I64(conv_output.stride(0)), I64(a.stride(0)), I64(b.stride(0)),
+                    I64(q.stride(0)), I64(k.stride(0)), I64(v.stride(0)),
+                    I32(L), I32(H), I32(HV), F32(1e-6), I32(_flags),
+                ],
+            )
         return q, k, v, g, beta
 
     # ---- Kernel config ----

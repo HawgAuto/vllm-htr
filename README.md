@@ -1,4 +1,38 @@
-# vLLM HTR — v0.2.5
+# vLLM HTR — v0.2.6
+
+Native HTR serving for **AMD Strix Halo / gfx1151** with **zero mid-inference Triton JIT**
+across prefill and decode: **20 new zero-spill AOT Wave32 HIP/HSACO kernels**
+(full-INT8 `v_wmma_i32_16x16x16_iu8` QSA prefill, 128-bit vectorized `causal_conv1d` & GDN
+prefill, double-buffered W4A16 MoE, HPF5 v2 MoE prefill, dense prefill v2, HyperConnection v2,
+QSA MQA v3 with hidden `v_dual_dot2acc_f32_bf16`, cache/prepare/indexer/PLE/Gumbel AOT) plus
+**3 Wave 7 RDNA 3.5 decode upgrades** (`htr_bf16_gemv.so`, `htr_moe_k6_shx.so`, `htr_kernels.so`).
+Weights, tokenizer/configuration and checkpoint sampling defaults are unchanged.
+
+[Run v0.2.6](htr_runtime/docs/optimized-serving.md) · [Htr5Core model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Exact results and release notes](htr_runtime/releases/v0.2.6/README.md) · [Release history](RELEASES.md)
+
+```sh
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:dc11916549c534b207bb45048fe2f9b2177117995931f5aff5b384b274ea0fe8
+```
+
+Version alias: `ghcr.io/hawgauto/vllm-htr:v0.2.6`. Ordinary `vllm serve` receives all
+v0.2.6 optimizations by default via `runtime-env.json` with zero extra `-e` flags.
+
+## What v0.2.6 brings
+
+Verified zero-overlay on exclusive AMD Strix Halo (`gfx1151`), Htr5Core, MTP3, `max-model-len=32768`, `--kv-cache-dtype int8_per_token_head`:
+
+| Workload | `v0.2.5` KV8 | **`v0.2.6` Zero-Overlay Gate** | **Change vs v0.2.5** |
+|---|---:|---:|---:|
+| `13K` warm prefill (`13,018 tok`) | `551.9 tok/s` (`23.58 s`) | **`1,137.7 tok/s`** (`11.44 s`) | **2.06× faster** |
+| `13K` cold prefill (`13,017 tok`) | `551.9 tok/s` (`23.58 s`) | **`910.5 tok/s`** (`14.30 s`) | **1.65× faster** |
+| Greedy `c=1` decode (`128 tok`) | `45.05 tok/s` | **`45.16 tok/s`** | **+0.2%** |
+| `c=4 × 4K` (`16,702` ctx) — wall / sum decode | `23.82 s` / `57.25 tok/s` | **`21.77 s`** / **`61.65 tok/s`** | **1.09× wall / +7.7% dec** |
+| `c=8` high-concurrency — wall / agg (`8×128`) | `19.03 s` / `53.80 tok/s` | **`15.51 s`** / **`66.01 tok/s`** | **1.23× wall** |
+| Mid-inference Triton JIT warnings | multiple | **`0`** | **eliminated** |
+
+Full manifest & notes: [v0.2.6 README](htr_runtime/releases/v0.2.6/README.md) · [V026-NATIVE-MANIFEST.json](htr_runtime/V026-NATIVE-MANIFEST.json).
+
+## Preserved v0.2.5 release
 
 Native HTR serving for **AMD Strix Halo / gfx1151**, shipping the full clean-slate
 Wave32 HIP/HSACO optimization stack (**18 new native binaries** + **38 runtime updates**):

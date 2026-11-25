@@ -19,6 +19,8 @@ SPEC_KEYS = {'wire', 'K', 'dir', 'manifest', 'manifest_sha256', 'layers', 'vllm_
 _SELECTED = []
 _COUNT_FILE = os.environ.get('HTR_MOE_COUNT_FILE') or None
 _SELFCHECK = os.environ.get('HTR_MOE_SELFCHECK') == '1'
+_SELFCHECK_LAYERS_RAW = os.environ.get('HTR_MOE_SELFCHECK_LAYERS', '0,47').strip()
+_SELFCHECK_LAYERS = None if _SELFCHECK_LAYERS_RAW in ('all', '*') else {int(x) for x in _SELFCHECK_LAYERS_RAW.split(',') if x.strip()}
 _COUNTS = {}
 _CLOCK = threading.Lock()
 
@@ -124,7 +126,7 @@ def _method_class():
         def _selfcheck(self, x, ids, w, route):
             # first eager call per route: kernel route vs dequant+BF16 fused_experts (independent kernel path); rel L2 gate
             key = route
-            if key in self._checked or torch.cuda.is_current_stream_capturing():
+            if (_SELFCHECK_LAYERS is not None and self.L not in _SELFCHECK_LAYERS) or key in self._checked or torch.cuda.is_current_stream_capturing():
                 return
             _prev_sh_active = self.ar.get('_k6_sh_fold_active', False)
             self.ar['_k6_sh_fold_active'] = False

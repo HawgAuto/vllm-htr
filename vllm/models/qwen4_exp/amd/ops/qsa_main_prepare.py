@@ -182,6 +182,26 @@ def supports_main_prepare(
     )
 
 
+
+_QSA_MAIN_PREP_AOT = None
+def _get_qsa_main_prep_aot():
+    global _QSA_MAIN_PREP_AOT
+    if _QSA_MAIN_PREP_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_QSA_MAIN_PREP_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_QSA_MAIN_PREP_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "qsa_main_prepare_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/qsa_main_prepare_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _QSA_MAIN_PREP_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _QSA_MAIN_PREP_AOT is None:
+            _QSA_MAIN_PREP_AOT = False
+    return _QSA_MAIN_PREP_AOT
+
 def qsa_main_prepare(
     qkv: torch.Tensor,
     positions: torch.Tensor,
@@ -236,6 +256,38 @@ def qsa_main_prepare(
     else:
         pos_stride_axis, pos_stride_token = 0, positions.stride(0)
     section = mrope_section if (is_2d and mrope_section) else (0, 0, 0)
+    aot = _get_qsa_main_prep_aot()
+    if (
+        aot
+        and head_dim == 256
+        and rotary_dim == 64
+        and positions.dtype == torch.int64
+        and slot_mapping.dtype == torch.int64
+        and q_norm_weight.dtype == torch.bfloat16
+        and k_norm_weight.dtype == torch.bfloat16
+        and (not table_free or inv_freq.dtype == torch.float32)
+    ):
+        import ctypes as _ct
+        _hm, _m = aot
+        I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+        total_rows = num_tokens * (num_q_heads + num_kv_heads)
+        _m.launch(
+            "qsa_main_prepare_d256_rot64",
+            ((total_rows + 3) // 4, 1, 1),
+            (128, 1, 1),
+            [
+                _hm.ptr(qkv), _hm.ptr(q_norm_weight), _hm.ptr(k_norm_weight), F32(float(eps)),
+                _hm.ptr(cs_arg), _hm.ptr(inv_arg), F32(float(mscale)),
+                _hm.ptr(positions), I64(pos_stride_axis), I64(pos_stride_token),
+                _hm.ptr(q_out), _hm.ptr(gate_out), _hm.ptr(kv_cache_t),
+                I64(kv_cache_t.stride(0)), I64(kv_cache_t.stride(1)), I64(kv_cache_t.stride(2)),
+                _hm.ptr(slot_mapping),
+                I32(num_tokens), I32(num_q_heads), I32(num_kv_heads),
+                I32(cs_stride), I32(kv_cache_t.shape[1]),
+                I32(int(is_2d)), I32(int(section[1])), I32(int(section[2])), I32(int(table_free)),
+            ],
+        )
+        return q_out
     grid = (
         num_tokens * num_q_heads // XBLOCK + num_tokens * num_kv_heads // XBLOCK,
     )

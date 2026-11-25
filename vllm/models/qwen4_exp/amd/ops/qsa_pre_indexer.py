@@ -474,6 +474,26 @@ def _qsa_pre_indexer_kernel(
                     tl.store(tail + 2, pos_w.to(tl.int64), mask=valid_slot)
 
 
+
+_QSA_PREIDX_AOT = None
+def _get_qsa_preidx_aot():
+    global _QSA_PREIDX_AOT
+    if _QSA_PREIDX_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_QSA_PREIDX_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_QSA_PREIDX_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "qsa_pre_indexer_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/qsa_pre_indexer_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _QSA_PREIDX_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _QSA_PREIDX_AOT is None:
+            _QSA_PREIDX_AOT = False
+    return _QSA_PREIDX_AOT
+
 def qsa_pre_indexer(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -545,6 +565,70 @@ def qsa_pre_indexer(
     else:
         TILE_T_Q, TILE_H_Q = 2, 4
     num_k_work = k_work_metadata.shape[0]
+    aot = _get_qsa_preidx_aot()
+    if (
+        aot
+        and head_dim == 128
+        and num_q_heads <= 4
+        and q.dtype == torch.bfloat16
+        and k.dtype == torch.bfloat16
+        and q_out.dtype == torch.bfloat16
+        and state_cache.dtype == torch.bfloat16
+        and compressed_cache.dtype == torch.bfloat16
+        and q_norm_weight.dtype == torch.bfloat16
+        and k_norm_weight.dtype == torch.bfloat16
+        and (table_free or cos_sin_cache.dtype == torch.bfloat16)
+        and (not table_free or inv_freq.dtype == torch.float32)
+        and positions.dtype == torch.int64
+        and logical_positions.dtype == torch.int64
+        and state_slots.dtype == torch.int64
+        and compressed_slots.dtype == torch.int64
+        and query_start_loc.dtype == torch.int32
+        and state_block_table.dtype == torch.int32
+        and k_work_metadata.dtype == torch.int32
+    ):
+        import ctypes as _ct
+        _hm, _m = aot
+        I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+        _m.launch(
+            "qsa_pre_indexer_q_bf16",
+            (num_tokens, 1, 1),
+            (32 * num_q_heads, 1, 1),
+            [
+                _hm.ptr(q), I64(q.stride(0)),
+                _hm.ptr(positions), I64(pos_stride_axis), I64(pos_stride_token),
+                _hm.ptr(cs_arg), _hm.ptr(inv_arg), F32(float(mscale)),
+                _hm.ptr(q_norm_weight), F32(float(eps)),
+                _hm.ptr(q_out), I64(q_out.stride(0)), I64(q_out.stride(1)),
+                I32(num_tokens), I32(num_q_heads),
+                I32(int(is_2d_positions)), I32(int(section[1])), I32(int(section[2])), I32(int(table_free)),
+            ],
+        )
+        if num_k_work > 0:
+            _m.launch(
+                "qsa_pre_indexer_k_bf16",
+                (num_k_work, 1, 1),
+                (32, 1, 1),
+                [
+                    _hm.ptr(k), I64(k.stride(0)),
+                    _hm.ptr(positions), I64(pos_stride_axis), I64(pos_stride_token),
+                    _hm.ptr(cs_arg), _hm.ptr(inv_arg), F32(float(mscale)),
+                    _hm.ptr(k_norm_weight), F32(float(eps)),
+                    _hm.ptr(state_cache), I64(state_cache.stride(0)), I64(state_cache.stride(1)),
+                    _hm.ptr(state_slots),
+                    _hm.ptr(state_block_table), I64(state_block_table.stride(0)),
+                    _hm.ptr(query_start_loc),
+                    _hm.ptr(logical_positions),
+                    _hm.ptr(compressed_slots),
+                    _hm.ptr(k_work_metadata),
+                    _hm.ptr(compressed_cache), I64(compressed_cache.stride(0)), I64(compressed_cache.stride(1)),
+                    I32(num_tokens), I32(state_cache.shape[0]), I32(compressed_cache.shape[0]), I32(num_k_work),
+                    I32(int(compress_ratio)), I32(state_cache.shape[1]), I32(compressed_cache.shape[1]),
+                    I32(int(is_2d_positions)), I32(int(is_k_mrope)), I32(int(cache_has_rope_pos)),
+                    I32(int(section[1])), I32(int(section[2])), I32(int(table_free)),
+                ],
+            )
+        return
     num_q_work = triton.cdiv(num_tokens, TILE_T_Q) * triton.cdiv(num_q_heads, TILE_H_Q)
     _qsa_pre_indexer_kernel[(num_k_work + num_q_work,)](
         q,

@@ -11,6 +11,14 @@ _CHECKED=set()
 _SEEN=set()
 _DEVICES=set()
 
+def _should_check_layer(L):
+    spec = os.environ.get('HTR_MOE_SELFCHECK_LAYERS', '0,47').strip().lower()
+    if spec in ('', 'all', '*'): return True
+    if spec in ('none', '00', 'off'): return False
+    return str(L) in {s.strip() for s in spec.split(',') if s.strip()}
+
+_SELFCHECK_LAYERS = True
+
 
 def log(tag,**values):
     print(tag+' '+json.dumps({'pid':os.getpid(),**values},sort_keys=True),file=sys.stderr,flush=True)
@@ -78,9 +86,14 @@ def prime_smaller(P,ar,x,ids,w):
     # shapes with cloned actual eager prefixes, never with fabricated IDs.
     # Run before the returned main result so probe scratch cannot clobber it.
     T=x.shape[0]
+    L = ar['_meta']['L']
+    do_chk = _should_check_layer(L)
     for rows in sorted(D.CANDIDATE_ROWS):
-        key=(id(ar),ar['_meta']['L'],rows,str(x.device))
+        key=(id(ar),L,rows,str(x.device))
         if rows>=T or key in _CHECKED:continue
+        if not do_chk:
+            _CHECKED.add(key)
+            continue
         if not bool((ids[:rows]>=0).any()):continue
         xx=x[:rows].clone().contiguous();ii=ids[:rows].clone().contiguous();ww=w[:rows].clone().contiguous()
         yy=D.forward(P,BP,ar,xx,ii,ww)
@@ -114,7 +127,7 @@ def install(R):
             prime_smaller(P,ar,x,ids,w)
         y=D.forward(P,BP,ar,x,ids,w)
         if key not in _CHECKED:
-            if selfcheck(P,ar,x,ids,w,y):_CHECKED.add(key)
+            if not _should_check_layer(ar['_meta']['L']) or selfcheck(P,ar,x,ids,w,y):_CHECKED.add(key)
         seen=(T,capturing)
         if key in _CHECKED and seen not in _SEEN:
             _SEEN.add(seen);log('HTR_MOE_GROUPED_ROUTE',T=T,K=4,capturing=capturing,eager_checked=True)

@@ -323,6 +323,26 @@ def _gumbel_sample_kernel(
     tl.store(local_max_ptr + token_idx * local_max_stride + block_idx, value)
 
 
+
+_GUMBEL_AOT = None
+def _get_gumbel_aot():
+    global _GUMBEL_AOT
+    if _GUMBEL_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_GUMBEL_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_GUMBEL_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "gumbel_sample_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/gumbel_sample_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _GUMBEL_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _GUMBEL_AOT is None:
+            _GUMBEL_AOT = False
+    return _GUMBEL_AOT
+
 def gumbel_sample(
     logits: torch.Tensor,  # [num_tokens, vocab_size]
     expanded_idx_mapping: torch.Tensor,  # [num_tokens]
@@ -353,6 +373,50 @@ def gumbel_sample(
     local_max_dtype = torch.float64 if use_fp64 else torch.float32
     local_max = logits.new_empty(num_tokens, num_blocks, dtype=local_max_dtype)
     per_token_col = logits_cache_col is not None and logits_cache_col.dim() > 0
+    _aot = _get_gumbel_aot()
+    if (
+        _aot
+        and not use_fp64
+        and logits.dtype in (torch.float32, torch.bfloat16)
+        and (logits_cache is None or logits_cache.dtype in (torch.float32, torch.bfloat16))
+        and expanded_idx_mapping.dtype == torch.int32
+        and seed.dtype == torch.int64
+        and pos.dtype == torch.int64
+        and temperature.dtype == torch.float32
+        and (logits_cache_col is None or logits_cache_col.dtype == torch.int64)
+        and logits.stride(-1) == 1
+        and (logits_cache is None or logits_cache.stride(-1) == 1)
+    ):
+        import ctypes as _ct
+        _hm, _m = _aot
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        _flags = (
+            (1 if is_drafting else 0)
+            | (2 if apply_temperature else 0)
+            | (4 if per_token_col else 0)
+            | (8 if logits.dtype == torch.bfloat16 else 0)
+            | (16 if (logits_cache is not None and logits_cache.dtype == torch.bfloat16) else 0)
+        )
+        with torch.cuda.device(logits.device):
+            _m.launch(
+                "gumbel_sample_block_fp32",
+                (num_tokens, num_blocks, 1),
+                (256, 1, 1),
+                [
+                    _hm.ptr(local_argmax), I64(local_argmax.stride(0)),
+                    _hm.ptr(local_max), I64(local_max.stride(0)),
+                    _hm.ptr(logits_cache) if logits_cache is not None else I64(0),
+                    I64(logits_cache.stride(0)) if logits_cache is not None else I64(0),
+                    I64(logits_cache.stride(1)) if logits_cache is not None else I64(0),
+                    _hm.ptr(logits_cache_col) if logits_cache_col is not None else I64(0),
+                    _hm.ptr(logits), I64(logits.stride(0)),
+                    _hm.ptr(expanded_idx_mapping),
+                    _hm.ptr(seed), _hm.ptr(pos), _hm.ptr(temperature),
+                    I32(vocab_size), I32(_flags),
+                ],
+            )
+        max_block_idx = local_max.argmax(dim=-1, keepdim=True)
+        return local_argmax.gather(dim=-1, index=max_block_idx).view(-1)
     _gumbel_sample_kernel[(num_tokens, num_blocks)](
         local_argmax,
         local_argmax.stride(0),

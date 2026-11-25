@@ -10,6 +10,26 @@ _DIRECT_MTP_PBOUND = os.environ.get("DIRECT_QSA_MTP_PBOUND") == "1"
 
 import torch
 
+_MQA_PAGED_AOT = None
+def _get_mqa_paged_aot():
+    global _MQA_PAGED_AOT
+    if _MQA_PAGED_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_MQA_PAGED_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_MQA_PAGED_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "qsa_mqa_paged_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/qsa_mqa_paged_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _MQA_PAGED_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _MQA_PAGED_AOT is None:
+            _MQA_PAGED_AOT = False
+    return _MQA_PAGED_AOT
+
+
 try:  # [nb2-mqa4-ab-v1]
     import direct_qsa_mqa_native_v1 as _MQA_NATIVE
 except ImportError:
@@ -1004,6 +1024,37 @@ def qsa_mqa_paged(
         _MQA_NATIVE.run(q, k_cache, page_table, token_to_req, query_positions, sequence_lengths, visible_blocks, logits,
                         columns, compress_ratio, float(score_divisor))
         return logits, visible_blocks
+    aot = _get_mqa_paged_aot()
+    if (
+        aot
+        and q.dtype == torch.bfloat16
+        and k_cache.dtype == torch.bfloat16
+        and q.shape[2] == 128
+        and page_table.dtype == torch.int32
+        and token_to_req.dtype == torch.int32
+        and query_positions.dtype in (torch.int32, torch.int64)
+        and sequence_lengths.dtype == torch.int32
+    ):
+        import ctypes as _ct
+        _hm, _m = aot
+        I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+        _fn = "qsa_mqa_paged_bf16_i64" if query_positions.dtype == torch.int64 else "qsa_mqa_paged_bf16"
+        _m.launch(
+            _fn,
+            (q.shape[0], (columns + 31) // 32, 1),
+            (128, 1, 1),
+            [
+                _hm.ptr(q), _hm.ptr(k_cache), _hm.ptr(page_table), _hm.ptr(token_to_req),
+                _hm.ptr(query_positions), _hm.ptr(sequence_lengths), _hm.ptr(visible_blocks), _hm.ptr(logits),
+                I64(q.stride(0)), I64(q.stride(1)), I64(q.stride(2)),
+                I64(k_cache.stride(0)), I64(k_cache.stride(1)), I64(k_cache.stride(3)),
+                I64(page_table.stride(0)), I64(page_table.stride(1)), I64(logits.stride(0)),
+                I32(q.shape[0]), I32(columns), I32(k_cache.shape[0]), I32(sequence_lengths.shape[0]),
+                F32(1.0 / float(score_divisor)),
+                I32(k_cache.shape[1]), I32(page_table.shape[1]), I32(q.shape[1]), I32(int(compress_ratio)),
+            ],
+        )
+        return logits, visible_blocks
     block_n = 32
     _qsa_mqa_paged_kernel[(q.shape[0], triton.cdiv(columns, block_n))](
         q,
@@ -1391,6 +1442,26 @@ def qsa_sparse_paged_attention(
     return out
 
 
+
+_QSA_CACHE_OPS_AOT = None
+def _get_qsa_cache_ops_aot():
+    global _QSA_CACHE_OPS_AOT
+    if _QSA_CACHE_OPS_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_QSA_CACHE_OPS_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_QSA_CACHE_OPS_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "qsa_cache_ops_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/qsa_cache_ops_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _QSA_CACHE_OPS_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _QSA_CACHE_OPS_AOT is None:
+            _QSA_CACHE_OPS_AOT = False
+    return _QSA_CACHE_OPS_AOT
+
 def qsa_store_cache_rows(
     cache: torch.Tensor,
     slot_mapping: torch.Tensor,
@@ -1410,6 +1481,32 @@ def qsa_store_cache_rows(
     if rows.shape != (slot_mapping.numel(), cache.shape[3]):
         raise ValueError("QSA cache rows and slots have incompatible shapes")
     if not rows.shape[0]:
+        return
+    _cops = _get_qsa_cache_ops_aot()
+    if (
+        _cops
+        and cache.dtype == rows.dtype
+        and cache.dtype in (torch.bfloat16, torch.int64)
+        and slot_mapping.dtype in (torch.int32, torch.int64)
+        and slot_mapping.is_contiguous()
+    ):
+        import ctypes as _ct
+        _hm, _m = _cops
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        _fn = "qsa_store_rows_bf16" if cache.dtype == torch.bfloat16 else "qsa_store_rows_i64"
+        with torch.cuda.device(cache.device):
+            _m.launch(
+                _fn,
+                ((rows.shape[0] + 3) // 4, 1, 1),
+                (128, 1, 1),
+                [
+                    _hm.ptr(cache), _hm.ptr(slot_mapping), _hm.ptr(rows),
+                    I64(cache.stride(0)), I64(cache.stride(1)), I64(cache.stride(3)),
+                    I64(rows.stride(0)), I64(rows.stride(1)),
+                    I32(rows.shape[0]), I32(cache.shape[0]), I32(cache.shape[1]), I32(cache.shape[3]),
+                    I32(1 if slot_mapping.dtype == torch.int64 else 0),
+                ],
+            )
         return
     _store_qsa_rows_kernel[(rows.shape[0],)](
         cache,
@@ -1502,6 +1599,54 @@ def qsa_compress_groups_with_ratio(
         load_rope_positions = False
     else:
         load_rope_positions = True
+    _cops = _get_qsa_cache_ops_aot()
+    if (
+        _cops
+        and raw_keys.dtype == torch.bfloat16
+        and compressor_state_cache.dtype == torch.bfloat16
+        and raw_positions.dtype == torch.int64
+        and compressor_state_block_table.dtype == torch.int32
+        and token_to_req.dtype == torch.int32
+        and query_start_loc.dtype == torch.int32
+        and logical_positions.dtype in (torch.int32, torch.int64)
+        and compressed_slots.dtype in (torch.int32, torch.int64)
+        and token_to_req.is_contiguous()
+        and query_start_loc.is_contiguous()
+        and logical_positions.is_contiguous()
+        and compressed_slots.is_contiguous()
+    ):
+        import ctypes as _ct
+        _hm, _m = _cops
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        _flags = (
+            (1 if load_rope_positions else 0)
+            | (2 if logical_positions.dtype == torch.int64 else 0)
+            | (4 if compressed_slots.dtype == torch.int64 else 0)
+        )
+        with torch.cuda.device(raw_keys.device):
+            _m.launch(
+                "qsa_compress_groups_bf16",
+                ((rows + 3) // 4, 1, 1),
+                (128, 1, 1),
+                [
+                    _hm.ptr(raw_keys), _hm.ptr(raw_positions),
+                    _hm.ptr(compressor_state_cache), _hm.ptr(rope_cache),
+                    _hm.ptr(compressor_state_block_table), _hm.ptr(token_to_req),
+                    _hm.ptr(query_start_loc), _hm.ptr(logical_positions), _hm.ptr(compressed_slots),
+                    _hm.ptr(pooled), _hm.ptr(first_positions),
+                    I64(raw_keys.stride(0)), I64(raw_keys.stride(2)),
+                    I64(raw_positions.stride(0)), I64(raw_positions.stride(2)),
+                    I64(compressor_state_cache.stride(0)), I64(compressor_state_cache.stride(1)), I64(compressor_state_cache.stride(3)),
+                    I64(rope_cache.stride(0)), I64(rope_cache.stride(1)), I64(rope_cache.stride(3)),
+                    I64(compressor_state_block_table.stride(0)),
+                    I64(pooled.stride(0)), I64(pooled.stride(2)),
+                    I64(first_positions.stride(0)), I64(first_positions.stride(1)),
+                    I32(rows), I32(compressor_state_cache.shape[0]), I32(compressor_state_block_table.shape[0]),
+                    I32(compressor_state_cache.shape[1]), I32(compress_ratio), I32(raw_keys.shape[2]),
+                    I32(_flags),
+                ],
+            )
+        return pooled, first_positions
     _compress_qsa_groups_kernel[(rows,)](
         raw_keys,
         raw_positions,

@@ -8,6 +8,25 @@ import torch
 _HIPHC_V2_COMBINE = os.environ.get("GP8HC_HIP_V2_COMBINE") == "1"
 _HIPHC_V2_EXT = None
 
+
+_HC_OPS_AOT = None
+def _get_hc_ops_aot():
+    global _HC_OPS_AOT
+    if _HC_OPS_AOT is None:
+        if os.environ.get("HTR_HC_OPS_AOT", "1") == "1":
+            for cand in (
+                os.environ.get("HTR_HC_OPS_HSACO", ""),
+                os.path.join(os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "hc_ops_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/hc_ops_aot.hsaco",
+            ):
+                if cand and os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _HC_OPS_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _HC_OPS_AOT is None:
+            _HC_OPS_AOT = False
+    return _HC_OPS_AOT
+
 def _hiphc_v2_ext():
     global _HIPHC_V2_EXT
     if _HIPHC_V2_EXT is None:
@@ -88,6 +107,19 @@ def _grouped_gemma_rmsnorm(
     assert weight.numel() in (group_dim, DIM)
 
     y = x.new_empty(x.shape)
+    _aot = _get_hc_ops_aot()
+    if _aot and x.dtype == torch.bfloat16 and weight.dtype in (torch.bfloat16, torch.float32) and N > 0:
+        import ctypes as _ct
+        _hm, _m = _aot
+        I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+        with torch.cuda.device(x.device):
+            _m.launch(
+                "hc_grouped_gemma_rmsnorm_bf16", (N * num_groups, 1, 1), (256, 1, 1),
+                [_hm.ptr(x), _hm.ptr(weight), _hm.ptr(y), I64(x.stride(0)), I64(y.stride(0)),
+                 I32(group_dim), I32(num_groups), I32(1 if weight.numel() == group_dim else 0),
+                 I32(1 if weight.dtype == torch.bfloat16 else 0), F32(float(eps))],
+            )
+        return y
     _grouped_gemma_rmsnorm_kernel[(N * num_groups,)](
         x,
         weight,
@@ -135,6 +167,17 @@ def _hc_silu(x: torch.Tensor, hc_count: int) -> torch.Tensor:
     assert x.stride(1) == 1
 
     output = x.new_empty(x.shape)
+    _aot = _get_hc_ops_aot()
+    if _aot and x.dtype == torch.bfloat16 and num_tokens > 0:
+        import ctypes as _ct
+        _hm, _m = _aot
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        with torch.cuda.device(x.device):
+            _m.launch(
+                "hc_silu_bf16", (num_tokens, 1, 1), (256, 1, 1),
+                [_hm.ptr(x), _hm.ptr(output), I64(x.stride(0)), I64(output.stride(0)), I32(DIM), I32(hc_count)],
+            )
+        return output
     _hc_silu_kernel[(num_tokens,)](
         x,
         output,
@@ -195,6 +238,18 @@ def _hc_gate_mix(x: torch.Tensor, gate: torch.Tensor, hc_count: int) -> torch.Te
 
     HC_DIM = DIM // hc_count
     out = x.new_empty(N, HC_DIM)
+    _aot = _get_hc_ops_aot()
+    if _aot and x.dtype == torch.bfloat16 and gate.dtype == torch.bfloat16 and N > 0:
+        import ctypes as _ct
+        _hm, _m = _aot
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        with torch.cuda.device(x.device):
+            _m.launch(
+                "hc_gate_mix_bf16", ((HC_DIM + 255) // 256, N, 1), (256, 1, 1),
+                [_hm.ptr(x), _hm.ptr(gate), _hm.ptr(out), I64(x.stride(0)), I64(gate.stride(0)), I64(out.stride(0)),
+                 I32(HC_DIM), I32(hc_count)],
+            )
+        return out
     BLOCK_SIZE = 512
     _hc_gate_mix_kernel[(triton.cdiv(HC_DIM, BLOCK_SIZE), N) if N >= 64 else (N, triton.cdiv(HC_DIM, BLOCK_SIZE))](
         x,
@@ -273,6 +328,19 @@ def _hc_combine(
     assert injection_logits.stride(1) == 1
 
     out = residual.new_empty(residual.shape)
+    _aot = _get_hc_ops_aot()
+    if _aot and residual.dtype == torch.bfloat16 and block_output.dtype == torch.bfloat16 and injection_logits.dtype == torch.bfloat16 and N > 0:
+        import ctypes as _ct
+        _hm, _m = _aot
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        with torch.cuda.device(residual.device):
+            _m.launch(
+                "hc_combine_bf16", ((hc_dim + 255) // 256, N, 1), (256, 1, 1),
+                [_hm.ptr(block_output), _hm.ptr(residual), _hm.ptr(injection_logits), _hm.ptr(out),
+                 I64(block_output.stride(0)), I64(residual.stride(0)), I64(injection_logits.stride(0)), I64(out.stride(0)),
+                 I32(hc_dim), I32(hc_count)],
+            )
+        return out
     BLOCK_SIZE = 512
     _hc_combine_kernel[(triton.cdiv(hc_dim, BLOCK_SIZE), N) if N >= 64 else (N, triton.cdiv(hc_dim, BLOCK_SIZE))](
         block_output,
@@ -397,6 +465,29 @@ def _hc_combine_norm(
             return out_h, y_h
     out = residual.new_empty(residual.shape)
     y = residual.new_empty(residual.shape)
+    _aot = _get_hc_ops_aot()
+    if (
+        _aot
+        and residual.dtype == torch.bfloat16
+        and block_output.dtype == torch.bfloat16
+        and injection_logits.dtype == torch.bfloat16
+        and norm_weight.dtype in (torch.bfloat16, torch.float32)
+        and N > 0
+    ):
+        import ctypes as _ct
+        _hm, _m = _aot
+        I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+        with torch.cuda.device(residual.device):
+            _m.launch(
+                "hc_combine_norm_bf16", (hc_count, N, 1), (256, 1, 1),
+                [_hm.ptr(block_output), _hm.ptr(residual), _hm.ptr(injection_logits), _hm.ptr(norm_weight),
+                 _hm.ptr(out), _hm.ptr(y),
+                 I64(block_output.stride(0)), I64(residual.stride(0)), I64(injection_logits.stride(0)),
+                 I64(out.stride(0)), I64(y.stride(0)),
+                 I32(hc_dim), I32(hc_count), I32(1 if norm_weight.numel() == hc_dim else 0),
+                 I32(1 if norm_weight.dtype == torch.bfloat16 else 0), F32(float(eps))],
+            )
+        return out, y
     BLOCK_SIZE = 512
     _hc_combine_norm_kernel[(hc_count, N) if N >= 64 else (N, hc_count)](
         block_output,

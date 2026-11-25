@@ -76,6 +76,29 @@ DENSE_PREFILL_WMMA_MAX_M = int(os.environ.get("HTR_DENSE_PREFILL_WMMA_MAX_M", "2
 _DPW_MOD = None
 
 
+
+DENSE_PREFILL_V2 = os.environ.get("HTR_DENSE_PREFILL_V2", "0") == "1"
+DENSE_PREFILL_V2_MIN_M = int(os.environ.get("HTR_DENSE_PREFILL_V2_MIN_M", "65"))
+DENSE_PREFILL_V2_MAX_M = int(os.environ.get("HTR_DENSE_PREFILL_V2_MAX_M", "16384"))
+_DPW_V2_MOD = None
+
+
+def _get_dpw_v2():
+    global _DPW_V2_MOD
+    if _DPW_V2_MOD is None:
+        for cand in (
+            os.environ.get("HTR_DENSE_PREFILL_V2_HSACO", ""),
+            os.path.join(os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "htr_dense_prefill_v2.hsaco"),
+            "/opt/vllm-htr/native-v026/htr_dense_prefill_v2.hsaco",
+        ):
+            if cand and os.path.isfile(cand):
+                import direct_hip_module_v1 as _hm
+                _DPW_V2_MOD = (_hm, _hm.Module(cand))
+                break
+        if _DPW_V2_MOD is None:
+            _DPW_V2_MOD = False
+    return _DPW_V2_MOD
+
 def _dpw_ext():
     global _DPW_MOD
     if _DPW_MOD is None:
@@ -147,6 +170,42 @@ def _linear_impl(x2, qweight, scales, su, sv, bias):
             else:
                 outs.append(E.gemv_epi(qweight, xt[r0:r1], xs[r0:r1], tok[r0:r1], scales, CB, sv, bias, cnt, ns, od, _e8))
         return torch.cat(outs)
+    if (
+        DENSE_PREFILL_V2
+        and DENSE_PREFILL_V2_MIN_M <= M <= DENSE_PREFILL_V2_MAX_M
+        and x2.dtype == torch.bfloat16
+        and qweight.shape[2] in (32, 40)
+        and (mt % 8) == 0
+        and (nt % 2) == 0
+        and (bias is None or bias.dtype == torch.bfloat16)
+    ):
+        _dpv2 = _get_dpw_v2()
+        if _dpv2:
+            import ctypes as _ct
+            _hm, _m = _dpv2
+            I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+            xt, xs, tok = E.prologue(x2, su)
+            Y = x2.new_empty((M, mt * 16), dtype=torch.bfloat16)
+            _K = qweight.shape[2] // 8
+            if M <= 256:
+                _fn = f"dense_prefill_k{_K}_bm64"
+                _grid = (mt // 8, (M + 63) // 64, 1)
+                _blk = (128, 1, 1)
+            else:
+                _fn = f"dense_prefill_k{_K}_bm128"
+                _grid = (mt // 8, (M + 127) // 128, 1)
+                _blk = (256, 1, 1)
+            with torch.cuda.device(x2.device):
+                _m.launch(
+                    _fn, _grid, _blk,
+                    [
+                        _hm.ptr(qweight), _hm.ptr(xt), _hm.ptr(xs), _hm.ptr(tok),
+                        _hm.ptr(scales), _hm.ptr(sv),
+                        _hm.ptr(bias) if bias is not None else I64(0),
+                        _hm.ptr(Y), I32(M), I32(mt), I32(nt), F32(float(CB)),
+                    ],
+                )
+            return Y
     if (
         DENSE_PREFILL_WMMA
         and DENSE_PREFILL_WMMA_MIN_M <= M <= DENSE_PREFILL_WMMA_MAX_M

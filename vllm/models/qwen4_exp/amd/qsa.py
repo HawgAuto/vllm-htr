@@ -98,7 +98,7 @@ _GL_OUT_TAIL = _gl_os.environ.get("DIRECT_QSA_OUT_TAILZERO") == "1"
 
 # RESEARCH (research/v033-octave-kv): upstream octave_decode_sparse takes GQA groups <= 8
 # (WMMA tile hpk * QG <= 32, window kernel hq / hkv <= 8); HTR TP1 Qwen3.8 is Q24/KV2 = 12.
-_OCTAVE_MAX_GROUP = 8
+_OCTAVE_MAX_GROUP = int(_gl_os.environ.get('HTR_OCTAVE_MAX_GROUP', '16'))
 
 
 def _octave_head_split(

@@ -1,5 +1,12 @@
 # vLLM HTR release history
 
+## v0.2.6
+
+- **Image:** `ghcr.io/hawgauto/vllm-htr@sha256:dc11916549c534b207bb45048fe2f9b2177117995931f5aff5b384b274ea0fe8` (alias `ghcr.io/hawgauto/vllm-htr:v0.2.6`)
+- **Highlights:** Zero-Triton-JIT hot path (`20` new zero-spill AOT `gfx1151` Wave32 HIP binaries incl. full-INT8 WMMA QSA prefill, 128-bit `causal_conv1d`, double-buffered W4A16 MoE, GDN prefill, HC v2, MQA v3) + Wave 7 RDNA 3.5 decode ISA upgrades (`htr_bf16_gemv.so` hidden `v_dual_dot2acc_f32_bf16`, `htr_moe_k6_shx.so`, `htr_kernels.so`).
+- **Verified zero-overlay served gains vs `v0.2.5` (INT8 KV, MTP-3):** `13K` warm prefill **`2.06×`** (`551.9 → 1,137.7 tok/s`, `23.58s → 11.44s`), `13K` cold prefill **`1.65×`** (`910.5 tok/s`), `c=4×4K` wall **`1.09×`** (`23.82s → 21.77s`, sum decode `+7.7%` to `61.65 tok/s`), `c=8` wall **`1.23×`** (`19.03s → 15.51s`), **`0`** mid-inference Triton JIT warnings.
+- **Details:** [htr_runtime/releases/v0.2.6/README.md](htr_runtime/releases/v0.2.6/README.md)
+
 ## v0.2.5
 
 - **Image:** `ghcr.io/hawgauto/vllm-htr@sha256:daa6b2847bf9678e2de39b8b216105ffe13313e50db889f002f5f918e581d193` (alias `ghcr.io/hawgauto/vllm-htr:v0.2.5`)

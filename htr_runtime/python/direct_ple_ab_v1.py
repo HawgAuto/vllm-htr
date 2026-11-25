@@ -91,7 +91,7 @@ FSTAT_EVERY = int(os.environ.get('DIRECT_PLE_FSTAT_EVERY', '1'))  # E27: shard i
 _TAB = {}
 
 
-def _gather_ids(reader, ids, lib):
+def _gather_ids(reader, ids, lib, out=None):
     ids = np.ascontiguousarray(ids, dtype=np.int64)
     dim = reader._embedding_dim
     if ids.ndim != 1:
@@ -116,7 +116,8 @@ def _gather_ids(reader, ids, lib):
                 if st.st_dev != loc.device or st.st_ino != loc.inode or st.st_size != loc.file_size:
                     raise OSError(f'safetensors shard identity changed: {loc.path}')
         t['calls'] += 1
-        out = np.empty((ids.size, dim), np.uint16)
+        if out is None:
+            out = np.empty((ids.size, dim), np.uint16)
         st3 = np.zeros(3, np.int64)
         t0 = time.perf_counter()
         rc = lib.ple_gather_ids(ids.ctypes.data, ids.size, t['fds'].ctypes.data, t['base'].ctypes.data, t['rows'].ctypes.data,
@@ -138,12 +139,12 @@ def _gather_ids(reader, ids, lib):
     return out
 
 
-def gather_rows_native(reader, ids):
+def gather_rows_native(reader, ids, out=None):
     """Return uint16 [len(ids), dim] rows, byte-identical to reader.gather_bytes."""
     if IDS_FAST:
         lib = _lib()
         if lib._e27_ids:
-            return _gather_ids(reader, ids, lib)
+            return _gather_ids(reader, ids, lib, out=out)
     ids = np.ascontiguousarray(ids, dtype=np.int64)
     dim = reader._embedding_dim
     rb = reader._row_bytes
@@ -194,6 +195,9 @@ def gather_rows_native(reader, ids):
             reader._read_calls += int(starts.size)
             reader._read_bytes += int(rlen.sum())
             reader._gather_wall_seconds += elapsed
+    if out is not None:
+        out[:] = buf[inv]
+        return out
     return buf[inv]
 
 

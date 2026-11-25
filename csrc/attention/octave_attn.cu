@@ -1093,13 +1093,13 @@ void octave_decode_sparse(torch::Tensor out, torch::Tensor query,
       win ? stags->data_ptr<int>() : nullptr, smask, 4);
   TORCH_CHECK(ns > 0,
               "octave_decode_sparse: needs the WMMA tier (gfx1100, head size "
-              "256, GQA group <= 8)");
+              "256, GQA group <= 16)");
   if (!win) {
     launch_reduce(out, mid_o, v_signs, ns, stream);
     return;
   }
   const int hq = query.size(1), hkv = cache.size(1);
-  TORCH_CHECK(hq / hkv <= 8 && wtab->size(1) == hkv && wtab->size(2) == 2 * D);
+  TORCH_CHECK(hq / hkv <= 16 && wtab->size(1) == hkv && wtab->size(2) == 2 * D);
   dim3 grid(num_q, hkv);
   #define SQ_WIN(T)                                                         \
     window_attn_kernel<T><<<grid, 256, 0, stream>>>(                        \

@@ -114,3 +114,23 @@ def hpf4_ext():
         spec.loader.exec_module(mod)
         _HPF4 = mod
     return _HPF4
+
+
+# ---- V6-P1: opt-in 3-stage pipelined MoE prefill (bit-exact vs HPF4; NT loadB + tight grid + adaptive BMW=64/128)
+_HPF5 = None
+
+
+def hpf5_ext():
+    global _HPF5
+    if _HPF5 is None:
+        import importlib.util
+        path = os.environ.get('HTR_HPF5_SO') or os.path.join(
+            os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'), 'hpf5_v2_moe_prefill.so'
+        )
+        if not os.path.isfile(path):
+            raise FileNotFoundError(f'HTR_MOE_HPF5: missing native extension {path}')
+        spec = importlib.util.spec_from_file_location('hpf5_v2_moe_prefill', path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        _HPF5 = mod
+    return _HPF5

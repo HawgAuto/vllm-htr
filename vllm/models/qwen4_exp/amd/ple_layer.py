@@ -218,10 +218,46 @@ def _direct_tr12(x, BR, BC, nw):
             raise RuntimeError('direct fast transpose self-check FAILED')
         _DX_SELFCHECKED.add(key)
     return y
+_DIRECT_TR12_MOD = None
+def _get_direct_tr12_mod():
+    global _DIRECT_TR12_MOD
+    if _DIRECT_TR12_MOD is None:
+        if _dx_os.environ.get('HTR_TR12_AOT', '1') == '1':
+            for cand in (
+                _dx_os.environ.get('HTR_TR12_HSACO', ''),
+                _dx_os.path.join(_dx_os.environ.get('HTR_NATIVE_DIR', '/opt/vllm-htr/native-bin'), 'direct_tr12.hsaco'),
+                '/opt/vllm-htr/native-v026/direct_tr12.hsaco',
+            ):
+                if cand and _dx_os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _DIRECT_TR12_MOD = (_hm, _hm.Module(cand))
+                    break
+        if _DIRECT_TR12_MOD is None:
+            _DIRECT_TR12_MOD = False
+    return _DIRECT_TR12_MOD
+
 def _direct_tr12_raw(x, BR, BC, nw):
     B, R, C = x.shape
     y = torch.empty((B, C, R), dtype=x.dtype, device=x.device)
     if y.numel() == 0:
+        return y
+    mod = _get_direct_tr12_mod()
+    if mod and x.element_size() in (2, 4):
+        import ctypes as _ct
+        _hm, _m = mod
+        fn = 'direct_tr12_b16' if x.element_size() == 2 else 'direct_tr12_b32'
+        sx = x.stride()
+        sy = y.stride()
+        _m.launch(
+            fn,
+            ((C + 31) // 32, (R + 31) // 32, B),
+            (32, 8, 1),
+            [
+                _hm.ptr(x), _hm.ptr(y), _ct.c_int32(R), _ct.c_int32(C),
+                _ct.c_int64(sx[0]), _ct.c_int64(sx[1]), _ct.c_int64(sx[2]),
+                _ct.c_int64(sy[0]), _ct.c_int64(sy[1]), _ct.c_int64(sy[2]),
+            ],
+        )
         return y
     _direct_tr12_kernel[(_dx_triton.cdiv(C, BC), _dx_triton.cdiv(R, BR), B)](x, y, R, C, *x.stride(), *y.stride(), BR=BR, BC=BC, num_warps=nw)
     return y

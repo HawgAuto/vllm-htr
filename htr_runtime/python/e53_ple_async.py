@@ -73,7 +73,7 @@ def submit(emb, ngram_ids, rows_dev, bufs):
         out = rows_h.view(torch.int16).numpy().reshape(m, dim)
         mb = getattr(reader, "max_batch_rows", 65536)
         for s in range(0, m, mb):
-            out[s:s + mb] = P.gather_rows_native(reader, ids_np[s:s + mb]).view(np.int16)
+            P.gather_rows_native(reader, ids_np[s:s + mb], out=out[s:s + mb].view(np.uint16))
         t2 = time.perf_counter()
         P.record("native", case, m, (t2 - t0) * 1e3)
         return dict(wait_ms=round((t1 - t0) * 1e3, 3), gather_ms=round((t2 - t1) * 1e3, 3), ids=m)

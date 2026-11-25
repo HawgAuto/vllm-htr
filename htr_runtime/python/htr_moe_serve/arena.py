@@ -72,11 +72,14 @@ def build_arena_cpu(experts, spadk=DEFAULT_SPADK):
         per[e], kk[e] = p, k
     if sorted(per) != list(range(NE)):
         raise ValueError(f'expert coverage {len(per)} != {NE}')
-    words, qoff, off = [], [], 0
+    # Pass 1: validate + compute exact total words so we allocate ONE contiguous qw/scales/sv/su (zero double-copy!)
+    qoff = []
+    off = 0
     for e in range(NE):
         k, p = kk[e], per[e]
         if not torch.equal(p['gate']['su'], p['up']['su']):
             raise ValueError(f'expert {e}: gate/up su differ')
+        pk = spadk.get(k, 0)
         o = []
         for r in ROLES:
             m, n = GEOM[r]
@@ -86,25 +89,54 @@ def build_arena_cpu(experts, spadk=DEFAULT_SPADK):
             if (p[r]['scales'].dtype, p[r]['scales'].numel()) != (torch.float16, m) or p[r]['sv'].numel() != m // 8 \
                     or p[r]['su'].numel() != n // 8 or p[r]['sv'].dtype != torch.uint8 or p[r]['su'].dtype != torch.uint8:
                 raise ValueError(f'expert {e} {r}: scales/su/sv geometry or dtype')
-            q = q.contiguous().view(q.shape[0], -1)
-            pk = spadk.get(k, 0)
-            if pk:
-                q = torch.cat([q, torch.zeros(q.shape[0], pk, dtype=q.dtype)], 1)
-            q = q.reshape(-1)
-            o.append(off); words.append(q); off += q.numel()
+            rows_r = m // 16
+            cols_r = (n // 16) * (8 * k) + pk
+            o.append(off)
+            off += rows_r * cols_r
         qoff.append(o)
     sh_qw_off = None
+    total_words = off
     if os.environ.get('HTR_MOE_K6_SHARED') == '1':
         spad5 = int(spadk.get(5, 0))
         sh_words = (40 + 40) * (160 * 40 + spad5) + 160 * (40 * 40 + spad5)
         sh_qw_off = off
-        words.append(torch.zeros(sh_words, dtype=torch.int32))
+        total_words += sh_words
+    qw = torch.zeros(total_words, dtype=torch.int32)
+    scales = torch.empty(NE * SC_ES, dtype=torch.float16)
+    sv = torch.empty(NE * SV_ES, dtype=torch.uint8)
+    su = torch.empty(NE * SU_ES, dtype=torch.uint8)
+    # Pass 2: direct in-place copy into pre-allocated buffers (saves ~2.36 GiB transient memcpy/layer)
+    for e in range(NE):
+        k, p = kk[e], per[e]
+        pk = spadk.get(k, 0)
+        for ri, r in enumerate(ROLES):
+            m, n = GEOM[r]
+            rows_r = m // 16
+            raw_cols = (n // 16) * (8 * k)
+            cols_r = raw_cols + pk
+            o0 = qoff[e][ri]
+            q = p[r]['qweight'].contiguous().view(rows_r, raw_cols)
+            if pk:
+                qw[o0:o0 + rows_r * cols_r].view(rows_r, cols_r)[:, :raw_cols].copy_(q)
+            else:
+                qw[o0:o0 + rows_r * raw_cols].copy_(q.reshape(-1))
+        sb = e * SC_ES
+        scales[sb:sb + I].copy_(p['gate']['scales'])
+        scales[sb + I:sb + 2 * I].copy_(p['up']['scales'])
+        scales[sb + 2 * I:sb + SC_ES].copy_(p['down']['scales'])
+        vb = e * SV_ES
+        sv[vb:vb + I // 8].copy_(p['gate']['sv'])
+        sv[vb + I // 8:vb + 2 * I // 8].copy_(p['up']['sv'])
+        sv[vb + 2 * I // 8:vb + SV_ES].copy_(p['down']['sv'])
+        ub = e * SU_ES
+        su[ub:ub + H // 8].copy_(p['gate']['su'])
+        su[ub + H // 8:ub + SU_ES].copy_(p['down']['su'])
     out = dict(
-        qw=torch.cat(words),
+        qw=qw,
         qoff=torch.tensor(qoff, dtype=torch.int64),
-        scales=torch.cat([torch.cat([per[e]['gate']['scales'], per[e]['up']['scales'], per[e]['down']['scales']]) for e in range(NE)]),
-        sv=torch.cat([torch.cat([per[e]['gate']['sv'], per[e]['up']['sv'], per[e]['down']['sv']]) for e in range(NE)]),
-        su=torch.cat([torch.cat([per[e]['gate']['su'], per[e]['down']['su']]) for e in range(NE)]),
+        scales=scales,
+        sv=sv,
+        su=su,
         kexp=torch.tensor([kk[e] for e in range(NE)], dtype=torch.int32))
     assert out['scales'].numel() == NE * SC_ES and out['sv'].numel() == NE * SV_ES and out['su'].numel() == NE * SU_ES
     if sh_qw_off is not None:
@@ -136,7 +168,7 @@ class Prefetcher:
     def __init__(self, spec, dev):
         self.spec, self.dev = spec, dev
         self.man = read_manifest(spec['manifest'], spec['manifest_sha256'])
-        n = int(os.environ.get('HTR_MOE_LOAD_WORKERS', '2'))
+        n = int(os.environ.get('HTR_MOE_LOAD_WORKERS', '8'))
         self.pool = ThreadPoolExecutor(max(1, n), thread_name_prefix='htr-moe-load')
         self.tls = threading.local()
         self.t0 = time.time()

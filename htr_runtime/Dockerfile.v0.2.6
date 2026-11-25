@@ -1,0 +1,6 @@
+FROM ghcr.io/hawgauto/vllm-htr:v0.2.5
+USER root
+COPY payload /payload
+RUN python3 /payload/install_v026.py
+USER 1000:1000
+LABEL org.opencontainers.image.version="0.2.6"       org.opencontainers.image.description="vllm-htr v0.2.6 — Zero-Triton-JIT AOT gfx1151 prefill+decode + INT8 WMMA QSA + Wave 7 RDNA 3.5 ISA upgrades"

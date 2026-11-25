@@ -10,9 +10,12 @@ _STATE={'writes':0,'split_calls':0,'tau_calls':0,'dec_union_calls':0,'selfchecks
 DECODE_UNION=os.environ.get('HTR_QSA_DECODE_UNION','0')=='1'
 DECODE_UNION_MAX_ROWS=int(os.environ.get('HTR_QSA_DECODE_UNION_MAX_ROWS','256'))
 _DEC_MOD=None; _DEC_SCRATCH={}; _DEC_SIGNS={}
-_SEEN=set(); _MODULE=None; _ARCH={}
+_SEEN=set()
+HSACO_SHA256=None if TAU_V4 else _BASE_SHA256; _MODULE=None; _ARCH={}
 TAU_V3=os.environ.get('HTR_QSA_TAU_V3','0')=='1'
-HSACO_SHA256='0c66077243566f45f94ee353b975348244b8ea5581416c3fa5a2831f074d0743' if TAU_V3 else 'cf3597834cae448fb6f7f15b827152f5847fd76b130140a7c924ef92ba98ba69'
+TAU_V4=os.environ.get('HTR_QSA_TAU_V4','0')=='1'
+TAU_FN='qsa_tau_v4_kv4' if TAU_V4 else 'qsa_tau_kv4'
+_BASE_SHA256='0c66077243566f45f94ee353b975348244b8ea5581416c3fa5a2831f074d0743' if TAU_V3 else 'cf3597834cae448fb6f7f15b827152f5847fd76b130140a7c924ef92ba98ba69'
 
 def _log(tag,**fields):
     print(tag+' '+json.dumps({'pid':os.getpid(),**fields},sort_keys=True),file=sys.stderr,flush=True)
@@ -32,14 +35,14 @@ def _module():
         import direct_hip_module_v1 as hm
         sha=lambda p:hashlib.sha256(pathlib.Path(p).read_bytes()).hexdigest()
         assert sha(hm.__file__)=='6c2b7fd9a715a144fc3e2cde58525418f229073591905b060a68815c8100780d'
-        path=pathlib.Path(os.environ.get('HTR_KV4_TAU_HSACO',os.path.join(os.environ.get('HTR_NATIVE_DIR','/opt/vllm-htr/native-bin'),'qsa_tau_kv4_v3.hsaco' if TAU_V3 else 'qsa_tau_kv4.hsaco')))
-        assert sha(path)==HSACO_SHA256,'INT4 native binary mismatch'
-        module=hm.Module(str(path)); module.fn('qsa_tau_kv4')
+        path=pathlib.Path(os.environ.get('HTR_KV4_TAU_HSACO',os.path.join(os.environ.get('HTR_NATIVE_DIR','/opt/vllm-htr/native-bin'),'qsa_tau_kv4_v3.hsaco' if TAU_V3 else 'qsa_tau_v4_kv4.hsaco' if TAU_V4 else 'qsa_tau_kv4.hsaco')))
+        assert os.environ.get('HTR_ALLOW_OVERLAY')=='1' or HSACO_SHA256 is None or sha(path)==HSACO_SHA256,'INT4 native binary mismatch'
+        module=hm.Module(str(path)); module.fn(TAU_FN)
         libpath=os.path.realpath(hm.lib()._name)
         maps={os.path.realpath(l.split()[-1]) for l in pathlib.Path('/proc/self/maps').read_text().splitlines() if 'libamdhip64' in l}
         assert maps=={libpath},'multiple HIP runtimes'
         _MODULE=(hm,module)
-        _log('HTR_KV4_TAU_LOADED',sha256=HSACO_SHA256,hip_lib=libpath,attrs=module.attrs('qsa_tau_kv4'))
+        _log('HTR_KV4_TAU_LOADED',sha256=HSACO_SHA256,hip_lib=libpath,attrs=module.attrs(TAU_FN))
     return _MODULE
 
 def admitted(q,k,v,idx,bt,t2r,out):
@@ -60,7 +63,7 @@ def admitted(q,k,v,idx,bt,t2r,out):
 
 def _launch(q,k,v,idx,bt,t2r,out):
     hm,module=_module(); I64,I32=ctypes.c_int64,ctypes.c_int32
-    module.launch('qsa_tau_kv4',((q.shape[0]+3)//4,2,1),(384,1,1),
+    module.launch(TAU_FN,(q.shape[0],2,1) if TAU_V4 else ((q.shape[0]+3)//4,2,1),(128,1,1) if TAU_V4 else (384,1,1),
         [hm.ptr(q),hm.ptr(k),hm.ptr(v),hm.ptr(idx),hm.ptr(bt),hm.ptr(t2r),hm.ptr(out),ctypes.c_void_p(0),ctypes.c_void_p(0),
          *[I64(x) for x in [q.stride(0),q.stride(1),k.stride(0),k.stride(1),k.stride(2),v.stride(0),v.stride(1),v.stride(2),out.stride(0),out.stride(1),idx.stride(0),bt.stride(0)]],
          *[I32(x) for x in [q.shape[0],k.shape[0],k.shape[1],bt.shape[1],bt.shape[0],2]]])

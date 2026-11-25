@@ -45,7 +45,6 @@ using octave::D;
 using octave::Format;
 using octave::LUT_ONE;
 using octave::R;
-constexpr int QG = 4;  // query tokens per block
 // Exact recent and leading positions (sparse window mode).
 [[maybe_unused]] constexpr int kWindow = 64;
 [[maybe_unused]] constexpr int kSinks = 4;
@@ -115,7 +114,7 @@ __device__ __forceinline__ float sign_of(const int* bits, int i) {
 // SP: sparse mode. Row qi attends to the logical positions idx[qi, 0..topk)
 // (negative entries are skipped) instead of its first q_to_klen[qi] tokens,
 // and every row is its own segment since rows do not share positions.
-template <int VB, bool KC, int NSB, typename QT, bool SP>
+template <int VB, bool KC, int NSB, typename QT, bool SP, int QG = 4>
 __global__ __launch_bounds__(64 * NSB) void decode_wmma(
     const QT* __restrict__ Q, const uint8_t* __restrict__ cache,
     const int* __restrict__ block_table, const int* __restrict__ q_to_req,
@@ -631,9 +630,10 @@ int octave_decode_wmma(torch::Tensor query, torch::Tensor cache,
   const int num_q_heads = query.size(1);
   const int num_kv_heads = cache.size(1);
   const int hpk = num_q_heads / num_kv_heads;
+  const int qg_eff = (hpk <= 8) ? 4 : ((hpk <= 16) ? 2 : 0);
   const bool eligible =
-      arch_ok && query.size(2) == D && query.stride(2) == 1 && hpk * QG <= 32 &&
-      cache.size(2) % 16 == 0 &&
+      arch_ok && query.size(2) == D && query.stride(2) == 1 && qg_eff > 0 &&
+      hpk * qg_eff <= 32 && cache.size(2) % 16 == 0 &&
       cache.stride(2) % (fmt & octave::kCompactFlag ? 4 : 8) == 0 &&
       num_kv_splits >= 1;
   if (!eligible) return 0;
@@ -644,11 +644,11 @@ int octave_decode_wmma(torch::Tensor query, torch::Tensor cache,
   const int* idx = sp ? indices->data_ptr<int>() : nullptr;
   const int64_t sidx = sp ? indices->stride(0) : 0;
   const int topk = sp ? (int)indices->size(1) : 0;
-  const int nrt = std::min(num_q, QG) * hpk > 16 ? 2 : 1;
+  const int nrt = std::min(num_q, qg_eff) * hpk > 16 ? 2 : 1;
   const int spb = 2 * kSqWmmaNsb / nrt;
-  dim3 grid((num_q + QG - 1) / QG, num_kv_heads, (ns + spb - 1) / spb);
-  #define SQW_SP(B, KC, T, SP)                                              \
-    decode_wmma<B, KC, kSqWmmaNsb, T, SP>                                   \
+  dim3 grid((num_q + qg_eff - 1) / qg_eff, num_kv_heads, (ns + spb - 1) / spb);
+  #define SQW_SP_QG(B, KC, T, SP, QGV)                                      \
+    decode_wmma<B, KC, kSqWmmaNsb, T, SP, QGV>                              \
         <<<grid, 64 * kSqWmmaNsb, 0, stream>>>(                             \
             (const T*)query.data_ptr(), (const uint8_t*)cache.data_ptr(),   \
             block_table.data_ptr<int>(), q_to_req.data_ptr<int>(),          \
@@ -660,6 +660,13 @@ int octave_decode_wmma(torch::Tensor query, torch::Tensor cache,
             cache.stride(1), cache.stride(2), mid_o.stride(0),              \
             mid_o.stride(1), mid_o.stride(2), idx, sidx, topk, qpos, wtags, \
             wmask, stags, smask)
+  #define SQW_SP(B, KC, T, SP)                                              \
+    do {                                                                    \
+      if (qg_eff == 4)                                                      \
+        SQW_SP_QG(B, KC, T, SP, 4);                                         \
+      else                                                                  \
+        SQW_SP_QG(B, KC, T, SP, 2);                                         \
+    } while (0)
   #define SQW(B, KC, T)          \
     do {                         \
       if (sp)                    \
@@ -686,6 +693,7 @@ int octave_decode_wmma(torch::Tensor query, torch::Tensor cache,
   }
   #undef SQW
   #undef SQW_SP
+  #undef SQW_SP_QG
   return ns;
 }
 

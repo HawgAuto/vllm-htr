@@ -92,25 +92,31 @@ __global__ __launch_bounds__(256) void k_gemv(const uint32_t* __restrict__ qw, c
     V[0] = tp[(q * K + 8 * K - 1) % (8 * K)];
 #pragma unroll
     for (int k = 0; k < K; ++k) V[k + 1] = tp[q * K + k];
-    h2v xv[M][8];
+    h2v xv[M][4];
 #pragma unroll
     for (int r = 0; r < M; ++r) {
       const uint4* xp = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16);
-      uint4 u0 = xp[0], u1 = xp[1];
+      uint4 u0 = xp[0];
       xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
-      xv[r][4] = as_h2(u1.x); xv[r][5] = as_h2(u1.y); xv[r][6] = as_h2(u1.z); xv[r][7] = as_h2(u1.w);
     }
-#define HTR_PAIR(U)                                                                        \
-    {                                                                                      \
-      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
-      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
-        if ((U) < 16) a0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a0[r], false); \
-        else a1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a1[r], false);      \
-      }                                                                                    \
+#define HTR_PAIR2(UA, UB)                                                                         \
+    {                                                                                             \
+      h2v wa = as_h2(val_f16bits2(ext16<16 + ((UA) + 1) * K>(V), ext16<16 + ((UA) + 2) * K>(V))); \
+      h2v wb = as_h2(val_f16bits2(ext16<16 + ((UB) + 1) * K>(V), ext16<16 + ((UB) + 2) * K>(V))); \
+      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                             \
+        a0[r] = __builtin_amdgcn_fdot2(wa, xv[r][((UA) & 7) >> 1], a0[r], false);                 \
+        a1[r] = __builtin_amdgcn_fdot2(wb, xv[r][((UB) & 7) >> 1], a1[r], false);                 \
+      }                                                                                           \
     }
-    HTR_PAIR(0) HTR_PAIR(2) HTR_PAIR(4) HTR_PAIR(6) HTR_PAIR(8) HTR_PAIR(10) HTR_PAIR(12) HTR_PAIR(14)
-    HTR_PAIR(16) HTR_PAIR(18) HTR_PAIR(20) HTR_PAIR(22) HTR_PAIR(24) HTR_PAIR(26) HTR_PAIR(28) HTR_PAIR(30)
-#undef HTR_PAIR
+    HTR_PAIR2(0, 18) HTR_PAIR2(2, 16) HTR_PAIR2(4, 22) HTR_PAIR2(6, 20)
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      const uint4* xp = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16);
+      uint4 u1 = xp[1];
+      xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+    }
+    HTR_PAIR2(8, 26) HTR_PAIR2(10, 24) HTR_PAIR2(12, 30) HTR_PAIR2(14, 28)
+#undef HTR_PAIR2
   }
 #pragma unroll
   for (int r = 0; r < M; ++r) {
@@ -369,25 +375,31 @@ __global__ __launch_bounds__(256) void k_e82_gemv_epi(const uint32_t* __restrict
 #pragma unroll
       for (int k = 0; k < K; ++k) V[k + 1] = tp[q * K + k];
     }
-    h2v xv[M][8];
+    h2v xv[M][4];
 #pragma unroll
     for (int r = 0; r < M; ++r) {
       const uint4* xp = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16);
-      uint4 u0 = xp[0], u1 = xp[1];
+      uint4 u0 = xp[0];
       xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
-      xv[r][4] = as_h2(u1.x); xv[r][5] = as_h2(u1.y); xv[r][6] = as_h2(u1.z); xv[r][7] = as_h2(u1.w);
     }
-#define HTR_PAIR(U)                                                                        \
-    {                                                                                      \
-      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
-      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
-        if ((U) < 16) a0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a0[r], false); \
-        else a1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a1[r], false);      \
-      }                                                                                    \
+#define HTR_PAIR2(UA, UB)                                                                         \
+    {                                                                                             \
+      h2v wa = as_h2(val_f16bits2(ext16<16 + ((UA) + 1) * K>(V), ext16<16 + ((UA) + 2) * K>(V))); \
+      h2v wb = as_h2(val_f16bits2(ext16<16 + ((UB) + 1) * K>(V), ext16<16 + ((UB) + 2) * K>(V))); \
+      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                             \
+        a0[r] = __builtin_amdgcn_fdot2(wa, xv[r][((UA) & 7) >> 1], a0[r], false);                 \
+        a1[r] = __builtin_amdgcn_fdot2(wb, xv[r][((UB) & 7) >> 1], a1[r], false);                 \
+      }                                                                                           \
     }
-    HTR_PAIR(0) HTR_PAIR(2) HTR_PAIR(4) HTR_PAIR(6) HTR_PAIR(8) HTR_PAIR(10) HTR_PAIR(12) HTR_PAIR(14)
-    HTR_PAIR(16) HTR_PAIR(18) HTR_PAIR(20) HTR_PAIR(22) HTR_PAIR(24) HTR_PAIR(26) HTR_PAIR(28) HTR_PAIR(30)
-#undef HTR_PAIR
+    HTR_PAIR2(0, 18) HTR_PAIR2(2, 16) HTR_PAIR2(4, 22) HTR_PAIR2(6, 20)
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      const uint4* xp = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16);
+      uint4 u1 = xp[1];
+      xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+    }
+    HTR_PAIR2(8, 26) HTR_PAIR2(10, 24) HTR_PAIR2(12, 30) HTR_PAIR2(14, 28)
+#undef HTR_PAIR2
   }
 #pragma unroll
   for (int r = 0; r < M; ++r) {
@@ -468,25 +480,31 @@ __global__ __launch_bounds__(256) void k_e82_gemv_epi8(const uint32_t* __restric
 #pragma unroll
       for (int k = 0; k < K; ++k) V[k + 1] = tp[q * K + k];
     }
-    h2v xv[M][8];
+    h2v xv[M][4];
 #pragma unroll
     for (int r = 0; r < M; ++r) {
       const uint4* xp = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16);
-      uint4 u0 = xp[0], u1 = xp[1];
+      uint4 u0 = xp[0];
       xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
-      xv[r][4] = as_h2(u1.x); xv[r][5] = as_h2(u1.y); xv[r][6] = as_h2(u1.z); xv[r][7] = as_h2(u1.w);
     }
-#define HTR_PAIR(U)                                                                        \
-    {                                                                                      \
-      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
-      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
-        if ((U) < 16) a0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a0[r], false); \
-        else a1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], a1[r], false);      \
-      }                                                                                    \
+#define HTR_PAIR2(UA, UB)                                                                         \
+    {                                                                                             \
+      h2v wa = as_h2(val_f16bits2(ext16<16 + ((UA) + 1) * K>(V), ext16<16 + ((UA) + 2) * K>(V))); \
+      h2v wb = as_h2(val_f16bits2(ext16<16 + ((UB) + 1) * K>(V), ext16<16 + ((UB) + 2) * K>(V))); \
+      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                             \
+        a0[r] = __builtin_amdgcn_fdot2(wa, xv[r][((UA) & 7) >> 1], a0[r], false);                 \
+        a1[r] = __builtin_amdgcn_fdot2(wb, xv[r][((UB) & 7) >> 1], a1[r], false);                 \
+      }                                                                                           \
     }
-    HTR_PAIR(0) HTR_PAIR(2) HTR_PAIR(4) HTR_PAIR(6) HTR_PAIR(8) HTR_PAIR(10) HTR_PAIR(12) HTR_PAIR(14)
-    HTR_PAIR(16) HTR_PAIR(18) HTR_PAIR(20) HTR_PAIR(22) HTR_PAIR(24) HTR_PAIR(26) HTR_PAIR(28) HTR_PAIR(30)
-#undef HTR_PAIR
+    HTR_PAIR2(0, 18) HTR_PAIR2(2, 16) HTR_PAIR2(4, 22) HTR_PAIR2(6, 20)
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      const uint4* xp = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16);
+      uint4 u1 = xp[1];
+      xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+    }
+    HTR_PAIR2(8, 26) HTR_PAIR2(10, 24) HTR_PAIR2(12, 30) HTR_PAIR2(14, 28)
+#undef HTR_PAIR2
   }
 #pragma unroll
   for (int r = 0; r < M; ++r) {
@@ -594,27 +612,33 @@ __global__ __launch_bounds__(256) void k_gemv_fused(const uint32_t* __restrict__
     V[0] = tp[(q * K + 8 * K - 1) % (8 * K)];
 #pragma unroll
     for (int k = 0; k < K; ++k) V[k + 1] = tp[q * K + k];
-    h2v xv[M][8];
+    h2v xv[M][4];
     float d0[M], d1[M];
 #pragma unroll
     for (int r = 0; r < M; ++r) {
       const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
-      uint4 u0 = xp[0], u1 = xp[1];
+      uint4 u0 = xp[0];
       xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
-      xv[r][4] = as_h2(u1.x); xv[r][5] = as_h2(u1.y); xv[r][6] = as_h2(u1.z); xv[r][7] = as_h2(u1.w);
       d0[r] = 0.f; d1[r] = 0.f;
     }
-#define HTR_PAIRF(U)                                                                       \
-    {                                                                                      \
-      h2v w2 = as_h2(val_f16bits2(ext16<16 + ((U) + 1) * K>(V), ext16<16 + ((U) + 2) * K>(V))); \
-      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                      \
-        if ((U) < 16) d0[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], d0[r], false); \
-        else d1[r] = __builtin_amdgcn_fdot2(w2, xv[r][((U) & 15) >> 1], d1[r], false);      \
-      }                                                                                    \
+#define HTR_PAIRF2(UA, UB)                                                                        \
+    {                                                                                             \
+      h2v wa = as_h2(val_f16bits2(ext16<16 + ((UA) + 1) * K>(V), ext16<16 + ((UA) + 2) * K>(V))); \
+      h2v wb = as_h2(val_f16bits2(ext16<16 + ((UB) + 1) * K>(V), ext16<16 + ((UB) + 2) * K>(V))); \
+      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                             \
+        d0[r] = __builtin_amdgcn_fdot2(wa, xv[r][((UA) & 7) >> 1], d0[r], false);                 \
+        d1[r] = __builtin_amdgcn_fdot2(wb, xv[r][((UB) & 7) >> 1], d1[r], false);                 \
+      }                                                                                           \
     }
-    HTR_PAIRF(0) HTR_PAIRF(2) HTR_PAIRF(4) HTR_PAIRF(6) HTR_PAIRF(8) HTR_PAIRF(10) HTR_PAIRF(12) HTR_PAIRF(14)
-    HTR_PAIRF(16) HTR_PAIRF(18) HTR_PAIRF(20) HTR_PAIRF(22) HTR_PAIRF(24) HTR_PAIRF(26) HTR_PAIRF(28) HTR_PAIRF(30)
-#undef HTR_PAIRF
+    HTR_PAIRF2(0, 18) HTR_PAIRF2(2, 16) HTR_PAIRF2(4, 22) HTR_PAIRF2(6, 20)
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
+      uint4 u1 = xp[1];
+      xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+    }
+    HTR_PAIRF2(8, 26) HTR_PAIRF2(10, 24) HTR_PAIRF2(12, 30) HTR_PAIRF2(14, 28)
+#undef HTR_PAIRF2
 #pragma unroll
     for (int r = 0; r < M; ++r) { const float s = bscale[r][bl]; a0[r] += s * d0[r]; a1[r] += s * d1[r]; }
   }

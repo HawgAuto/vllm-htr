@@ -1,0 +1,98 @@
+{
+  "schema": "htr-v026-native-manifest-v1",
+  "target": "gfx1151",
+  "binaries": {
+    "causal_conv1d_fwd_aot.hsaco": {
+      "sha256": "968cbe1676085aab9e66fc6d6166f0d159bb3e62aa57c39c2be7afbb6db7cb6d",
+      "bytes": 21248
+    },
+    "direct_tr12.hsaco": {
+      "sha256": "69e3c45e63ace482b4f724f1c17b7e114cfc444fbffaa9f3f59e43b9adf0ffb3",
+      "bytes": 12344
+    },
+    "gdn_chunk_h_aot.hsaco": {
+      "sha256": "1c0cb43e1a8bf681655e0f1337417be7915252b6c508a90a514c9651510393be",
+      "bytes": 16520
+    },
+    "gdn_chunk_o_aot.hsaco": {
+      "sha256": "bd612759655db6867437351f533d039274e81a8c262b9bc7bfa1e77f045f94c5",
+      "bytes": 28008
+    },
+    "gdn_norm_gate_aot.hsaco": {
+      "sha256": "1727cee0219e2f4b9e739c8767df510293ab12d82cd8c45b126bae78f94eba70",
+      "bytes": 11000
+    },
+    "gdn_post_conv_aot.hsaco": {
+      "sha256": "0c9c9252292d99c3323730bf2e7a10495a1c42d1f3783ede1540a5454bb38f5e",
+      "bytes": 12920
+    },
+    "gdn_wy_fused_aot.hsaco": {
+      "sha256": "9bf90ce1147b92d4082e66ad486ee4a2e37e8809568aabc625ba8f7af1ed7f62",
+      "bytes": 66416
+    },
+    "gumbel_sample_aot.hsaco": {
+      "sha256": "d91686f75f565bc342da4b924e4110a1636831bd3e9041797ddd8f950484ba12",
+      "bytes": 15096
+    },
+    "hc_ops_aot.hsaco": {
+      "sha256": "e70a36165c0302b579136e3ab7f7974614ed0911d4f9b92bbbc715c6ffe982af",
+      "bytes": 25944
+    },
+    "hpf5_v2_moe_prefill.so": {
+      "sha256": "4121cf467729248fdefcb10c5daf349484c51feac181da635de06e4cfb7b9135",
+      "bytes": 525216
+    },
+    "htr_dense_prefill_v2.hsaco": {
+      "sha256": "b79cdb6c5fdf6acf24af4cb690b29765d7c909cd564b0cf5492e89028e8483cc",
+      "bytes": 114200
+    },
+    "moe_w4a16_wmma_aot.hsaco": {
+      "sha256": "45643ea90a06f3196c7fa2e5630f920b5518ba2e1e1a60d73e152dab2ca1ca3f",
+      "bytes": 42728
+    },
+    "qsa_cache_ops_aot.hsaco": {
+      "sha256": "5894e0fb995b68ce729b0bba3a206f2c4f563939acd544123ed70bf52716b972",
+      "bytes": 20400
+    },
+    "qsa_main_prepare_aot.hsaco": {
+      "sha256": "93599d3fc302dbb0b0a3159b77af317278a0cc59bd1652b40bc6444d33f5f9dc",
+      "bytes": 15744
+    },
+    "qsa_mqa_paged_aot.hsaco": {
+      "sha256": "b6ced48d0ee972f5fe0c450aba41faa90f7121883dcd8156679f1a1d41f77f90",
+      "bytes": 20560
+    },
+    "qsa_pre_indexer_aot.hsaco": {
+      "sha256": "fae90e1903e64e005fefeb62454c957efcc63e71eaf3e9a42fa71c0aee5467bf",
+      "bytes": 24920
+    },
+    "qsa_tau_v4.hsaco": {
+      "sha256": "d221acf2eac2b55e7b68a67f7e03e696be89db4d9ea2a407c6c044c5b7c0ff07",
+      "bytes": 21216
+    },
+    "qsa_tau_v4_kv4.hsaco": {
+      "sha256": "76682ccfa6f7653afc41f0e605f939791d06356d6a23a78450c6c561c81d08c8",
+      "bytes": 25064
+    },
+    "qsa_tau_v4_kv8.hsaco": {
+      "sha256": "c8558f411f6e46e3fe30aaff2565a03d406a18e47bd77eccfbe82af29cdca54b",
+      "bytes": 24808
+    },
+    "qsa_tau_v5_kv8_i8.hsaco": {
+      "sha256": "a14369678862af533d34dd4940339776d1b44b36b13b0cf4b013dfef5a62ca5c",
+      "bytes": 26096
+    },
+    "htr_bf16_gemv.so": {
+      "sha256": "e6c5256e8754d724e613be9b98b8784ff14eabcb60ae4bd9a2ce13d324295df8",
+      "bytes": 353960
+    },
+    "htr_moe_k6_shx.so": {
+      "sha256": "6019edc304e59ad5f1b9ce3ea408f3d7964c2fcbbad19b3f69e63d3fc178443d",
+      "bytes": 987384
+    },
+    "htr_kernels.so": {
+      "sha256": "419ee5a4abab52e9bf372ca02dc60d0b5488b83575d7b499f1384b390f655555",
+      "bytes": 4040744
+    }
+  }
+}

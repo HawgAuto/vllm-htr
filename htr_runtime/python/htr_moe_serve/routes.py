@@ -16,7 +16,7 @@ from . import arena as A
 from . import wire
 from .kernels import moe_ext, dq_ext
 from .kernels import moe2_ext  # E29
-from .kernels import hpf3_ext, hpf4_ext  # E31, V5-F1
+from .kernels import hpf3_ext, hpf4_ext, hpf5_ext  # E31, V5-F1, V6-P1
 
 TOPK, MAXT = 10, 8
 BPS_GU, BPS_DN, FENCE_RA = 5, 1, 1
@@ -25,7 +25,11 @@ V2_MIN = int(os.environ.get('HTR_MOE_V2_MIN', '0'))      # 0 = v2 route disabled
 FUSE = os.environ.get('HTR_MOE_FUSE_COMBINE') == '1'   # E29: fused down+combine decode route (bitwise == decode_route)
 HPF3 = os.environ.get('HTR_MOE_HPF3') == '1'           # E31: v2 route through hpf3_forward (bitwise == hpf2_forward)
 HPF4 = os.environ.get('HTR_MOE_HPF4') == '1'           # V5-F1: BM=16 optimal 8-block pairing (bitwise == hpf3)
-HPF4_MAX_M = int(os.environ.get('HTR_MOE_HPF4_MAX_M', '2048'))
+HPF4_MAX_M = int(os.environ.get('HTR_MOE_HPF4_MAX_M', '16384'))
+HPF5 = os.environ.get('HTR_MOE_HPF5') == '1'           # V6-P1: 3-stage pipelined NT-loadB + tight grid + adaptive BMW=64/128
+HPF5_BMW = int(os.environ.get('HTR_MOE_HPF5_BMW', '0'))  # 0 = auto (64 for T<=3200, 128 for T>3200)
+HPF5_NT = int(os.environ.get('HTR_MOE_HPF5_NT', '-1'))   # -1 = auto (1 for bmw=64, 0 for bmw=128)
+HPF5_MAX_M = int(os.environ.get('HTR_MOE_HPF5_MAX_M', '16384'))
 _SCR, _BF, _CB, _V2 = {}, {}, {}, {}
 
 
@@ -139,14 +143,15 @@ def v2_route(ar, x, ids, w):
     valid = ids >= 0
     idc = torch.where(valid, ids, torch.zeros_like(ids)).to(torch.int32)
     wc = torch.where(valid, w, torch.zeros_like(w)).to(torch.float32).contiguous()
-    use_hpf4 = HPF4 and x.shape[0] <= HPF4_MAX_M
-    bm = 16 if use_hpf4 else 64
+    use_hpf5 = HPF5 and x.shape[0] <= HPF5_MAX_M
+    use_hpf4 = (not use_hpf5) and HPF4 and x.shape[0] <= HPF4_MAX_M
+    bm = 16 if (use_hpf5 or use_hpf4) else 64
     sid, eid, ntpp = moe_align_block_size(idc, bm, A.NE, pad_sorted_ids=True)
     dev, Pn = x.device, sid.numel()
     sc = _V2.setdefault(str(dev), {})
     need = dict(A1=(Pn * A.H, torch.float16), Y1=(Pn * 2 * A.I, torch.bfloat16), A2=(Pn * A.I, torch.float16),
                 Y2=(Pn * A.H, torch.bfloat16), S=(Pn, torch.float32), inv=(idc.numel(), torch.int32))
-    if use_hpf4:
+    if use_hpf5 or use_hpf4:
         nb = Pn // 16
         need['grp_y'] = (nb, torch.int32)
         need['grp_nblk'] = (nb, torch.int32)
@@ -156,6 +161,12 @@ def v2_route(ar, x, ids, w):
             sc[k] = torch.empty(n, dtype=dt, device=dev)
     nsat = sc.setdefault('nsat', torch.zeros(1, dtype=torch.int32, device=dev))
     K = ar['_K']
+    if use_hpf5:
+        bmw = HPF5_BMW if HPF5_BMW in (64, 128) else (64 if x.shape[0] <= 3200 else 128)
+        nt = HPF5_NT if HPF5_NT in (0, 1) else (1 if bmw == 64 else 0)
+        return hpf5_ext().hpf5v2_forward(x.contiguous(), sid.to(torch.int32), eid.to(torch.int32), ntpp.to(torch.int32), wc, ar['qw'], ar['qoff'],
+                                         ar['scales'], ar['su'], ar['sv'], cbscale(), K, int(ar['_spad'].get(K, 0)), sc['A1'], sc['Y1'],
+                                         sc['A2'], sc['Y2'], sc['S'], sc['inv'], nsat, sc['grp_y'], sc['grp_nblk'], sc['grp_cnt'], 31, bmw, nt)
     if use_hpf4:
         return hpf4_ext().hpf4_forward(x.contiguous(), sid.to(torch.int32), eid.to(torch.int32), ntpp.to(torch.int32), wc, ar['qw'], ar['qoff'],
                                        ar['scales'], ar['su'], ar['sv'], cbscale(), K, int(ar['_spad'].get(K, 0)), sc['A1'], sc['Y1'],

@@ -197,6 +197,26 @@ def layer_norm_gated_fwd_kernel1(
     tl.store(y + o_d, b_y, mask=m_d)
 
 
+
+_GDN_NORM_GATE_AOT = None
+def _get_gdn_norm_gate_aot():
+    global _GDN_NORM_GATE_AOT
+    if _GDN_NORM_GATE_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_GDN_NORM_GATE_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_GDN_NORM_GATE_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "gdn_norm_gate_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/gdn_norm_gate_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _GDN_NORM_GATE_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _GDN_NORM_GATE_AOT is None:
+            _GDN_NORM_GATE_AOT = False
+    return _GDN_NORM_GATE_AOT
+
 def layer_norm_gated_fwd(
     x: torch.Tensor,
     g: torch.Tensor,
@@ -242,6 +262,45 @@ def layer_norm_gated_fwd(
     BD = min(MAX_FUSED_SIZE, next_power_of_2(D))
     if D > BD:
         raise RuntimeError("This layer norm doesn't support feature dim >= 64KB.")
+    _aot = _get_gdn_norm_gate_aot()
+    if (
+        _aot
+        and D == 128
+        and is_rms_norm
+        and residual is None
+        and residual_out is None
+        and bias is None
+        and x.dtype == torch.bfloat16
+        and g.dtype == torch.bfloat16
+        and y.dtype == torch.bfloat16
+        and x.is_contiguous()
+        and y.is_contiguous()
+        and g.stride(-1) == 1
+        and (weight is None or (weight.is_contiguous() and weight.dtype in (torch.float32, torch.bfloat16)))
+        and activation in ("swish", "silu", "sigmoid")
+    ):
+        import ctypes as _ct
+        _hm, _m = _aot
+        I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+        _flags = (
+            (1 if weight is not None else 0)
+            | (2 if (weight is not None and weight.dtype == torch.bfloat16) else 0)
+            | (4 if activation == "sigmoid" else 0)
+        )
+        if T > 0:
+            with torch.cuda.device(x.device):
+                _m.launch(
+                    "rms_norm_gated_bf16_d128",
+                    ((T + 7) // 8, 1, 1),
+                    (256, 1, 1),
+                    [
+                        _hm.ptr(x), _hm.ptr(g),
+                        _hm.ptr(weight) if weight is not None else I64(0),
+                        _hm.ptr(y), _hm.ptr(rstd),
+                        I32(T), I32(H), I64(g_stride_n), F32(float(eps)), I32(_flags),
+                    ],
+                )
+        return y, mean, rstd, residual_out if residual_out is not None else x
     if D <= 512:
         BT = 16
         layer_norm_gated_fwd_kernel[(cdiv(T, BT),)](

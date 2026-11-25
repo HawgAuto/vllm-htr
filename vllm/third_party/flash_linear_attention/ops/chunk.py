@@ -63,6 +63,66 @@ def _input_guard_vview(fn):
 from .wy_fast import recompute_w_u_fwd
 
 
+
+_GDN_WY_AOT = None
+def _get_gdn_wy_aot():
+    global _GDN_WY_AOT
+    if _GDN_WY_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_GDN_WY_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_GDN_WY_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "gdn_wy_fused_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/gdn_wy_fused_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _GDN_WY_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _GDN_WY_AOT is None:
+            _GDN_WY_AOT = False
+    return _GDN_WY_AOT
+
+
+_GDN_O_AOT = None
+def _get_gdn_o_aot():
+    global _GDN_O_AOT
+    if _GDN_O_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_GDN_O_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_GDN_O_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "gdn_chunk_o_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/gdn_chunk_o_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _GDN_O_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _GDN_O_AOT is None:
+            _GDN_O_AOT = False
+    return _GDN_O_AOT
+
+
+_GDN_CHUNK_H_AOT = None
+def _get_gdn_chunk_h_aot():
+    global _GDN_CHUNK_H_AOT
+    if _GDN_CHUNK_H_AOT is None:
+        import os as _os
+        if _os.environ.get("HTR_GDN_CHUNK_H_AOT", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_GDN_CHUNK_H_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "gdn_chunk_h_aot.hsaco"),
+                "/opt/vllm-htr/native-v026/gdn_chunk_h_aot.hsaco",
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _GDN_CHUNK_H_AOT = (_hm, _hm.Module(cand))
+                    break
+        if _GDN_CHUNK_H_AOT is None:
+            _GDN_CHUNK_H_AOT = False
+    return _GDN_CHUNK_H_AOT
+
 def chunk_gated_delta_rule_fwd(
     q: torch.Tensor,
     k: torch.Tensor,
@@ -77,52 +137,195 @@ def chunk_gated_delta_rule_fwd(
     chunk_offsets: torch.Tensor | None = None,
     core_attn_out: torch.Tensor | None = None,
 ):
-    g = chunk_local_cumsum(
-        g, chunk_size=FLA_CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
-    )
-    # obtain WY representation. u is actually the new v.
-    A = chunk_scaled_dot_kkt_fwd(
-        k=k,
-        beta=beta,
-        g=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        output_dtype=torch.float32,
-    )
-    A = solve_tril(
-        A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, output_dtype=k.dtype
-    )
-    w, u = recompute_w_u_fwd(
-        k=k,
-        v=v,
-        beta=beta,
-        A=A,
-        g_cumsum=g,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-    )
-    h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
-        k=k,
-        w=w,
-        u=u,
-        g=g,
-        initial_state=initial_state,
-        output_final_state=output_final_state,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        chunk_offsets=chunk_offsets,
-    )
-    o = chunk_fwd_o(
-        q=q,
-        k=k,
-        v=v_new,
-        h=h,
-        g=g,
-        scale=scale,
-        cu_seqlens=cu_seqlens,
-        chunk_indices=chunk_indices,
-        core_attn_out=core_attn_out,
-    )
+    _wy_aot = _get_gdn_wy_aot()
+    if (
+        _wy_aot
+        and FLA_CHUNK_SIZE == 64
+        and k.ndim == 4 and k.shape[0] == 1 and k.shape[3] == 128
+        and v.ndim == 4 and v.shape[0] == 1 and v.shape[3] == 128
+        and k.dtype == torch.bfloat16 and v.dtype == torch.bfloat16
+        and g.dtype == torch.float32 and beta.dtype == torch.float32
+        and k.stride(-1) == 1 and v.stride(-1) == 1
+        and (k.data_ptr() & 15) == 0 and (v.data_ptr() & 15) == 0
+        and (k.stride(1) & 7) == 0 and (v.stride(1) & 7) == 0
+        and cu_seqlens is not None
+    ):
+        import ctypes as _ct
+        from .index import prepare_chunk_indices as _prep_cidx
+        _hm, _m = _wy_aot
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        _H = int(v.shape[2])
+        _Hg = int(k.shape[2])
+        _gqa = _H // _Hg
+        _cu = cu_seqlens.to(torch.int32).contiguous()
+        _cidx = (chunk_indices if chunk_indices is not None else _prep_cidx(_cu, 64)).to(torch.int32).contiguous()
+        _gc = torch.empty_like(g)
+        w = torch.empty_like(v)
+        u = torch.empty_like(v)
+        _m.launch(
+            "gdn_wy_fused_bf16",
+            (_H, int(_cidx.shape[0]), 1),
+            (256, 1, 1),
+            [
+                _hm.ptr(k), _hm.ptr(v), _hm.ptr(g), _hm.ptr(beta),
+                _hm.ptr(_gc), _hm.ptr(w), _hm.ptr(u),
+                _hm.ptr(_cidx), _hm.ptr(_cu),
+                I64(k.stride(1)), I64(k.stride(2)),
+                I64(v.stride(1)), I64(v.stride(2)),
+                I64(g.stride(1)), I64(g.stride(2)),
+                I64(beta.stride(1)), I64(beta.stride(2)),
+                I64(_gc.stride(1)), I64(_gc.stride(2)),
+                I64(w.stride(1)), I64(w.stride(2)),
+                I64(u.stride(1)), I64(u.stride(2)),
+                I32(_H), I32(_gqa),
+            ],
+        )
+        g = _gc
+        A = None
+    else:
+        g = chunk_local_cumsum(
+            g, chunk_size=FLA_CHUNK_SIZE, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices
+        )
+        # obtain WY representation. u is actually the new v.
+        A = chunk_scaled_dot_kkt_fwd(
+            k=k,
+            beta=beta,
+            g=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            output_dtype=torch.float32,
+        )
+        A = solve_tril(
+            A=A, cu_seqlens=cu_seqlens, chunk_indices=chunk_indices, output_dtype=k.dtype
+        )
+        w, u = recompute_w_u_fwd(
+            k=k,
+            v=v,
+            beta=beta,
+            A=A,
+            g_cumsum=g,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+        )
+    _ch_aot = _get_gdn_chunk_h_aot()
+    if (
+        _ch_aot
+        and FLA_CHUNK_SIZE == 64
+        and k.dtype == torch.bfloat16
+        and w.dtype == torch.bfloat16
+        and u.dtype == torch.bfloat16
+        and (g is None or g.dtype == torch.float32)
+        and k.shape[0] == 1
+        and k.shape[-1] == 128
+        and u.shape[-1] == 128
+        and k.is_contiguous()
+        and w.is_contiguous()
+        and u.is_contiguous()
+        and (g is None or g.is_contiguous())
+        and (initial_state is None or (initial_state.is_contiguous() and initial_state.dtype in (torch.float32, torch.bfloat16)))
+    ):
+        import ctypes as _ct
+        from .index import prepare_chunk_indices as _pci, prepare_chunk_offsets as _pco
+        _hm, _m = _ch_aot
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        _B, _T, _Hg, _K = k.shape
+        _H, _V = u.shape[-2], u.shape[-1]
+        if cu_seqlens is not None:
+            if chunk_indices is None:
+                chunk_indices = _pci(cu_seqlens, 64)
+            _N = len(cu_seqlens) - 1
+            _NT = len(chunk_indices)
+            _cu_i32 = cu_seqlens.to(torch.int32).contiguous()
+            _co_i32 = (chunk_offsets if chunk_offsets is not None else _pco(cu_seqlens, 64)).to(torch.int32).contiguous()
+        else:
+            _N = _B
+            _NT = (_T + 63) // 64
+            _cu_i32 = None
+            _co_i32 = None
+        h = k.new_empty(_B, _NT, _H, _V, _K)
+        v_new = torch.empty_like(u)
+        final_state = k.new_empty(_N, _H, _V, _K, dtype=torch.float32) if output_final_state else None
+        with torch.cuda.device(k.device):
+            _m.launch(
+                "gdn_chunk_h_bf16_k128_v128_bt64",
+                (4, _N * _H, 1),
+                (256, 1, 1),
+                [
+                    _hm.ptr(k), _hm.ptr(u), _hm.ptr(w), _hm.ptr(v_new),
+                    _hm.ptr(g) if g is not None else I64(0),
+                    _hm.ptr(h),
+                    _hm.ptr(initial_state) if initial_state is not None else I64(0),
+                    _hm.ptr(final_state) if final_state is not None else I64(0),
+                    _hm.ptr(_cu_i32) if _cu_i32 is not None else I64(0),
+                    _hm.ptr(_co_i32) if _co_i32 is not None else I64(0),
+                    I32(_T), I32(_H), I32(_Hg),
+                    I32(1 if (initial_state is not None and initial_state.dtype == torch.bfloat16) else 0),
+                    I32(0),
+                ],
+            )
+    else:
+        h, v_new, final_state = chunk_gated_delta_rule_fwd_h(
+            k=k,
+            w=w,
+            u=u,
+            g=g,
+            initial_state=initial_state,
+            output_final_state=output_final_state,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            chunk_offsets=chunk_offsets,
+        )
+    _o_aot = _get_gdn_o_aot()
+    if (
+        _o_aot
+        and FLA_CHUNK_SIZE == 64
+        and q.ndim == 4 and q.shape[0] == 1 and q.shape[3] == 128
+        and k.ndim == 4 and k.shape[0] == 1 and k.shape[3] == 128
+        and v_new.ndim == 4 and v_new.shape[0] == 1 and v_new.shape[3] == 128
+        and q.dtype == torch.bfloat16 and k.dtype == torch.bfloat16 and v_new.dtype == torch.bfloat16
+        and h.dtype == torch.bfloat16 and g.dtype == torch.float32
+        and q.stride(-1) == 1 and k.stride(-1) == 1 and v_new.stride(-1) == 1 and h.stride(-1) == 1
+        and (q.data_ptr() & 15) == 0 and (k.data_ptr() & 15) == 0 and (v_new.data_ptr() & 15) == 0 and (h.data_ptr() & 15) == 0
+        and (q.stride(1) & 7) == 0 and (k.stride(1) & 7) == 0 and (v_new.stride(1) & 7) == 0 and (h.stride(3) & 7) == 0
+        and h.ndim == 5
+        and (core_attn_out is None or (core_attn_out.dtype == torch.bfloat16 and core_attn_out.is_contiguous() and core_attn_out.numel() == v_new.numel() and (core_attn_out.data_ptr() & 15) == 0))
+        and cu_seqlens is not None
+    ):
+        import ctypes as _ct
+        from .index import prepare_chunk_indices as _prep_cidx
+        _hm, _m = _o_aot
+        I32, I64, F32 = _ct.c_int32, _ct.c_int64, _ct.c_float
+        _H = int(v_new.shape[2])
+        _Hg = int(k.shape[2])
+        _cu = cu_seqlens.to(torch.int32).contiguous()
+        _cidx = (chunk_indices if chunk_indices is not None else _prep_cidx(_cu, 64)).to(torch.int32).contiguous()
+        o = core_attn_out.view(v_new.shape) if core_attn_out is not None else torch.empty_like(v_new)
+        with torch.cuda.device(q.device):
+            _m.launch(
+                "gdn_chunk_o_bf16",
+                (_H, int(_cidx.shape[0]), 1),
+                (256, 1, 1),
+                [
+                    _hm.ptr(q), _hm.ptr(k), _hm.ptr(v_new), _hm.ptr(h), _hm.ptr(g), _hm.ptr(o),
+                    _hm.ptr(_cidx), _hm.ptr(_cu),
+                    I64(q.stride(1)), I64(q.stride(2)), I64(k.stride(1)), I64(k.stride(2)),
+                    I64(v_new.stride(1)), I64(v_new.stride(2)), I64(h.stride(1)), I64(h.stride(2)), I64(h.stride(3)),
+                    I64(g.stride(1)), I64(g.stride(2)), I64(o.stride(-3)), I64(o.stride(-2)),
+                    F32(float(scale)), I32(_H), I32(_H // _Hg),
+                ],
+            )
+    else:
+        o = chunk_fwd_o(
+            q=q,
+            k=k,
+            v=v_new,
+            h=h,
+            g=g,
+            scale=scale,
+            cu_seqlens=cu_seqlens,
+            chunk_indices=chunk_indices,
+            core_attn_out=core_attn_out,
+        )
     if SUPPRESS_LEVEL < 3:
         return g, o, A, final_state, None, None, None
     elif SUPPRESS_LEVEL >= 3:
