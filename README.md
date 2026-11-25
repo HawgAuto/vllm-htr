@@ -1,12 +1,6 @@
 # vLLM HTR — v0.2.6
 
-Native HTR serving for **AMD Strix Halo / gfx1151** with **zero mid-inference Triton JIT**
-across prefill and decode: **20 new zero-spill AOT Wave32 HIP/HSACO kernels**
-(full-INT8 `v_wmma_i32_16x16x16_iu8` QSA prefill, 128-bit vectorized `causal_conv1d` & GDN
-prefill, double-buffered W4A16 MoE, HPF5 v2 MoE prefill, dense prefill v2, HyperConnection v2,
-QSA MQA v3 with hidden `v_dual_dot2acc_f32_bf16`, cache/prepare/indexer/PLE/Gumbel AOT) plus
-**3 Wave 7 RDNA 3.5 decode upgrades** (`htr_bf16_gemv.so`, `htr_moe_k6_shx.so`, `htr_kernels.so`).
-Weights, tokenizer/configuration and checkpoint sampling defaults are unchanged.
+Native HTR serving for **AMD Strix Halo / gfx1151** — now with **2× faster long-context prefill**, **zero mid-inference Triton JIT pauses**, and **RDNA 3.5 ISA decode upgrades**. All model weights, tokenizers, configs, and sampling defaults are unchanged — just pull the new image.
 
 [Run v0.2.6](htr_runtime/docs/optimized-serving.md) · [Htr5Core model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [Exact results and release notes](htr_runtime/releases/v0.2.6/README.md) · [Release history](RELEASES.md)
 
@@ -14,12 +8,19 @@ Weights, tokenizer/configuration and checkpoint sampling defaults are unchanged.
 docker pull ghcr.io/hawgauto/vllm-htr@sha256:dc11916549c534b207bb45048fe2f9b2177117995931f5aff5b384b274ea0fe8
 ```
 
-Version alias: `ghcr.io/hawgauto/vllm-htr:v0.2.6`. Ordinary `vllm serve` receives all
-v0.2.6 optimizations by default via `runtime-env.json` with zero extra `-e` flags.
+Version alias: `ghcr.io/hawgauto/vllm-htr:v0.2.6`. Standard `vllm serve` enables every v0.2.6 optimization automatically via `runtime-env.json` with no extra `-e` flags required.
 
-## What v0.2.6 brings
+## What's new in v0.2.6
 
-Verified zero-overlay on exclusive AMD Strix Halo (`gfx1151`), Htr5Core, MTP3, `max-model-len=32768`, `--kv-cache-dtype int8_per_token_head`:
+- **2× faster long-context prefill:** 13K-token warm prefill drops from **23.58 s → 11.44 s** (**551.9 → 1,137.7 tok/s**), and cold 13K prefill reaches **14.30 s** (**910.5 tok/s**, **1.65×** faster).
+- **Zero Triton JIT on the serving hot path:** **20 new ahead-of-time (AOT) zero-spill HIP kernels** compiled specifically for `gfx1151` Wave32 replace the remaining Triton hot-path kernels across QSA attention, GDN, `causal_conv1d`, W4A16 MoE, HyperConnection, dense prefill, PLE transpose, and Gumbel sampling (**`0`** mid-inference Triton JIT warnings).
+- **Full-INT8 WMMA attention prefill (with instant BF16 fallback):** Uses RDNA 3.5 `v_wmma_i32_16x16x16_iu8` (`qsa_tau_v5_kv8_i8`) for **1.66–1.70× faster** QSA attention prefill (**−865 ms** on 13K prompts) with verified parity (`cos = 0.999994`, exact 200/200-char greedy match, `63.45%` MTP-3 spec acceptance). Pass `-e HTR_QSA_TAU_V5_I8=0` to revert to BF16 WMMA at any time.
+- **Faster multi-request concurrency & strided-cache fix:** `c=8` wall time improves **19.03 s → 15.51 s** (**1.23× faster**, `66.01 tok/s` aggregate) and `c=4 × 4K` long-context concurrency improves **23.82 s → 21.77 s** (**+7.7% sum decode** to `61.65 tok/s`), including a bit-exact fix for strided-1D `causal_conv1d` cache indexing under high concurrency.
+- **RDNA 3.5 (`gfx1151`) ISA decode upgrades:** Unlocks the hidden dual-issue `v_dual_dot2acc_f32_bf16` instruction (4 BF16 FMAs/lane/cycle), single-cycle `v_perm_b32` BF16 packing, and bank-staggered VOPD pairing across `htr_bf16_gemv.so`, `htr_moe_k6_shx.so`, and `htr_kernels.so`.
+
+### Verified zero-overlay E2E results (`v0.2.6` vs `v0.2.5`)
+
+Measured zero-overlay on exclusive AMD Strix Halo (`gfx1151`), Htr5Core, MTP3, `max-model-len=32768`, `--kv-cache-dtype int8_per_token_head`:
 
 | Workload | `v0.2.5` KV8 | **`v0.2.6` Zero-Overlay Gate** | **Change vs v0.2.5** |
 |---|---:|---:|---:|
@@ -30,6 +31,7 @@ Verified zero-overlay on exclusive AMD Strix Halo (`gfx1151`), Htr5Core, MTP3, `
 | `c=8` high-concurrency — wall / agg (`8×128`) | `19.03 s` / `53.80 tok/s` | **`15.51 s`** / **`66.01 tok/s`** | **1.23× wall** |
 | Mid-inference Triton JIT warnings | multiple | **`0`** | **eliminated** |
 
+Executable source: [`00f0b8c0caf7d85fee9232ecf600e0317408b1ab`](https://github.com/HawgAuto/vllm-htr/tree/00f0b8c0caf7d85fee9232ecf600e0317408b1ab).
 Full manifest & notes: [v0.2.6 README](htr_runtime/releases/v0.2.6/README.md) · [V026-NATIVE-MANIFEST.json](htr_runtime/V026-NATIVE-MANIFEST.json).
 
 ## Preserved v0.2.5 release

@@ -1,10 +1,12 @@
 # vLLM HTR release history
 
-## v0.2.6
+## v0.2.6 — 2× faster long-context prefill, zero Triton JIT & RDNA 3.5 ISA upgrades
 
 - **Image:** `ghcr.io/hawgauto/vllm-htr@sha256:dc11916549c534b207bb45048fe2f9b2177117995931f5aff5b384b274ea0fe8` (alias `ghcr.io/hawgauto/vllm-htr:v0.2.6`)
-- **Highlights:** Zero-Triton-JIT hot path (`20` new zero-spill AOT `gfx1151` Wave32 HIP binaries incl. full-INT8 WMMA QSA prefill, 128-bit `causal_conv1d`, double-buffered W4A16 MoE, GDN prefill, HC v2, MQA v3) + Wave 7 RDNA 3.5 decode ISA upgrades (`htr_bf16_gemv.so` hidden `v_dual_dot2acc_f32_bf16`, `htr_moe_k6_shx.so`, `htr_kernels.so`).
-- **Verified zero-overlay served gains vs `v0.2.5` (INT8 KV, MTP-3):** `13K` warm prefill **`2.06×`** (`551.9 → 1,137.7 tok/s`, `23.58s → 11.44s`), `13K` cold prefill **`1.65×`** (`910.5 tok/s`), `c=4×4K` wall **`1.09×`** (`23.82s → 21.77s`, sum decode `+7.7%` to `61.65 tok/s`), `c=8` wall **`1.23×`** (`19.03s → 15.51s`), **`0`** mid-inference Triton JIT warnings.
+- **Executable source:** `00f0b8c0caf7d85fee9232ecf600e0317408b1ab`
+- **What's new:** Replaces the remaining Triton hot-path kernels with **20 new zero-spill AOT `gfx1151` Wave32 HIP binaries** (full-INT8 `v_wmma_i32_16x16x16_iu8` QSA prefill, 128-bit vectorized `causal_conv1d` & GDN prefill, double-buffered W4A16 MoE, HPF5 v2 MoE prefill, dense prefill v2, HyperConnection v2, QSA MQA v3, cache/prepare/indexer/PLE/Gumbel AOT) and upgrades **3 decode `.so` extensions** (`htr_bf16_gemv.so`, `htr_moe_k6_shx.so`, `htr_kernels.so`) with RDNA 3.5 ISA optimizations (hidden `v_dual_dot2acc_f32_bf16`, single-cycle `v_perm_b32`, bank-staggered VOPD pairing). Weights, configs, and sampling defaults are unchanged.
+- **Verified zero-overlay gains vs `v0.2.5` (INT8 KV, MTP-3):** `13K` warm prefill **`2.06×`** (`551.9 → 1,137.7 tok/s`, `23.58 s → 11.44 s`), `13K` cold prefill **`1.65×`** (`910.5 tok/s`), `c=4×4K` wall **`1.09×`** (`23.82 s → 21.77 s`, sum decode `+7.7%` to `61.65 tok/s`), `c=8` wall **`1.23×`** (`19.03 s → 15.51 s`, `66.01 tok/s` agg), greedy `c=1` `45.16 tok/s`, **`0`** mid-inference Triton JIT warnings.
+- **INT8 WMMA QSA parity & control:** Direct A/B vs BF16 WMMA saves **−865 ms** on 13K warm prefill (`+7.5%`), **−1.83 s** on `c=4×4K`, and **−1.45 s** on `c=8`, with `cos=0.999994` (`0 NaNs`), 200/200-char exact greedy & 12K match, and `63.45%` spec acceptance (`HTR_QSA_TAU_V5_I8=0` switches back to BF16 WMMA).
 - **Details:** [htr_runtime/releases/v0.2.6/README.md](htr_runtime/releases/v0.2.6/README.md)
 
 ## v0.2.5
