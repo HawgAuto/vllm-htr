@@ -349,6 +349,341 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched(
   if (threadIdx.x == 0) *cnt = 0u;
 }
 
+
+// v0.2.8: 2-subpass T=9..16 batched 8-group wo_a K=5 GEMV (recovers ~3.4 ms/step at T=12 concurrent B=2!)
+// Always uses NS=8, NBL=4 (12 KiB LDS for M_CAP=12, 16 KiB LDS for M_CAP=16 -> 2+ WGs/CU!).
+template <int M_CAP, int HAS_GATE, int SP16>
+__global__ __launch_bounds__(256) void k_wo_a_k5_batched_big(
+    const uint32_t* __restrict__ qw,
+    const __half* __restrict__ scales,
+    const uint8_t* __restrict__ su,
+    const uint8_t* __restrict__ sv,
+    const uint16_t* __restrict__ x,
+    const uint16_t* __restrict__ gate,
+    float* __restrict__ part,
+    unsigned* __restrict__ counters,
+    uint16_t* __restrict__ out,
+    int T, float cb, int spad
+) {
+  static_assert(M_CAP > 8 && M_CAP <= 16, "M_CAP must be in 9..16");
+  constexpr int R2 = M_CAP - 8;
+  constexpr int K = 5;
+  constexpr int G = 8;
+  constexpr int M_OUT = 1024;
+  constexpr int N_IN = 4096;
+  constexpr int MT = 64;
+  constexpr int NT = 256;
+  constexpr int MPB = 8;
+  constexpr int NBL = 4;
+  constexpr int NS = 8;
+
+  __shared__ __attribute__((aligned(16))) _Float16 xs_l[M_CAP][NBL * 128];
+  __shared__ float bscale[M_CAP][NBL];
+  __shared__ float bsum[M_CAP][NBL];
+  __shared__ unsigned is_last;
+
+  const int sb = blockIdx.x;
+  const int sp = blockIdx.y;
+  const int grp = blockIdx.z;
+  const int lane = threadIdx.x & 31;
+  const int w = threadIdx.x >> 5;
+  const int mr = T;
+
+  const size_t pitch = (size_t)NT * 40 + spad;
+  const uint32_t* qm = SP16 ? nullptr : (qw + (size_t)grp * MT * pitch);
+  const uint32_t* p16_grp = SP16 ? (qw + (size_t)grp * (MT * NT * 40)) : nullptr;
+  const uint32_t* p4_grp  = SP16 ? (p16_grp + (size_t)(MT * NT) * 32) : nullptr;
+  const __half* scl = scales + (size_t)grp * M_OUT;
+  const uint8_t* sup = su + (size_t)grp * (N_IN / 8);
+  const uint8_t* svp = sv + (size_t)grp * (M_OUT / 8);
+
+  const int b0 = sp * NBL;
+  const int nb = NBL;
+
+  for (int it = w; it < mr * nb; it += 8) {
+    const int r = it >> 2;
+    const int bl = it & 3;
+    const int base = (b0 + bl) * 128 + lane * 4;
+    const uint16_t* xr = x + ((size_t)r * G + grp) * N_IN;
+    const uint2 raw = *reinterpret_cast<const uint2*>(xr + base);
+    float v[4] = {
+      __uint_as_float((raw.x & 0xFFFFu) << 16),
+      __uint_as_float(raw.x & 0xFFFF0000u),
+      __uint_as_float((raw.y & 0xFFFFu) << 16),
+      __uint_as_float(raw.y & 0xFFFF0000u),
+    };
+    const unsigned sg4 = (unsigned)sup[base >> 3] >> (base & 7);
+    if (sg4 & 1u) v[0] = -v[0];
+    if (sg4 & 2u) v[1] = -v[1];
+    if (sg4 & 4u) v[2] = -v[2];
+    if (sg4 & 8u) v[3] = -v[3];
+    fwht128_wave(v, lane);
+    float am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+    am = wave_max(am) * (1.0f / 11.313708498984761f);
+    const float sc = am > 30000.f ? exp2f(ceilf(log2f(am * (1.0f / 30000.f)))) : 1.f;
+    const float inv = (1.0f / 11.313708498984761f) * __builtin_amdgcn_rcpf(sc);
+    const h4v h4 = {(_Float16)(v[0] * inv), (_Float16)(v[1] * inv),
+                    (_Float16)(v[2] * inv), (_Float16)(v[3] * inv)};
+    *reinterpret_cast<h4v*>(&xs_l[r][bl * 128 + lane * 4]) = h4;
+    float sum = (float)h4.x + (float)h4.y + (float)h4.z + (float)h4.w;
+    sum = wave_sum(sum);
+    if (lane == 0) { bscale[r][bl] = sc; bsum[r][bl] = sum; }
+  }
+  __syncthreads();
+
+  const int il = sb * 8 + w;
+  const int g_lane = lane >> 3, q = lane & 7;
+  float a0[M_CAP], a1[M_CAP];
+#pragma unroll
+  for (int r = 0; r < M_CAP; ++r) { a0[r] = 0.f; a1[r] = 0.f; }
+
+  constexpr int ntiles = NBL * 8;
+  const int phase = (spad == 0) ? ((w & 7) * 4) : 0;
+
+  u4v wa_cur = {0u, 0u, 0u, 0u};
+  uint32_t w5_cur = 0u;
+  {
+    const int jl0 = phase + g_lane;
+    const int j0 = b0 * 8 + jl0;
+    if constexpr (SP16) {
+      const size_t tid0 = (size_t)il * NT + j0;
+      wa_cur = __builtin_nontemporal_load(reinterpret_cast<const u4v*>(p16_grp + tid0 * 32 + q * 4));
+      w5_cur = __builtin_nontemporal_load(p4_grp + tid0 * 8 + q);
+    } else {
+      const uint32_t* tp0 = qm + (size_t)il * pitch + (size_t)j0 * 40;
+      wa_cur = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tp0 + q * 5));
+      w5_cur = __builtin_nontemporal_load(tp0 + q * 5 + 4);
+    }
+  }
+
+  for (int step = 0; step < ntiles; step += 4) {
+    int jl_base = step + phase;
+    if (jl_base >= ntiles) jl_base -= ntiles;
+    const int jl = jl_base + g_lane;
+    const int bl = jl >> 3;
+    uint32_t V[6];
+    V[0] = __builtin_amdgcn_permlane16(w5_cur, w5_cur, 0x65432107u, 0xedcba98fu, false, false);
+    V[1] = wa_cur.x; V[2] = wa_cur.y; V[3] = wa_cur.z; V[4] = wa_cur.w; V[5] = w5_cur;
+
+    u4v wa_nxt = {0u, 0u, 0u, 0u};
+    uint32_t w5_nxt = 0u;
+    if (step + 4 < ntiles) {
+      int jn_base = step + 4 + phase;
+      if (jn_base >= ntiles) jn_base -= ntiles;
+      const int jn = b0 * 8 + jn_base + g_lane;
+      if constexpr (SP16) {
+        const size_t tidn = (size_t)il * NT + jn;
+        wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4v*>(p16_grp + tidn * 32 + q * 4));
+        w5_nxt = __builtin_nontemporal_load(p4_grp + tidn * 8 + q);
+      } else {
+        const uint32_t* tpn = qm + (size_t)il * pitch + (size_t)jn * 40;
+        wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn + q * 5));
+        w5_nxt = __builtin_nontemporal_load(tpn + q * 5 + 4);
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    const h2v w0a = as_h2(val_f16bits2(ext16<16 + 1 * K>(V),  ext16<16 + 2 * K>(V)));
+    const h2v w1a = as_h2(val_f16bits2(ext16<16 + 19 * K>(V), ext16<16 + 20 * K>(V)));
+    const h2v w0b = as_h2(val_f16bits2(ext16<16 + 3 * K>(V),  ext16<16 + 4 * K>(V)));
+    const h2v w1b = as_h2(val_f16bits2(ext16<16 + 17 * K>(V), ext16<16 + 18 * K>(V)));
+    const h2v w0c = as_h2(val_f16bits2(ext16<16 + 5 * K>(V),  ext16<16 + 6 * K>(V)));
+    const h2v w1c = as_h2(val_f16bits2(ext16<16 + 23 * K>(V), ext16<16 + 24 * K>(V)));
+    const h2v w0d = as_h2(val_f16bits2(ext16<16 + 7 * K>(V),  ext16<16 + 8 * K>(V)));
+    const h2v w1d = as_h2(val_f16bits2(ext16<16 + 21 * K>(V), ext16<16 + 22 * K>(V)));
+    {
+      h2v xv[8][4];
+      float d0[8], d1[8];
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        const uint4 u0 = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16])[0];
+        xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
+        d0[r] = 0.f; d1[r] = 0.f;
+      }
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        d0[r] = __builtin_amdgcn_fdot2(w0a, xv[r][0], d0[r], false);
+        d1[r] = __builtin_amdgcn_fdot2(w1a, xv[r][1], d1[r], false);
+        d0[r] = __builtin_amdgcn_fdot2(w0b, xv[r][1], d0[r], false);
+        d1[r] = __builtin_amdgcn_fdot2(w1b, xv[r][0], d1[r], false);
+        d0[r] = __builtin_amdgcn_fdot2(w0c, xv[r][2], d0[r], false);
+        d1[r] = __builtin_amdgcn_fdot2(w1c, xv[r][3], d1[r], false);
+        d0[r] = __builtin_amdgcn_fdot2(w0d, xv[r][3], d0[r], false);
+        d1[r] = __builtin_amdgcn_fdot2(w1d, xv[r][2], d1[r], false);
+        const float s = bscale[r][bl];
+        a0[r] += s * d0[r]; a1[r] += s * d1[r];
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+    {
+      h2v xv2[R2][4];
+      float d0[R2], d1[R2];
+#pragma unroll
+      for (int k = 0; k < R2; ++k) {
+        const int rr = (8 + k < mr) ? (8 + k) : (mr - 1);
+        const uint4 u0 = reinterpret_cast<const uint4*>(&xs_l[rr][jl * 16])[0];
+        xv2[k][0] = as_h2(u0.x); xv2[k][1] = as_h2(u0.y); xv2[k][2] = as_h2(u0.z); xv2[k][3] = as_h2(u0.w);
+        d0[k] = 0.f; d1[k] = 0.f;
+      }
+#pragma unroll
+      for (int k = 0; k < R2; ++k) {
+        d0[k] = __builtin_amdgcn_fdot2(w0a, xv2[k][0], d0[k], false);
+        d1[k] = __builtin_amdgcn_fdot2(w1a, xv2[k][1], d1[k], false);
+        d0[k] = __builtin_amdgcn_fdot2(w0b, xv2[k][1], d0[k], false);
+        d1[k] = __builtin_amdgcn_fdot2(w1b, xv2[k][0], d1[k], false);
+        d0[k] = __builtin_amdgcn_fdot2(w0c, xv2[k][2], d0[k], false);
+        d1[k] = __builtin_amdgcn_fdot2(w1c, xv2[k][3], d1[k], false);
+        d0[k] = __builtin_amdgcn_fdot2(w0d, xv2[k][3], d0[k], false);
+        d1[k] = __builtin_amdgcn_fdot2(w1d, xv2[k][2], d1[k], false);
+        const int rr = (8 + k < mr) ? (8 + k) : (mr - 1);
+        const float s = bscale[rr][bl];
+        a0[8 + k] += s * d0[k]; a1[8 + k] += s * d1[k];
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    const h2v w0e = as_h2(val_f16bits2(ext16<16 + 9 * K>(V),  ext16<16 + 10 * K>(V)));
+    const h2v w1e = as_h2(val_f16bits2(ext16<16 + 27 * K>(V), ext16<16 + 28 * K>(V)));
+    const h2v w0f = as_h2(val_f16bits2(ext16<16 + 11 * K>(V), ext16<16 + 12 * K>(V)));
+    const h2v w1f = as_h2(val_f16bits2(ext16<16 + 25 * K>(V), ext16<16 + 26 * K>(V)));
+    const h2v w0g = as_h2(val_f16bits2(ext16<16 + 13 * K>(V), ext16<16 + 14 * K>(V)));
+    const h2v w1g = as_h2(val_f16bits2(ext16<16 + 31 * K>(V), ext16<16 + 32 * K>(V)));
+    const h2v w0h = as_h2(val_f16bits2(ext16<16 + 15 * K>(V), ext16<16 + 16 * K>(V)));
+    const h2v w1h = as_h2(val_f16bits2(ext16<16 + 29 * K>(V), ext16<16 + 30 * K>(V)));
+    {
+      h2v xv[8][4];
+      float d0[8], d1[8];
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        const uint4 u1 = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16])[1];
+        xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+        d0[r] = 0.f; d1[r] = 0.f;
+      }
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        d0[r] = __builtin_amdgcn_fdot2(w0e, xv[r][0], d0[r], false);
+        d1[r] = __builtin_amdgcn_fdot2(w1e, xv[r][1], d1[r], false);
+        d0[r] = __builtin_amdgcn_fdot2(w0f, xv[r][1], d0[r], false);
+        d1[r] = __builtin_amdgcn_fdot2(w1f, xv[r][0], d1[r], false);
+        d0[r] = __builtin_amdgcn_fdot2(w0g, xv[r][2], d0[r], false);
+        d1[r] = __builtin_amdgcn_fdot2(w1g, xv[r][3], d1[r], false);
+        d0[r] = __builtin_amdgcn_fdot2(w0h, xv[r][3], d0[r], false);
+        d1[r] = __builtin_amdgcn_fdot2(w1h, xv[r][2], d1[r], false);
+        const float s = bscale[r][bl];
+        a0[r] += s * d0[r]; a1[r] += s * d1[r];
+      }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+    {
+      h2v xv2[R2][4];
+      float d0[R2], d1[R2];
+#pragma unroll
+      for (int k = 0; k < R2; ++k) {
+        const int rr = (8 + k < mr) ? (8 + k) : (mr - 1);
+        const uint4 u1 = reinterpret_cast<const uint4*>(&xs_l[rr][jl * 16])[1];
+        xv2[k][0] = as_h2(u1.x); xv2[k][1] = as_h2(u1.y); xv2[k][2] = as_h2(u1.z); xv2[k][3] = as_h2(u1.w);
+        d0[k] = 0.f; d1[k] = 0.f;
+      }
+#pragma unroll
+      for (int k = 0; k < R2; ++k) {
+        d0[k] = __builtin_amdgcn_fdot2(w0e, xv2[k][0], d0[k], false);
+        d1[k] = __builtin_amdgcn_fdot2(w1e, xv2[k][1], d1[k], false);
+        d0[k] = __builtin_amdgcn_fdot2(w0f, xv2[k][1], d0[k], false);
+        d1[k] = __builtin_amdgcn_fdot2(w1f, xv2[k][0], d1[k], false);
+        d0[k] = __builtin_amdgcn_fdot2(w0g, xv2[k][2], d0[k], false);
+        d1[k] = __builtin_amdgcn_fdot2(w1g, xv2[k][3], d1[k], false);
+        d0[k] = __builtin_amdgcn_fdot2(w0h, xv2[k][3], d0[k], false);
+        d1[k] = __builtin_amdgcn_fdot2(w1h, xv2[k][2], d1[k], false);
+        const int rr = (8 + k < mr) ? (8 + k) : (mr - 1);
+        const float s = bscale[rr][bl];
+        a0[8 + k] += s * d0[k]; a1[8 + k] += s * d1[k];
+      }
+    }
+
+    wa_cur = wa_nxt;
+    w5_cur = w5_nxt;
+  }
+
+#pragma unroll
+  for (int r = 0; r < M_CAP; ++r) {
+    a0[r] += shx<8>(a0[r]); a0[r] += shx<16>(a0[r]);
+    a1[r] += shx<8>(a1[r]); a1[r] += shx<16>(a1[r]);
+  }
+  if (g_lane == 0) {
+#pragma unroll
+    for (int r = 0; r < M_CAP; ++r) {
+      if (r >= mr) continue;
+      float off = 0.f;
+#pragma unroll
+      for (int bl = 0; bl < NBL; ++bl) off += bscale[r][bl] * bsum[r][bl];
+      off *= 1534.0f;
+      float* pp = part + (((size_t)grp * NS + sp) * M_CAP + r) * M_OUT + il * 16 + 2 * q;
+      *reinterpret_cast<float2*>(pp) = make_float2(a0[r] - off, a1[r] - off);
+    }
+  }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  __syncthreads();
+  unsigned* cnt = counters + (size_t)grp * MPB + sb;
+  if (threadIdx.x == 0) is_last = (atomicAdd(cnt, 1u) == (unsigned)(NS - 1));
+  __syncthreads();
+  if (!is_last) return;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+
+  const h4v hs = *reinterpret_cast<const h4v*>(scl + sb * 128 + lane * 4);
+  const unsigned sg4 = (unsigned)svp[sb * 16 + (lane >> 1)] >> ((lane & 1) * 4);
+  for (int r = w; r < mr; r += 8) {
+    f4v s4 = {0.f, 0.f, 0.f, 0.f};
+    f4v pv[NS];
+#pragma unroll
+    for (int k = 0; k < NS; ++k) {
+      pv[k] = __builtin_nontemporal_load(reinterpret_cast<const f4v*>(
+          part + (((size_t)grp * NS + k) * M_CAP + r) * M_OUT + sb * 128 + lane * 4));
+    }
+#pragma unroll
+    for (int k = 0; k < NS; ++k) s4 += pv[k];
+    float v[4] = {
+      s4.x * (float)hs.x * cb, s4.y * (float)hs.y * cb,
+      s4.z * (float)hs.z * cb, s4.w * (float)hs.w * cb
+    };
+    fwht128_wave(v, lane);
+    float o[4] = {
+      v[0] * (1.0f / 11.313708498984761f), v[1] * (1.0f / 11.313708498984761f),
+      v[2] * (1.0f / 11.313708498984761f), v[3] * (1.0f / 11.313708498984761f)
+    };
+    if (sg4 & 1) o[0] = -o[0];
+    if (sg4 & 2) o[1] = -o[1];
+    if (sg4 & 4) o[2] = -o[2];
+    if (sg4 & 8) o[3] = -o[3];
+
+    const size_t out_off = (size_t)r * (G * M_OUT) + (size_t)grp * M_OUT + sb * 128 + lane * 4;
+    uint2 out_p;
+    if constexpr (HAS_GATE) {
+      const uint2 graw = *reinterpret_cast<const uint2*>(gate + out_off);
+      const float gfv[4] = {
+        __uint_as_float((graw.x & 0xFFFFu) << 16),
+        __uint_as_float(graw.x & 0xFFFF0000u),
+        __uint_as_float((graw.y & 0xFFFFu) << 16),
+        __uint_as_float(graw.y & 0xFFFF0000u),
+      };
+      float prod[4];
+#pragma unroll
+      for (int e2 = 0; e2 < 4; ++e2) {
+        const float sig = __builtin_amdgcn_rcpf(1.0f + exp2f(-1.4426950408889634f * gfv[e2]));
+        const float zb = bf2f(f2bf(o[e2]));
+        const float gb = bf2f(f2bf(sig));
+        prod[e2] = zb * gb;
+      }
+      out_p.x = f32_to_bf16x2_rne(prod[0], prod[1]);
+      out_p.y = f32_to_bf16x2_rne(prod[2], prod[3]);
+    } else {
+      out_p.x = f32_to_bf16x2_rne(o[0], o[1]);
+      out_p.y = f32_to_bf16x2_rne(o[2], o[3]);
+    }
+    *reinterpret_cast<uint2*>(out + out_off) = out_p;
+  }
+  if (threadIdx.x == 0) *cnt = 0u;
+}
+
 template <int M, int HAS_GATE, int SP16>
 static void dispatch_ns(
     int ns, const uint32_t* qw, const __half* scales, const uint8_t* su, const uint8_t* sv,
@@ -376,7 +711,7 @@ void launch_wo_a_k5_batched(
 ) {
   const int T = (int)x.size(0);
   if (T == 0) return;
-  TORCH_CHECK(T <= 8, "launch_wo_a_k5_batched supports T <= 8 (got ", T, ")");
+  TORCH_CHECK(T <= 16, "launch_wo_a_k5_batched supports T <= 16 (got ", T, ")");
   auto stream = c10::hip::getCurrentHIPStream().stream();
   const uint32_t* qw_p = reinterpret_cast<const uint32_t*>(qw.data_ptr<int32_t>());
   const __half* scl_p = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>());
@@ -404,7 +739,24 @@ void launch_wo_a_k5_batched(
   else if (T == 5) { DISP_M(5); }
   else if (T == 6) { DISP_M(6); }
   else if (T == 7) { DISP_M(7); }
-  else { DISP_M(8); }
+  else if (T == 8) { DISP_M(8); }
+  else if (T <= 12) {
+    if (sp16) {
+      if (g_p) hipLaunchKernelGGL((k_wo_a_k5_batched_big<12, 1, 1>), dim3(8, 8, 8), dim3(256), 0, stream, qw_p, scl_p, su_p, sv_p, x_p, g_p, part_p, cnt_p, out_p, T, (float)cb, 0);
+      else     hipLaunchKernelGGL((k_wo_a_k5_batched_big<12, 0, 1>), dim3(8, 8, 8), dim3(256), 0, stream, qw_p, scl_p, su_p, sv_p, x_p, nullptr, part_p, cnt_p, out_p, T, (float)cb, 0);
+    } else {
+      if (g_p) hipLaunchKernelGGL((k_wo_a_k5_batched_big<12, 1, 0>), dim3(8, 8, 8), dim3(256), 0, stream, qw_p, scl_p, su_p, sv_p, x_p, g_p, part_p, cnt_p, out_p, T, (float)cb, (int)spad);
+      else     hipLaunchKernelGGL((k_wo_a_k5_batched_big<12, 0, 0>), dim3(8, 8, 8), dim3(256), 0, stream, qw_p, scl_p, su_p, sv_p, x_p, nullptr, part_p, cnt_p, out_p, T, (float)cb, (int)spad);
+    }
+  } else {
+    if (sp16) {
+      if (g_p) hipLaunchKernelGGL((k_wo_a_k5_batched_big<16, 1, 1>), dim3(8, 8, 8), dim3(256), 0, stream, qw_p, scl_p, su_p, sv_p, x_p, g_p, part_p, cnt_p, out_p, T, (float)cb, 0);
+      else     hipLaunchKernelGGL((k_wo_a_k5_batched_big<16, 0, 1>), dim3(8, 8, 8), dim3(256), 0, stream, qw_p, scl_p, su_p, sv_p, x_p, nullptr, part_p, cnt_p, out_p, T, (float)cb, 0);
+    } else {
+      if (g_p) hipLaunchKernelGGL((k_wo_a_k5_batched_big<16, 1, 0>), dim3(8, 8, 8), dim3(256), 0, stream, qw_p, scl_p, su_p, sv_p, x_p, g_p, part_p, cnt_p, out_p, T, (float)cb, (int)spad);
+      else     hipLaunchKernelGGL((k_wo_a_k5_batched_big<16, 0, 0>), dim3(8, 8, 8), dim3(256), 0, stream, qw_p, scl_p, su_p, sv_p, x_p, nullptr, part_p, cnt_p, out_p, T, (float)cb, (int)spad);
+    }
+  }
 #undef DISP_M
 }
 

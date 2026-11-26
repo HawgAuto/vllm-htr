@@ -80,6 +80,11 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 from htr import ops as htr_ops
 from htr import wire as htr_wire
 from .fast_ops import get_dsa_attn, get_fast_ops, get_split_kv_scratch
+from .flashindexer import (
+    attach_flashindexer_gate,
+    flashindexer_context,
+    is_flashindexer_enabled,
+)
 
 logger = init_logger(__name__)
 
@@ -140,8 +145,8 @@ def _woa_scratch(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
     key = str(dev)
     pair = _WOA_SCRATCH.get(key)
     if pair is None:
-        # G=8, max_ns=8, max_M=8, M_OUT=1024 -> 2 MiB fp32; counters: 64 int32
-        part = torch.empty(8 * 8 * 8 * 1024, dtype=torch.float32, device=dev)
+        # G=8, max_ns=8, max_M=16, M_OUT=1024 -> 4 MiB fp32; counters: 64 int32
+        part = torch.empty(8 * 8 * 16 * 1024, dtype=torch.float32, device=dev)
         cnt = torch.zeros(8 * 8, dtype=torch.int32, device=dev)
         pair = _WOA_SCRATCH[key] = (part, cnt)
     return pair
@@ -150,10 +155,10 @@ def _woa_scratch(dev: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
 def _woa_prefill_scratch(dev: torch.device, T: int) -> tuple[torch.Tensor, torch.Tensor]:
     key = str(dev)
     pair = _WOA_PREFILL_SCRATCH.get(key)
-    if pair is None:
-        # Fixed cap=512 (32 MiB) allocated once -> zero reallocations across all T>8 / graph captures!
-        xt = torch.empty((512, 8, 4096), dtype=torch.float16, device=dev)
-        tok = torch.empty((512, 8), dtype=torch.float32, device=dev)
+    if pair is None or pair[0].shape[0] < T:
+        cap = max(512, T)
+        xt = torch.empty((cap, 8, 4096), dtype=torch.float16, device=dev)
+        tok = torch.empty((cap, 8), dtype=torch.float32, device=dev)
         pair = _WOA_PREFILL_SCRATCH[key] = (xt, tok)
     return pair[0][:T], pair[1][:T]
 
@@ -511,16 +516,16 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
                 dtype=o_groups.dtype,
                 device=o_groups.device,
             )
-            if num_tokens <= 8:
+            if num_tokens <= 16:
                 part, cnt = _woa_scratch(o_groups.device)
                 ext.wo_a_k5_batched(
                     qw, sc, su, sv, o_groups, gl, part, cnt, z_gated,
                     _WOA_NS, float(htr_ops.CB), 0, self._woa_sp16,
                 )
             elif hasattr(ext, "wo_a_k5_prefill_wmma"):
-                # Batched 8-group K=5 WMMA + SAD_HI + fused sigmoid(gate) for ALL T > 8!
-                for i in range(0, num_tokens, 512):
-                    j = min(i + 512, num_tokens)
+                # Batched 8-group K=5 WMMA + SAD_HI + fused sigmoid(gate) for ALL T > 16 (chunk=2048 -> 1.27x faster)!
+                for i in range(0, num_tokens, 2048):
+                    j = min(i + 2048, num_tokens)
                     xt_b, tok_b = _woa_prefill_scratch(o_groups.device, j - i)
                     ext.wo_a_k5_prefill_wmma(
                         qw, sc, su, sv, o_groups[i:j], gl[i:j], xt_b, tok_b, z_gated[i:j],
@@ -852,6 +857,23 @@ class Ernie5_5IndexerROCm(nn.Module):
             skip_k_cache_insert=False,
             use_fp4_cache=False,
         )
+        self.linear_gate = None
+        self.flashindexer_bias = None
+        self.flashindexer_topk = 8
+        if is_flashindexer_enabled(config):
+            attach_flashindexer_gate(self, config)
+
+    def _run_indexer_op(
+        self,
+        hidden_states: torch.Tensor,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+    ) -> torch.Tensor:
+        if self.linear_gate is not None:
+            with flashindexer_context(self, hidden_states, weights):
+                return self.indexer_op(hidden_states, q, k, weights)
+        return self.indexer_op(hidden_states, q, k, weights)
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions: torch.Tensor
@@ -899,7 +921,7 @@ class Ernie5_5IndexerROCm(nn.Module):
             q, weights = fops.rope_neox64_fwht128_ue8m0_quant_weights(
                 q.contiguous(), weights, positions, cs, float(self.weights_scale),
             )
-            return self.indexer_op(hidden_states, q, k, weights)
+            return self._run_indexer_op(hidden_states, q, k, weights)
         k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
         k = hadamard_rows(k)
@@ -915,14 +937,14 @@ class Ernie5_5IndexerROCm(nn.Module):
             q, weights = fops.fwht128_ue8m0_quant_weights(
                 q.contiguous(), weights, float(self.weights_scale)
             )
-            return self.indexer_op(hidden_states, q, k, weights)
+            return self._run_indexer_op(hidden_states, q, k, weights)
         q = hadamard_rows(q.view(-1, self.head_dim))
         q, q_scale = per_token_group_quant_fp8(
             q, INDEXER_QUANT_BLOCK, column_major_scales=False, use_ue8m0=True
         )
         q = q.view(-1, self.n_head, self.head_dim)
         weights = weights.float() * q_scale.view(-1, self.n_head) * self.weights_scale
-        return self.indexer_op(hidden_states, q, k, weights)
+        return self._run_indexer_op(hidden_states, q, k, weights)
 
 
 @dataclasses.dataclass

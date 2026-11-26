@@ -33,11 +33,15 @@ SU_STRIDE = 512    # w1/w3 256 | w2 256
 
 BPS_GU = int(os.environ.get("ERNIE_HTR_MOE_BPS_GU", "8"))
 BPS_DN = int(os.environ.get("ERNIE_HTR_MOE_BPS_DN", "8"))
+# K=2 DSpark draft MoE saturates 40 CUs at bps=4 (1.59x faster @ B=1, 1.48x @ B=2, 1.35x @ B=4!)
+BPS_GU_K2 = int(os.environ.get("ERNIE_HTR_MOE_BPS_GU_K2", "4"))
+BPS_DN_K2 = int(os.environ.get("ERNIE_HTR_MOE_BPS_DN_K2", "4"))
 SPAD3 = int(os.environ.get("ERNIE_HTR_MOE_SPAD3", "0"))
 PREFILL_CUT = int(os.environ.get("ERNIE_HTR_MOE_PREFILL_CUT", "32"))
 PREFILL_TILE_E = int(os.environ.get("ERNIE_HTR_MOE_TILE_E", "16"))
 USE_HPF5 = os.environ.get("ERNIE_HPF5_PREFILL", "1") == "1"
-HPF5_BMW = int(os.environ.get("ERNIE_HPF5_BMW", "64"))
+_HPF5_BMW_ENV = os.environ.get("ERNIE_HPF5_BMW")
+HPF5_BMW = int(_HPF5_BMW_ENV) if _HPF5_BMW_ENV is not None else 64
 HPF5_NT = int(os.environ.get("ERNIE_HPF5_NT", "1"))
 
 _EXT = None
@@ -116,8 +120,10 @@ def _decode_scratch(dev: torch.device) -> dict[str, torch.Tensor]:
     if s is None:
         a = MAXT * TOPK
         m = MAX_M
-        ns_gu = (MOE_H // 128 + BPS_GU - 1) // BPS_GU
-        ns_dn = (MOE_I // 128 + BPS_DN - 1) // BPS_DN
+        bps_gu_min = min(BPS_GU, BPS_GU_K2)
+        bps_dn_min = min(BPS_DN, BPS_DN_K2)
+        ns_gu = (MOE_H // 128 + bps_gu_min - 1) // bps_gu_min
+        ns_dn = (MOE_I // 128 + bps_dn_min - 1) // bps_dn_min
         f = dict(dtype=torch.float32, device=dev)
         i32 = dict(dtype=torch.int32, device=dev)
         s = _SCRATCH[key] = dict(
@@ -262,17 +268,19 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
         else:
             ge, gr, gn, slot, ng = E.moe_plan2(ids32, M)
         sp3 = self.spad if self.K == 3 else 0
+        bps_gu = BPS_GU_K2 if self.K == 2 else BPS_GU
+        bps_dn = BPS_DN_K2 if self.K == 2 else BPS_DN
         E.moe_gemv(
             0, self.K, M,
             self.qw, self.qoff, self.kexp, self.scales, self.su, self.sv,
             ge, gr, gn, x, s["part"], s["cnt_gu"], s["gu"],
-            BPS_GU, cb, 0, sp3, 0, 0, 1,
+            bps_gu, cb, 0, sp3, 0, 0, 1,
         )
         return E.moe_gemv_dn_fused(
             self.K, M,
             self.qw, self.qoff, self.kexp, self.scales, self.su, self.sv,
             ge, gr, gn, s["gu"], s["part"], s["cnt_dn"], s["dn"],
-            BPS_DN, cb, 0, sp3, 0, 0, 1,
+            bps_dn, cb, 0, sp3, 0, 0, 1,
             slot, w32, ng, s["cnt_c2"],
         )
 
@@ -284,8 +292,12 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
         nv = T * topk
         Pmax = ((nv + self.num_experts * 15 + 15) // 16) * 16
         s = _hpf5_scratch(x.device, Pmax, nv)
-        # Dynamic bmw: 32 for small prefill (T<=128, ~2.5 toks/expert), 64/128 for larger
-        bmw = 32 if T <= 128 else HPF5_BMW
+        # Dynamic bmw (v0.2.8 empirically tuned on gfx1151):
+        #   T<=1280: bmw=32 (1.22x faster @ T=1024); T<=2560: bmw=64 (18.2 TF/s @ T=2048); T>2560: 128
+        if _HPF5_BMW_ENV is not None:
+            bmw = 32 if T <= 128 else HPF5_BMW
+        else:
+            bmw = 32 if T <= 1280 else (64 if T <= 2560 else 128)
         return _hpf5().hpf5_ernie_forward(
             x, ids32, w32,
             self.qw, self.qoff, self.scales, self.su, self.sv,

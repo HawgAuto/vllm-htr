@@ -137,11 +137,29 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
     if orig_pref is not None and not getattr(orig_pref, "_ernie5_gfx1151_hip", False):
         @functools.wraps(orig_pref)
         def _rocm_fp8_mqa_logits_hip(q, kv, weights, cu_seqlen_ks, cu_seqlen_ke):
+            from .flashindexer import (
+                flashindexer_select_heads_rocm,
+                get_active_flashindexer,
+                slice_hidden_for_weights,
+            )
+            fi_ctx = get_active_flashindexer()
+            if fi_ctx is not None and q.dim() == 3 and q.shape[1] == 64:
+                fi_indexer, fi_hidden, fi_base_weights = fi_ctx
+                if getattr(fi_indexer, "linear_gate", None) is not None:
+                    h_chunk = slice_hidden_for_weights(fi_hidden, fi_base_weights, weights)
+                    q, weights = flashindexer_select_heads_rocm(
+                        q,
+                        weights,
+                        fi_indexer.linear_gate.weight,
+                        fi_indexer.flashindexer_bias,
+                        h_chunk,
+                        topk_heads=getattr(fi_indexer, "flashindexer_topk", 8),
+                    )
             if (
                 not (getattr(rmod, "_ON_GFX950", False) or getattr(rmod, "_ON_GFX942", False))
                 and q.is_cuda
                 and q.dim() == 3
-                and q.shape[1] == 64
+                and q.shape[1] in (64, 8)
                 and q.shape[2] == 128
             ):
                 from .fast_ops import get_dsa_attn
@@ -758,19 +776,113 @@ def _patch_htr_native_policy_for_dspark() -> None:
     hnp.prepare_engine = prepare_engine_wrapped
 
 
+def _dspark_draft_filter_enabled() -> bool:
+    import os
+    env = os.environ.get("ERNIE_DSPARK_DRAFT_FILTER")
+    if env is not None:
+        return env == "1"
+    return os.environ.get("Q38SPEC_DRAFT_FILTER") == "1"
+
+
+def _dspark_sample_filtered_or_orig(self, logits, idx_map, sample_pos, step, orig_fn):
+    """Apply request top_k / exact top_p-only filtering + sparse cache on DSpark probabilistic draft."""
+    import os
+    import torch
+
+    if (
+        not _dspark_draft_filter_enabled()
+        or self.draft_logits is None
+        or self._d2t_scatter_index is not None
+        or self.draft_watermarker is not None
+        or getattr(self, "use_acceptance_estimator", False)
+        or logits.dim() != 2
+        or logits.dtype not in (torch.bfloat16, torch.float32)
+        or logits.shape[1] < 256
+    ):
+        return orig_fn(self, logits, idx_map, sample_pos, step)
+
+    import q38spec
+
+    tk = getattr(self, "_q38_topk", None)
+    tp = getattr(self, "_q38_topp", None)
+    if tk is None or tp is None:
+        n = self.temperature.shape[0]
+        tk = torch.full((n,), 1 << 30, dtype=torch.int32, device=self.temperature.device)
+        tp = torch.ones((n,), dtype=torch.float32, device=self.temperature.device)
+        self._q38_topk = tk
+        self._q38_topp = tp
+
+    if logits.is_cuda and os.environ.get("HTR_Q38_FILTER_GUMBEL_FUSED", "1") == "1":
+        max_reqs, num_steps = self.draft_logits.shape[0], self.draft_logits.shape[1]
+        sp = getattr(self, "_q38_sparse_bufs", None)
+        if sp is None or sp[0].shape[0] != max_reqs or sp[0].shape[1] != num_steps:
+            dev = self.draft_logits.device
+            sp = (
+                torch.full((max_reqs, num_steps, q38spec.KC), -1, dtype=torch.int32, device=dev),
+                torch.full((max_reqs, num_steps, q38spec.KC), float("-inf"), dtype=torch.float32, device=dev),
+                torch.zeros((max_reqs, num_steps), dtype=torch.int32, device=dev),
+            )
+            self._q38_sparse_bufs = sp
+        q38spec._STATE["draft_sparse"][self.draft_logits.data_ptr()] = sp
+
+        step_cols_i64 = getattr(self, "_step_cols_i64", None)
+        if step_cols_i64 is None or step_cols_i64.shape[0] != self._step_cols.shape[0]:
+            step_cols_i64 = self._step_cols.to(torch.int64)
+            self._step_cols_i64 = step_cols_i64
+
+        write_dense = os.environ.get("HTR_SPARSE_REJECTION_ZERO_DENSE") != "1"
+        sampled = q38spec._spec_sample_ext().q38_filter_gumbel_sample_native(
+            logits.contiguous(),
+            self.draft_logits if write_dense else None,
+            step_cols_i64[step],
+            sp[0],
+            sp[1],
+            sp[2],
+            idx_map,
+            self.temperature,
+            tk,
+            tp,
+            self.seeds,
+            sample_pos - 1,
+            int(num_steps),
+            bool(write_dense),
+            bool(self.use_fp64_gumbel),
+        )
+        n_logged = getattr(self, "_ernie_dspark_filter_logged", 0)
+        if n_logged < 2:
+            self._ernie_dspark_filter_logged = n_logged + 1
+            capturing = torch.cuda.is_available() and torch.cuda.is_current_stream_capturing()
+            logger.info(
+                "ERNIE_DSPARK_DRAFT_FILTER fused_v28 rows=%d step=%d capturing=%s write_dense=%s",
+                logits.shape[0], int(step), capturing, write_dense,
+            )
+        return sampled
+
+    # Pure-PyTorch fallback (graph-safe, supports both top_k<=64 and exact top_p-only)
+    logits = q38spec.q38_filter_logits(logits, idx_map, self.temperature, tk, tp, in_place=True)
+    return orig_fn(self, logits, idx_map, sample_pos, step)
+
+
 def patch_dspark_sample_logits() -> None:
-    """Apply ERNIE-5.5 MultiMax + fused NT-streaming Markov sampling inside DSparkSpeculator."""
+    """Apply ERNIE-5.5 MultiMax + filtered predictive drafting + fused NT-streaming Markov sampling inside DSparkSpeculator."""
     import os
     from vllm.v1.worker.gpu.spec_decode.dspark.speculator import DSparkSpeculator
+
+    if _dspark_draft_filter_enabled():
+        try:
+            import q38spec
+            q38spec._patch_mrv2()
+        except Exception as exc:
+            logger.warning("ERNIE_DSPARK_DRAFT_FILTER failed to init q38spec mrv2 buffers: %r", exc)
 
     orig = DSparkSpeculator._sample_logits
     if not getattr(orig, "_ernie5_draft_logits", False):
         @functools.wraps(orig)
-        def _sample_logits(self, logits, *args, **kwargs):
+        def _sample_logits(self, logits, idx_map, sample_pos, step):
             postprocess = getattr(self.model, "postprocess_draft_logits", None)
             if postprocess is not None:
                 logits = postprocess(logits)
-            return orig(self, logits, *args, **kwargs)
+            return _dspark_sample_filtered_or_orig(self, logits, idx_map, sample_pos, step, orig)
 
         _sample_logits._ernie5_draft_logits = True  # type: ignore[attr-defined]
         DSparkSpeculator._sample_logits = _sample_logits
@@ -858,8 +970,10 @@ def patch_dspark_sample_logits() -> None:
                                 w2, markov_embed.to(torch.bfloat16), base_logits[:, i],
                                 ranges, ts, out_lg,
                             )
-                            # MultiMax already applied inline -> call orig _sample_logits directly
-                            draft_sampled_i = orig(self, out_lg, idx_map[:, i], sample_pos[:, i], i)
+                            # MultiMax already applied inline -> filtered predictive drafting (or orig)
+                            draft_sampled_i = _dspark_sample_filtered_or_orig(
+                                self, out_lg, idx_map[:, i], sample_pos[:, i], i, orig
+                            )
                             self.draft_tokens[:num_reqs, i] = draft_sampled_i
                             prev = draft_sampled_i
 
@@ -901,6 +1015,22 @@ def _get_k5sp_cfg() -> tuple[int, bool, int, int]:
     return _K5SP_CFG
 
 
+
+def _use_k5_unsplit_gemv(M: int, mt: int) -> bool:
+    """Empirically optimal gfx1151 crossover between K=5 unsplit GEMV and WMMA.
+    - M == 1: gemv_k5_unsplit_epi beats htr_ops.gemv_epi on small (mt<=128, 1.53x) and lm_head (mt>=4096, 236 GB/s).
+    - 2 <= M <= 8: gemv_k5_unsplit_epi wins across all shapes.
+    - 9 <= M <= 16: 2-subpass gemv_k5_unsplit_epi beats WMMA on mt<=256 (1.32-1.63x) and lm_head (1.05x),
+      while 256 < mt < 4096 (q_b/kv_b) saturates 40 CUs faster with WMMA.
+    """
+    if M == 1:
+        return mt <= 128 or mt >= 4096
+    if 2 <= M <= 8:
+        return True
+    if 9 <= M <= 16:
+        return mt <= 256 or mt >= 4096
+    return False
+
 def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
     """Execute an ERNIE-5.5 K=5 linear (unsplit or repacked) using pre-computed (xt, xs, tok)."""
     import torch
@@ -913,23 +1043,25 @@ def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
     from .fast_ops import get_k5_sp_prefill
     sp_ext = get_k5_sp_prefill()
     if qweight.data_ptr() not in _REPACKED_K5_PTRS:
-        # Unsplit qw [mt, nt, 40]: zero-repack full-speed decode + unsplit WMMA prefill!
+        # Unsplit qw [mt, nt, 40]: zero-repack full-speed decode + concurrent T=9..16 GEMV + v28 4x4 WMMA prefill!
+        if (
+            _USE_K5_UNSPLIT_FAST
+            and (mt % 8) == 0
+            and sp_ext is not None
+            and hasattr(sp_ext, "gemv_k5_unsplit_epi")
+            and _use_k5_unsplit_gemv(M, mt)
+        ):
+            cnt = htr_ops.counters(xt.device)
+            ns = htr_ops.nsplit_for(mt, nt, min(M, 8))
+            if nt >= 32:
+                ns = min(32, max(8, ((ns + 7) // 8) * 8))
+            _e8 = int(htr_ops.EPI8 and htr_ops._ns_eff(mt, nt, ns) % 8 == 0)
+            return sp_ext.gemv_k5_unsplit_epi(
+                qweight, xt, xs, tok, scales, float(htr_ops.CB), sv, bias, cnt, ns, _e8
+            )
         if M < wmma_min_m and M <= htr_ops.GEMV_MAX_M:
             cnt = htr_ops.counters(xt.device)
             ns = htr_ops.nsplit_for(mt, nt, M)
-            if (
-                M >= 2
-                and (mt % 8) == 0
-                and sp_ext is not None
-                and hasattr(sp_ext, "gemv_k5_unsplit_epi")
-                and _USE_K5_UNSPLIT_FAST
-            ):
-                if nt >= 32:
-                    ns = min(32, max(8, ((ns + 7) // 8) * 8))
-                _e8 = int(htr_ops.EPI8 and htr_ops._ns_eff(mt, nt, ns) % 8 == 0)
-                return sp_ext.gemv_k5_unsplit_epi(
-                    qweight, xt, xs, tok, scales, float(htr_ops.CB), sv, bias, cnt, ns, _e8
-                )
             _e8 = int(htr_ops.EPI8 and htr_ops._ns_eff(mt, nt, ns) % 8 == 0)
             return htr_ops.ext().gemv_epi(
                 qweight, xt, xs, tok, scales, htr_ops.CB, sv, bias, cnt, ns, 0, _e8
@@ -979,7 +1111,7 @@ def _patch_htr_linear_for_repacked_k5() -> None:
     # Optional cap on split-K ns for M>=4 ERNIE-5.5 mt>=256 linears (0 = default htr_ops.nsplit_for)
     m4_max_ns = int(os.environ.get("ERNIE_K5_SP_M4_MAX_NS", "0"))
 
-    wmma_unsplit_max_m = int(os.environ.get("ERNIE_K5_UNSPLIT_WMMA_MAX_M", "384"))
+    wmma_unsplit_max_m = int(os.environ.get("ERNIE_K5_UNSPLIT_WMMA_MAX_M", "8192"))
 
     @functools.wraps(orig_impl)
     def _linear_impl_k5sp(x2, qweight, scales, su, sv, bias):
@@ -993,17 +1125,18 @@ def _patch_htr_linear_for_repacked_k5() -> None:
                 and qweight.shape[2] == 40
                 and (qweight.shape[0] % 8) == 0
             ):
-                if _USE_K5_UNSPLIT_FAST and 2 <= M <= htr_ops.GEMV_MAX_M:
+                mt = qweight.shape[0]
+                if _USE_K5_UNSPLIT_FAST and _use_k5_unsplit_gemv(M, mt):
                     from .fast_ops import get_k5_sp_prefill
                     sp_ext = get_k5_sp_prefill()
                     if sp_ext is not None and hasattr(sp_ext, "gemv_k5_unsplit_epi"):
                         if not getattr(_linear_impl_k5sp, "_w24_logged", False):
                             _linear_impl_k5sp._w24_logged = True
                             print(f"ERNIE_WAVE24_K5_UNSPLIT_ACTIVE first_shape={tuple(qweight.shape)} M={M}", flush=True)
-                        mt, nt = qweight.shape[0], qweight.shape[1]
+                        nt = qweight.shape[1]
                         xt, xs, tok = htr_ops.ext().prologue(x2, su)
                         cnt = htr_ops.counters(x2.device)
-                        ns = htr_ops.nsplit_for(mt, nt, M)
+                        ns = htr_ops.nsplit_for(mt, nt, min(M, 8))
                         if nt >= 32:
                             ns = min(32, max(8, ((ns + 7) // 8) * 8))
                         _e8 = int(htr_ops.EPI8 and htr_ops._ns_eff(mt, nt, ns) % 8 == 0)
@@ -1224,4 +1357,10 @@ def apply_patches() -> None:
     _register_renderer()
     _patch_enable_thinking()
     _patch_rocm_paged_mqa_logits_triton()
+    if _dspark_draft_filter_enabled():
+        try:
+            import q38spec
+            q38spec._patch_mrv2()
+        except Exception as exc:
+            logger.warning("ERNIE_DSPARK_DRAFT_FILTER early q38spec init failed: %r", exc)
 
