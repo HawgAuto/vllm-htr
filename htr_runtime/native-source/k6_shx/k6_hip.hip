@@ -18,63 +18,122 @@ __device__ __forceinline__ float k6_nofuse(float v) {
   return __builtin_bit_cast(float, __builtin_amdgcn_update_dpp(0, __builtin_bit_cast(int, v), 0xE4, 0xF, 0xF, false));
 }
 // trellis tile loop for one 16-row strip over input 128-blocks [b0, b0+nb): verbatim k_gemv_fused inner loop
+// WAVE6_K6_SWPIPE: software-pipelined weight prefetch for NT==2 && K>=4 && M<=2 (88% of T=4 routed experts!)
 template <int K, int M, int NBL, int NT>
 __device__ __forceinline__ void tile_loop_n(const uint32_t* __restrict__ qm, size_t pitch, int i, int b0, int nb, int lane,
                                           _Float16 (*xs_l)[NBL * 128], float (*bscale)[NBL], float* a0, float* a1) {
   const int g = lane >> 3, q = lane & 7;
-  for (int jl = g; jl < nb * 8; jl += 4) {
-    const int j = b0 * 8 + jl, bl = jl >> 3;
-    const uint32_t* tp = qm + (size_t)i * pitch + (size_t)j * (8 * K);   // v0: ((size_t)i * nt + j) * (8 * K)
-    uint32_t V[K + 1];
-    if constexpr (NT == 2 && K >= 4) {
-      const k6_u4 wa = __builtin_nontemporal_load(reinterpret_cast<const k6_u4a*>(tp + q * K));
-      V[1] = wa.x; V[2] = wa.y; V[3] = wa.z; V[4] = wa.w;
+  const int jlim = nb * 8;
+  if constexpr (NT == 2 && K >= 4 && M <= 2) {
+    int jl = g;
+    if (jl < jlim) {
+      const uint32_t* tp0 = qm + (size_t)i * pitch + (size_t)(b0 * 8 + jl) * (8 * K);
+      uint32_t Vraw[K];
+      {
+        const k6_u4 wa = __builtin_nontemporal_load(reinterpret_cast<const k6_u4a*>(tp0 + q * K));
+        Vraw[0] = wa.x; Vraw[1] = wa.y; Vraw[2] = wa.z; Vraw[3] = wa.w;
 #pragma unroll
-      for (int k = 4; k < K; ++k) V[k + 1] = __builtin_nontemporal_load(tp + q * K + k);
-      V[0] = __builtin_amdgcn_permlane16(V[K], V[K], 0x65432107u, 0xedcba98fu, false, false);
-    } else if constexpr ((K == 4 && M == 1) || NT != 0) {
-      V[0] = __builtin_nontemporal_load(tp + (q * K + 8 * K - 1) % (8 * K));
+        for (int k = 4; k < K; ++k) Vraw[k] = __builtin_nontemporal_load(tp0 + q * K + k);
+      }
+      for (; jl < jlim; jl += 4) {
+        const int bl = jl >> 3;
+        h2v xv[M][4];
+        float d0[M], d1[M];
 #pragma unroll
-      for (int k = 0; k < K; ++k) V[k + 1] = __builtin_nontemporal_load(tp + q * K + k);
-    } else {
-      V[0] = tp[(q * K + 8 * K - 1) % (8 * K)];
+        for (int r = 0; r < M; ++r) {
+          const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
+          uint4 u0 = xp[0];
+          xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
+          d0[r] = 0.f; d1[r] = 0.f;
+        }
+        uint32_t V[K + 1];
 #pragma unroll
-      for (int k = 0; k < K; ++k) V[k + 1] = tp[q * K + k];
-    }
-    h2v xv[M][4];
-    float d0[M], d1[M];
+        for (int k = 0; k < K; ++k) V[k + 1] = Vraw[k];
+        if (jl + 4 < jlim) {
+          const uint32_t* tpn = qm + (size_t)i * pitch + (size_t)(b0 * 8 + jl + 4) * (8 * K);
+          const k6_u4 wa = __builtin_nontemporal_load(reinterpret_cast<const k6_u4a*>(tpn + q * K));
+          Vraw[0] = wa.x; Vraw[1] = wa.y; Vraw[2] = wa.z; Vraw[3] = wa.w;
 #pragma unroll
-    for (int r = 0; r < M; ++r) {
-      const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
-      uint4 u0 = xp[0];
-      xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
-      d0[r] = 0.f; d1[r] = 0.f;
-    }
+          for (int k = 4; k < K; ++k) Vraw[k] = __builtin_nontemporal_load(tpn + q * K + k);
+        }
+        V[0] = __builtin_amdgcn_permlane16(V[K], V[K], 0x65432107u, 0xedcba98fu, false, false);
 #define HTR_PAIRM2(UA, UB)                                                                        \
-    {                                                                                             \
-      h2v wa = as_h2(val_f16bits2(ext16<16 + ((UA) + 1) * K>(V), ext16<16 + ((UA) + 2) * K>(V))); \
-      h2v wb = as_h2(val_f16bits2(ext16<16 + ((UB) + 1) * K>(V), ext16<16 + ((UB) + 2) * K>(V))); \
-      _Pragma("unroll") for (int r = 0; r < M; ++r) {                                             \
-        d0[r] = __builtin_amdgcn_fdot2(wa, xv[r][((UA) & 7) >> 1], d0[r], false);                 \
-        d1[r] = __builtin_amdgcn_fdot2(wb, xv[r][((UB) & 7) >> 1], d1[r], false);                 \
-      }                                                                                           \
-    }
-    HTR_PAIRM2(0, 18) HTR_PAIRM2(2, 16) HTR_PAIRM2(4, 22) HTR_PAIRM2(6, 20)
+        {                                                                                         \
+          h2v wa = as_h2(val_f16bits2(ext16<16 + ((UA) + 1) * K>(V), ext16<16 + ((UA) + 2) * K>(V))); \
+          h2v wb = as_h2(val_f16bits2(ext16<16 + ((UB) + 1) * K>(V), ext16<16 + ((UB) + 2) * K>(V))); \
+          _Pragma("unroll") for (int r = 0; r < M; ++r) {                                         \
+            d0[r] = __builtin_amdgcn_fdot2(wa, xv[r][((UA) & 7) >> 1], d0[r], false);             \
+            d1[r] = __builtin_amdgcn_fdot2(wb, xv[r][((UB) & 7) >> 1], d1[r], false);             \
+          }                                                                                       \
+        }
+        HTR_PAIRM2(0, 18) HTR_PAIRM2(2, 16) HTR_PAIRM2(4, 22) HTR_PAIRM2(6, 20)
 #pragma unroll
-    for (int r = 0; r < M; ++r) {
-      const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
-      uint4 u1 = xp[1];
-      xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
-    }
-    HTR_PAIRM2(8, 26) HTR_PAIRM2(10, 24) HTR_PAIRM2(12, 30) HTR_PAIRM2(14, 28)
+        for (int r = 0; r < M; ++r) {
+          const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
+          uint4 u1 = xp[1];
+          xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+        }
+        HTR_PAIRM2(8, 26) HTR_PAIRM2(10, 24) HTR_PAIRM2(12, 30) HTR_PAIRM2(14, 28)
 #undef HTR_PAIRM2
 #pragma unroll
-    for (int r = 0; r < M; ++r) { const float s = bscale[r][bl]; a0[r] += s * d0[r]; a1[r] += s * d1[r]; }
+        for (int r = 0; r < M; ++r) { const float s = bscale[r][bl]; a0[r] += s * d0[r]; a1[r] += s * d1[r]; }
+      }
+    }
+  } else {
+    for (int jl = g; jl < jlim; jl += 4) {
+      const int j = b0 * 8 + jl, bl = jl >> 3;
+      const uint32_t* tp = qm + (size_t)i * pitch + (size_t)j * (8 * K);
+      uint32_t V[K + 1];
+      if constexpr (NT == 2 && K >= 4) {
+        const k6_u4 wa = __builtin_nontemporal_load(reinterpret_cast<const k6_u4a*>(tp + q * K));
+        V[1] = wa.x; V[2] = wa.y; V[3] = wa.z; V[4] = wa.w;
+#pragma unroll
+        for (int k = 4; k < K; ++k) V[k + 1] = __builtin_nontemporal_load(tp + q * K + k);
+        V[0] = __builtin_amdgcn_permlane16(V[K], V[K], 0x65432107u, 0xedcba98fu, false, false);
+      } else if constexpr ((K == 4 && M == 1) || NT != 0) {
+        V[0] = __builtin_nontemporal_load(tp + (q * K + 8 * K - 1) % (8 * K));
+#pragma unroll
+        for (int k = 0; k < K; ++k) V[k + 1] = __builtin_nontemporal_load(tp + q * K + k);
+      } else {
+        V[0] = tp[(q * K + 8 * K - 1) % (8 * K)];
+#pragma unroll
+        for (int k = 0; k < K; ++k) V[k + 1] = tp[q * K + k];
+      }
+      h2v xv[M][4];
+      float d0[M], d1[M];
+#pragma unroll
+      for (int r = 0; r < M; ++r) {
+        const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
+        uint4 u0 = xp[0];
+        xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
+        d0[r] = 0.f; d1[r] = 0.f;
+      }
+#define HTR_PAIRM2(UA, UB)                                                                        \
+      {                                                                                           \
+        h2v wa = as_h2(val_f16bits2(ext16<16 + ((UA) + 1) * K>(V), ext16<16 + ((UA) + 2) * K>(V))); \
+        h2v wb = as_h2(val_f16bits2(ext16<16 + ((UB) + 1) * K>(V), ext16<16 + ((UB) + 2) * K>(V))); \
+        _Pragma("unroll") for (int r = 0; r < M; ++r) {                                           \
+          d0[r] = __builtin_amdgcn_fdot2(wa, xv[r][((UA) & 7) >> 1], d0[r], false);               \
+          d1[r] = __builtin_amdgcn_fdot2(wb, xv[r][((UB) & 7) >> 1], d1[r], false);               \
+        }                                                                                         \
+      }
+      HTR_PAIRM2(0, 18) HTR_PAIRM2(2, 16) HTR_PAIRM2(4, 22) HTR_PAIRM2(6, 20)
+#pragma unroll
+      for (int r = 0; r < M; ++r) {
+        const uint4* xp = reinterpret_cast<const uint4*>(&xs_l[r][jl * 16]);
+        uint4 u1 = xp[1];
+        xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+      }
+      HTR_PAIRM2(8, 26) HTR_PAIRM2(10, 24) HTR_PAIRM2(12, 30) HTR_PAIRM2(14, 28)
+#undef HTR_PAIRM2
+#pragma unroll
+      for (int r = 0; r < M; ++r) { const float s = bscale[r][bl]; a0[r] += s * d0[r]; a1[r] += s * d1[r]; }
+    }
   }
 }
 
 template <int KF, int M, int PH, int FUSE, int OPT, int NBL = MOE_MAXB, int NT = 0, int NSC = 0>
-__global__ __launch_bounds__(256) void k6_moe(K6Args A6) {
+__global__ __launch_bounds__(256, 4) void k6_moe(K6Args A6) {
   const MoeArgs& a = A6.a;
   constexpr int m = PH == 0 ? 2 * MOE_I : MOE_H;       // output rows (gate|up fused for PH0)
   constexpr int n = PH == 0 ? MOE_H : MOE_I;           // input columns
@@ -100,99 +159,124 @@ __global__ __launch_bounds__(256) void k6_moe(K6Args A6) {
   const __half* scl = a.scales + (size_t)e * SC_STRIDE + (mat == 0 ? 0 : mat == 1 ? MOE_I : 2 * MOE_I);
   const uint8_t* svp = a.sv + (size_t)e * SV_STRIDE + (mat == 0 ? 0 : mat == 1 ? 80 : 160);
   const uint8_t* sup = a.su + (size_t)e * SU_STRIDE + (PH == 0 ? 0 : 320);
-  const int b0 = sp * a.bps, b1 = min(n >> 7, b0 + a.bps), nb = b1 - b0;
-  if (a.bps > NBL) __builtin_trap();
+  // K6_CHUNKED_NSC1: when PH==0 && NSC==1, iterate 20 input blocks in 4 chunks of NBL=5 blocks
+  // reusing the same 5 KB xs_l LDS -> ZERO split-K part R/W, ZERO atomics, ZERO fences!
+  constexpr bool CHUNKED_GU = (PH == 0 && NSC == 1);
+  const int b_start = CHUNKED_GU ? 0 : (sp * a.bps);
+  const int b_limit = CHUNKED_GU ? (n >> 7) : min(n >> 7, b_start + a.bps);
+  const int chunk_step = CHUNKED_GU ? NBL : (b_limit - b_start);
+  if (!CHUNKED_GU && a.bps > NBL) __builtin_trap();
   if constexpr (NSC != 0) { if (ns != NSC) __builtin_trap(); }
-  // ---- prologue: x~ = f16(H128(su . x) / blockscale) for this WG's input chunk, rows r < mr
+
   const int prow = (OPT & 1) ? mr : M;
-  if constexpr ((OPT & 8) != 0) {
-    for (int it = w; it < prow * nb; it += 8) {
-      const int r = it / nb, bl = it % nb;
-#pragma unroll
-      for (int e2 = 0; e2 < 4; ++e2) xs_l[r][bl * 128 + lane * 4 + e2] = (_Float16)0.25f;
-      if (lane == 0) { bscale[r][bl] = 1.f; bsum[r][bl] = 32.f; }
-    }
-  } else
-  for (int it = w; it < prow * nb; it += 8) {
-    const int r = it / nb, bl = it % nb, base = (b0 + bl) * 128 + lane * 4;
-    float v[4];
-    if (r < mr) {
-      if constexpr (PH == 0) {
-        const __hip_bfloat16* xr = a.x + (size_t)a.grp_rows[gidx * M + r] * MOE_H;
-#pragma unroll
-        for (int e2 = 0; e2 < 4; ++e2) v[e2] = __bfloat162float(xr[base + e2]);
-      } else {
-        const float* gr = a.gu + ((size_t)gidx * M + r) * (2 * MOE_I);
-#pragma unroll
-        for (int e2 = 0; e2 < 4; ++e2) v[e2] = silu_f(gr[base + e2]) * gr[MOE_I + base + e2];
-      }
-    } else {
-#pragma unroll
-      for (int e2 = 0; e2 < 4; ++e2) v[e2] = 0.f;
-    }
-#pragma unroll
-    for (int e2 = 0; e2 < 4; ++e2) {
-      const int idx = base + e2;
-      if ((sup[idx >> 3] >> (idx & 7)) & 1) v[e2] = -v[e2];
-    }
-    fwht128_wave(v, lane);
-    float am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
-    am = wave_max(am);
-    am *= (1.0f / 11.313708498984761f);
-    const float sc = am > 30000.f ? exp2f(ceilf(log2f(am / 30000.f))) : 1.f;
-    const float inv = (1.0f / 11.313708498984761f) / sc;
-    float sum = 0.f;
-#pragma unroll
-    for (int e2 = 0; e2 < 4; ++e2) {
-      _Float16 h = (_Float16)(v[e2] * inv);
-      xs_l[r][bl * 128 + lane * 4 + e2] = h;
-      sum += (float)h;
-    }
-    sum = wave_sum(sum);
-    if (lane == 0) { bscale[r][bl] = sc; bsum[r][bl] = sum; }
-  }
-  __syncthreads();
-  // ---- trellis GEMV over this WG's 8 strips x chunk
   const int il = sbl * 8 + w;                           // 16-row strip inside the selected matrix
-  float a0[M], a1[M];
+  float a0[M], a1[M], off_acc[M];
 #pragma unroll
-  for (int r = 0; r < M; ++r) { a0[r] = 0.f; a1[r] = 0.f; }
-  if constexpr (KF != 0 && (OPT & 1) != 0) {
-    if (shg) {
-      const size_t pitch = (size_t)nt * 40 + a.spadk[5];
-      switch (mr) {
-        case 1: if constexpr (M >= 1) tile_loop_n<5, 1, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 2: if constexpr (M >= 2) tile_loop_n<5, 2, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 3: if constexpr (M >= 3) tile_loop_n<5, 3, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 4: if constexpr (M >= 4) tile_loop_n<5, 4, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 5: if constexpr (M >= 5) tile_loop_n<5, 5, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 6: if constexpr (M >= 6) tile_loop_n<5, 6, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 7: if constexpr (M >= 7) tile_loop_n<5, 7, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 8: if constexpr (M >= 8) tile_loop_n<5, 8, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        default: break;
+  for (int r = 0; r < M; ++r) { a0[r] = 0.f; a1[r] = 0.f; off_acc[r] = 0.f; }
+
+  for (int b0 = b_start; b0 < b_limit; b0 += chunk_step) {
+    const int nb = min(chunk_step, b_limit - b0);
+    // ---- prologue: x~ = f16(H128(su . x) / blockscale) for this chunk, rows r < mr
+    if constexpr ((OPT & 8) != 0) {
+      for (int it = w; it < prow * nb; it += 8) {
+        const int r = it / nb, bl = it % nb;
+#pragma unroll
+        for (int e2 = 0; e2 < 4; ++e2) xs_l[r][bl * 128 + lane * 4 + e2] = (_Float16)0.25f;
+        if (lane == 0) { bscale[r][bl] = 1.f; bsum[r][bl] = 32.f; }
       }
+    } else
+    for (int it = w; it < prow * nb; it += 8) {
+      const int r = it / nb, bl = it % nb, base = (b0 + bl) * 128 + lane * 4;
+      float v[4];
+      if (r < mr) {
+        if constexpr (PH == 0) {
+          const uint2 raw = *reinterpret_cast<const uint2*>(a.x + (size_t)a.grp_rows[gidx * M + r] * MOE_H + base);
+          v[0] = __uint_as_float((raw.x & 0xffffu) << 16);
+          v[1] = __uint_as_float(raw.x & 0xffff0000u);
+          v[2] = __uint_as_float((raw.y & 0xffffu) << 16);
+          v[3] = __uint_as_float(raw.y & 0xffff0000u);
+        } else {
+          const float* gr = a.gu + ((size_t)gidx * M + r) * (2 * MOE_I) + base;
+          const k6_f4 g4 = *reinterpret_cast<const k6_f4*>(gr);
+          const k6_f4 u4 = *reinterpret_cast<const k6_f4*>(gr + MOE_I);
+          v[0] = silu_f(g4.x) * u4.x;
+          v[1] = silu_f(g4.y) * u4.y;
+          v[2] = silu_f(g4.z) * u4.z;
+          v[3] = silu_f(g4.w) * u4.w;
+        }
+      } else {
+#pragma unroll
+        for (int e2 = 0; e2 < 4; ++e2) v[e2] = 0.f;
+      }
+      const unsigned sg4 = (unsigned)sup[(b0 + bl) * 16 + (lane >> 1)] >> ((lane & 1) * 4);
+      if (sg4 & 1) v[0] = -v[0];
+      if (sg4 & 2) v[1] = -v[1];
+      if (sg4 & 4) v[2] = -v[2];
+      if (sg4 & 8) v[3] = -v[3];
+      fwht128_wave(v, lane);
+      float mx = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+      mx = wave_max(mx);
+      const float sc = mx > 0.f ? (mx * (1.0f / 11.313708498984761f)) * (1.0f / 32768.0f) : 1.0f;
+      const float inv = (1.0f / 11.313708498984761f) / sc;
+      k6_h4 h4;
+      h4.x = (_Float16)(v[0] * inv);
+      h4.y = (_Float16)(v[1] * inv);
+      h4.z = (_Float16)(v[2] * inv);
+      h4.w = (_Float16)(v[3] * inv);
+      *reinterpret_cast<k6_h4*>(&xs_l[r][bl * 128 + lane * 4]) = h4;
+      float sum = ((float)h4.x + (float)h4.y) + ((float)h4.z + (float)h4.w);
+      sum = wave_sum(sum);
+      if (lane == 0) { bscale[r][bl] = sc; bsum[r][bl] = sum; }
+    }
+    __syncthreads();
+    // ---- trellis GEMV over this WG's 8 strips x chunk
+    if constexpr (KF != 0 && (OPT & 1) != 0) {
+      if (shg) {
+        const size_t pitch = (size_t)nt * 40 + a.spadk[5];
+        switch (mr) {
+          case 1: if constexpr (M >= 1) tile_loop_n<5, 1, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 2: if constexpr (M >= 2) tile_loop_n<5, 2, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 3: if constexpr (M >= 3) tile_loop_n<5, 3, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 4: if constexpr (M >= 4) tile_loop_n<5, 4, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 5: if constexpr (M >= 5) tile_loop_n<5, 5, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 6: if constexpr (M >= 6) tile_loop_n<5, 6, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 7: if constexpr (M >= 7) tile_loop_n<5, 7, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 8: if constexpr (M >= 8) tile_loop_n<5, 8, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          default: break;
+        }
+      } else {
+        const size_t pitch = (size_t)nt * 8 * KF + a.spadk[KF];
+        switch (mr) {
+          case 1: if constexpr (M >= 1) tile_loop_n<KF, 1, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 2: if constexpr (M >= 2) tile_loop_n<KF, 2, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 3: if constexpr (M >= 3) tile_loop_n<KF, 3, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 4: if constexpr (M >= 4) tile_loop_n<KF, 4, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 5: if constexpr (M >= 5) tile_loop_n<KF, 5, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 6: if constexpr (M >= 6) tile_loop_n<KF, 6, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 7: if constexpr (M >= 7) tile_loop_n<KF, 7, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          case 8: if constexpr (M >= 8) tile_loop_n<KF, 8, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+          default: break;
+        }
+      }
+    } else if constexpr (KF != 0) {
+      tile_loop_n<KF, M, NBL, NT>(qm, (size_t)nt * 8 * KF + a.spadk[KF], il, b0, nb, lane, xs_l, bscale, a0, a1);
     } else {
-      const size_t pitch = (size_t)nt * 8 * KF + a.spadk[KF];
-      switch (mr) {
-        case 1: if constexpr (M >= 1) tile_loop_n<KF, 1, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 2: if constexpr (M >= 2) tile_loop_n<KF, 2, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 3: if constexpr (M >= 3) tile_loop_n<KF, 3, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 4: if constexpr (M >= 4) tile_loop_n<KF, 4, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 5: if constexpr (M >= 5) tile_loop_n<KF, 5, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 6: if constexpr (M >= 6) tile_loop_n<KF, 6, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 7: if constexpr (M >= 7) tile_loop_n<KF, 7, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        case 8: if constexpr (M >= 8) tile_loop_n<KF, 8, NBL, NT>(qm, pitch, il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-        default: break;
+      switch (K) {
+        case 3: tile_loop_n<3, M, NBL, NT>(qm, (size_t)nt * 24 + a.spadk[3], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+        case 4: tile_loop_n<4, M, NBL, NT>(qm, (size_t)nt * 32 + a.spadk[4], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+        case 5: tile_loop_n<5, M, NBL, NT>(qm, (size_t)nt * 40 + a.spadk[5], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
+        default: __builtin_trap();
       }
     }
-  } else if constexpr (KF != 0) {
-    tile_loop_n<KF, M, NBL, NT>(qm, (size_t)nt * 8 * KF + a.spadk[KF], il, b0, nb, lane, xs_l, bscale, a0, a1);
-  } else {
-    switch (K) {
-      case 3: tile_loop_n<3, M, NBL, NT>(qm, (size_t)nt * 24 + a.spadk[3], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-      case 4: tile_loop_n<4, M, NBL, NT>(qm, (size_t)nt * 32 + a.spadk[4], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-      case 5: tile_loop_n<5, M, NBL, NT>(qm, (size_t)nt * 40 + a.spadk[5], il, b0, nb, lane, xs_l, bscale, a0, a1); break;
-      default: __builtin_trap();
+    if ((lane >> 3) == 0) {
+#pragma unroll
+      for (int r = 0; r < M; ++r) {
+        if ((OPT & 1) && r >= mr) continue;
+        for (int bl = 0; bl < nb; ++bl) off_acc[r] += bscale[r][bl] * bsum[r][bl];
+      }
+    }
+    if constexpr (CHUNKED_GU) {
+      if (b0 + chunk_step < b_limit) __syncthreads();
     }
   }
 #pragma unroll
@@ -201,13 +285,44 @@ __global__ __launch_bounds__(256) void k6_moe(K6Args A6) {
     a1[r] += shx<8>(a1[r]); a1[r] += shx<16>(a1[r]);
   }
   const int q = lane & 7;
+  const int t = threadIdx.x, rl = sbl * 128 + (t & 127), row = sb * 128 + (t & 127);
+  if constexpr (NSC == 1 && (OPT & 64) != 0 && (OPT & 16) == 0) {
+    // v0.2.7 ZERO-SPLIT-K fast path: reuse xs_l LDS (dead after tile_loop_n, >= M*128*4 bytes when NBL >= 2!)
+    static_assert(NBL >= 2, "NSC==1 LDS epilogue requires NBL >= 2");
+    __syncthreads();
+    float (*ep_lds)[128] = reinterpret_cast<float (*)[128]>(xs_l);
+    if ((lane >> 3) == 0) {
+#pragma unroll
+      for (int r = 0; r < M; ++r) {
+        if ((OPT & 1) && r >= mr) continue;
+        const float off = off_acc[r] * 1534.0f;
+        ep_lds[r][w * 16 + 2 * q]     = a0[r] - off;
+        ep_lds[r][w * 16 + 2 * q + 1] = a1[r] - off;
+      }
+    }
+    __syncthreads();
+    if (w < mr) {
+      const int r = w;
+      const k6_f4 s4 = *reinterpret_cast<const k6_f4*>(&ep_lds[r][lane * 4]);
+      const k6_h4 hs = *reinterpret_cast<const k6_h4*>(scl + sbl * 128 + lane * 4);
+      float v[4] = {k6_nofuse(s4.x * (float)hs.x * a.cb), k6_nofuse(s4.y * (float)hs.y * a.cb), k6_nofuse(s4.z * (float)hs.z * a.cb), k6_nofuse(s4.w * (float)hs.w * a.cb)};
+      fwht128_wave(v, lane);
+      const unsigned sg4 = (unsigned)svp[sbl * 16 + (lane >> 1)] >> ((lane & 1) * 4);
+      k6_f4 o4;
+      o4.x = v[0] * (1.0f / 11.313708498984761f); o4.y = v[1] * (1.0f / 11.313708498984761f);
+      o4.z = v[2] * (1.0f / 11.313708498984761f); o4.w = v[3] * (1.0f / 11.313708498984761f);
+      if (sg4 & 1) o4.x = -o4.x;
+      if (sg4 & 2) o4.y = -o4.y;
+      if (sg4 & 4) o4.z = -o4.z;
+      if (sg4 & 8) o4.w = -o4.w;
+      *reinterpret_cast<k6_f4*>(a.out + ((size_t)gidx * M + r) * m + sb * 128 + lane * 4) = o4;
+    }
+  } else {
   if ((lane >> 3) == 0) {
 #pragma unroll
     for (int r = 0; r < M; ++r) {
       if ((OPT & 1) && r >= mr) continue;
-      float off = 0.f;
-      for (int bl = 0; bl < nb; ++bl) off += bscale[r][bl] * bsum[r][bl];
-      off *= 1534.0f;
+      const float off = off_acc[r] * 1534.0f;
       float* pp = a.part + (((size_t)gidx * ns + sp) * M + r) * m + (sb * 8 + w) * 16 + 2 * q;
       pp[0] = a0[r] - off; pp[1] = a1[r] - off;
     }
@@ -221,7 +336,6 @@ __global__ __launch_bounds__(256) void k6_moe(K6Args A6) {
   if constexpr ((OPT & 16) != 0) { if (threadIdx.x == 0) *cnt = 0u; return; }
   if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); else __threadfence();
   // ---- epilogue (last WG of this expert's strip-block): sum splits, scale*cb, output H128, sv -> f32 out
-  const int t = threadIdx.x, rl = sbl * 128 + (t & 127), row = sb * 128 + (t & 127);
   if constexpr ((OPT & 64) != 0 && NSC != 0) {
     if (w < mr) {
       const int r = w;
@@ -275,6 +389,7 @@ __global__ __launch_bounds__(256) void k6_moe(K6Args A6) {
     }
   }
   if (t == 0) *cnt = 0u;
+  } // end NSC != 1
   if constexpr (FUSE != 0 && PH == 1) {
     // all of this WG's a.out rows for strip-block sb are written; publish, then count groups done for sb
     if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent"); else __threadfence();
@@ -354,9 +469,18 @@ __global__ void k6_plan(const int* __restrict__ ids, int A, int topk, int M, int
   // shared expert: groups A .. A+nsh-1, rows j*M .. of the T tokens
   if (a < nsh) { grp_e[A + a] = sh_e; grp_n[A + a] = min(M, T - a * M); }
   if (a < nsh * M) grp_rows[A * M + a] = a < T ? a : 0;
+  typedef short k6_bf16x2 __attribute__((ext_vector_type(2)));
   for (int t = 0; t < T; ++t) {
     float p = 0.f;
-    for (int i = a; i < MOE_H; i += 256) p += __bfloat162float(wsg[i]) * __bfloat162float(x[(size_t)t * MOE_H + i]);
+    // MOE_H = 2560 = 640 uint2 (4 bf16/load): 256 threads x 2..3 uint2 loads + native v_dot2_f32_bf16!
+    const uint2* wp = reinterpret_cast<const uint2*>(wsg);
+    const uint2* xp = reinterpret_cast<const uint2*>(x + (size_t)t * MOE_H);
+    for (int i = a; i < (MOE_H / 4); i += 256) {
+      const uint2 w4 = wp[i];
+      const uint2 x4 = xp[i];
+      p = __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(k6_bf16x2, w4.x), __builtin_bit_cast(k6_bf16x2, x4.x), p, false);
+      p = __builtin_amdgcn_fdot2_f32_bf16(__builtin_bit_cast(k6_bf16x2, w4.y), __builtin_bit_cast(k6_bf16x2, x4.y), p, false);
+    }
     red[a] = p;
     __syncthreads();
     if (a < 32) {

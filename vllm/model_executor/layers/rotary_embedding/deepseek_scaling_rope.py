@@ -243,8 +243,16 @@ class DeepseekV4ScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
 
     def _compute_cos_sin_cache(self) -> torch.Tensor:
         inv_freq = self._compute_inv_freq(self.scaling_factor)
+        _n_pos = int(self.max_position_embeddings * self.scaling_factor)
+        try:
+            from vllm.config import get_current_vllm_config
+            _mml = getattr(get_current_vllm_config().model_config, "max_model_len", None)
+            if _mml and int(_mml) + 256 < _n_pos:
+                _n_pos = int(_mml) + 256
+        except Exception:
+            pass
         t = torch.arange(
-            self.max_position_embeddings * self.scaling_factor,
+            _n_pos,
             device=inv_freq.device,
             dtype=torch.float32,
         )

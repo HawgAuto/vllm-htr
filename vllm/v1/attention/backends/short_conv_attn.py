@@ -268,6 +268,57 @@ class PleShortConvAttentionMetadataBuilder(ShortConvAttentionMetadataBuilder):
         del common_prefix_len, fast_build, kwargs
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
+        if (
+            self.use_full_cuda_graph
+            and query_start_loc.is_cuda
+            and num_accepted_tokens is not None
+        ):
+            try:
+                from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+                _dm = _get_dm()
+            except Exception:
+                _dm = None
+            if _dm is not None:
+                _bs = m.num_reqs
+                _ns_toks = int(query_start_loc_cpu[-1].item())
+                if (
+                    _bs <= self.decode_cudagraph_max_bs
+                    and _ns_toks <= self.decode_cudagraph_max_tokens
+                    and int(spec_sequence_masks_cpu.sum().item()) == _bs
+                ):
+                    if not hasattr(self, "_v27_ple_tok_idx") or self._v27_ple_tok_idx.numel() < self.decode_cudagraph_max_tokens:
+                        self._v27_ple_tok_idx = torch.empty(self.decode_cudagraph_max_tokens, dtype=torch.int32, device=query_start_loc.device)
+                        self._v27_ple_empty_i32 = torch.empty(0, dtype=torch.int32, device=query_start_loc.device)
+                    _align = self.vllm_config.cache_config.mamba_cache_mode == "align"
+                    _dm.ple_prepare_pure_spec_decode(
+                        m.block_table_tensor, m.seq_lens, query_start_loc, num_accepted_tokens,
+                        self.spec_state_indices_tensor, self.spec_sequence_masks,
+                        self._v27_ple_tok_idx, self.spec_query_start_loc, self.num_accepted_tokens,
+                        int(_bs), int(_bs), int(_ns_toks),
+                        int(self.kv_cache_spec.block_size), bool(_align), int(NULL_BLOCK_ID),
+                    )
+                    return PleShortConvAttentionMetadata(
+                        num_prefills=0, num_prefill_tokens=0, num_decodes=0, num_decode_tokens=0,
+                        num_reqs=_bs, num_spec_decodes=_bs, num_spec_decode_tokens=_ns_toks,
+                        num_actual_tokens=m.num_actual_tokens, spec_query_len=self.num_spec + 1,
+                        max_prefill_query_len=0, query_start_loc=query_start_loc,
+                        state_indices_tensor=self._v27_ple_empty_i32,
+                        has_initial_states_p=None, has_initial_states_d=None,
+                        non_spec_query_start_loc=None,
+                        spec_query_start_loc=self.spec_query_start_loc[: _bs + 1],
+                        spec_state_indices_tensor=self.spec_state_indices_tensor[:_bs],
+                        spec_sequence_masks=self.spec_sequence_masks[:_bs],
+                        spec_token_indx=self._v27_ple_tok_idx[:_ns_toks],
+                        non_spec_token_indx=self._v27_ple_empty_i32,
+                        num_accepted_tokens=self.num_accepted_tokens[:_bs],
+                        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+                        nums_dict=None, batch_ptr=None, token_chunk_offset_ptr=None,
+                        query_start_loc_p=None, query_start_loc_d=None,
+                        state_indices_tensor_p=None, state_indices_tensor_d=None,
+                        num_computed_tokens_p=None, block_idx_last_scheduled_token=None,
+                        block_idx_first_scheduled_token_p=None, block_idx_last_computed_token=None,
+                        block_idx_last_scheduled_token_prev_step=None, seq_lens=m.seq_lens,
+                    )
         query_lens_cpu = torch.diff(query_start_loc_cpu)
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,

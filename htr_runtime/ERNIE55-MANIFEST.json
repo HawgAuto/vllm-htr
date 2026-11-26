@@ -1,0 +1,123 @@
+{
+  "package": "vllm-ernie-htr",
+  "target_image": "vllm-htr:v0.2.6-ernie55",
+  "base_image": "ghcr.io/hawgauto/vllm-htr:v0.2.5",
+  "arch": "gfx1151",
+  "wave": "wave24+adaptive_verification_ready",
+  "total_kernels": 463,
+  "native_bins": {
+    "ernie_dsa_attn.so": {
+      "sha256": "89eb8a0964bf9d27acabc50a9d137439ba9c2d52a6075f2a64ecae24fb1f29c0",
+      "bytes": 367032,
+      "kernels": 6,
+      "max_vgpr": 118,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "div_ops": 0
+    },
+    "ernie_fast_ops.so": {
+      "sha256": "cb56d86d310b63c8ef6fff4e046a643045d8e7b5409395bca45ff8aa387d47d6",
+      "bytes": 1091248,
+      "kernels": 97,
+      "max_vgpr": 89,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "div_ops": 0
+    },
+    "ernie_hca_attn.so": {
+      "sha256": "269edb487e449f298b66d95d766c157c2176d8c896c9cf37f9163dd055e33fa0",
+      "bytes": 451592,
+      "kernels": 13,
+      "max_vgpr": 172,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "div_ops": 0
+    },
+    "ernie_k5_sp_prefill.so": {
+      "sha256": "7be7b706c40ee6ae391cf2ce56f4e7385a443bdb44f054fe875b9921ac18694e",
+      "bytes": 815712,
+      "kernels": 40,
+      "max_vgpr": 182,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "div_ops": 0
+    },
+    "hpf5_ernie.so": {
+      "sha256": "cc6d30f04e81ffab6bbd6928f57fdc03dad0a72de3f08fea3f0190c8d9432084",
+      "bytes": 921776,
+      "kernels": 29,
+      "max_vgpr": 176,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "div_ops": 0
+    },
+    "htr_moe_ernie.so": {
+      "sha256": "868d98c987e946ff08993ca9e024af9af9d298cb22b8b2941d580e365d5c1d2f",
+      "bytes": 2834168,
+      "kernels": 151,
+      "max_vgpr": 93,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "div_ops": 0
+    },
+    "htr_wo_a_ernie.so": {
+      "sha256": "0aa68d797a11075cbd79a20ece791b733a44749ce5def84b5f105b501d93bd30",
+      "bytes": 1630480,
+      "kernels": 110,
+      "max_vgpr": 166,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "div_ops": 0
+    },
+    "mhc_ernie.so": {
+      "sha256": "c31ab67b4c64f9b8348709e20c4d6676f27ee5bd19ddba1436420b066ed75be8",
+      "bytes": 411808,
+      "kernels": 17,
+      "max_vgpr": 108,
+      "vgpr_spills": 0,
+      "sgpr_spills": 0,
+      "div_ops": 0
+    }
+  },
+  "native_sources": {
+    "build_ernie55.sh": "813dadac31723a4468089ec20581de86ab2a01e8dd5ee74c523036266674ddbd",
+    "ernie_dsa_attn.hip": "93cb063585036e8e77f89efac0328c4c9a4f131cf54b25a8f3d38713c289e147",
+    "ernie_fast_ops.hip": "ccfabd3629cace0415921cb59bc2b7d2748c56414e555cc34f3f95b25dfd02c8",
+    "ernie_hca_attn.hip": "140f03112df2419e01cb492339c1dff117c75616b8f8602401762c8acf694b23",
+    "ernie_k5_sp_prefill.hip": "c5be810b4a54b58754c70ec7945fbfc51f2d6de04c275ae00fb0120caefea787",
+    "hpf5_ernie.hip": "7ff7689c820806fe9d89bb60c55f1a98ced06c6f0790b02e41f1a91643911dbe",
+    "htr_moe_ernie.cpp": "f834397cb687c0e0ac21d615224471bef0af57427ec577091a72c1b3d51a17ac",
+    "htr_moe_ernie.hip": "b75872eee01e85c00a553c864ac038188448f6e7694db700dca3cd30fbb2287b",
+    "htr_wo_a_ernie.cpp": "b4e34389de91a2508497b7e6a6b84c92350d65fc7da2c58bb6877e52ff6ce624",
+    "htr_wo_a_ernie.hip": "ff4b4e2483a5bb37a0370c61b9f04bc66ba56b7734dc29e7c108ad5f82d05488",
+    "mhc_ernie.cpp": "c07c0cd40dc7ae540c8e129be224aa94379fe7f18b1d35124c184f16d03ddb05",
+    "mhc_ernie.hip": "9d6f160d32d40d57fcab071ebba5516bd0036cf7ed004a8cec70dc5ebe69ae69"
+  },
+  "python_files": {
+    "__init__.py": "9690aa0b8abb3765e192be8900a22e7d654402b5b17f6674ae91d26cd727a555",
+    "attention.py": "733143417fdda2cdf33e2ff8067d87d4841fe75a3d1fd45459c133540acafd1e",
+    "config.py": "f16d057b11bd8b8e920259657b41651d003908f99ff8aff4a94118a4912c343d",
+    "dspark.py": "f9640355ac8c4aa9bf4a9df42df40fed45a7e41b2eb77933e3d3364a3c55df3a",
+    "fast_ops.py": "16f8123c0c864f4d7fd3f2c455e32e141a6f66f2651b11031be22c8669c28c38",
+    "mhc.py": "d1b2f26b5b49e5c08f23b05136f41e85ed36f600427d9d449dd6a25a9cf3e442",
+    "model.py": "6a84f7a00d3836bec18d62c66312d8ec820222d47115a9a16fed1436262b83b0",
+    "moe_ops.py": "9e918951d227eb66e6e72ba19e268c41f5bd4970fa4fef217d130774e30a8ed6",
+    "parser.py": "7b10a59d750d1f7108adad6b8a1ce6717b30ba3bdc6ddadf85df6e7587f5000b",
+    "patches.py": "dbcaf4fc3e61e23149dfdd1e6ec1d088f4e041601140d316c1904fa67e9a7daf",
+    "reasoning_parser.py": "617d4ec8cbebffa0f6b228d80b4020a749c09be11cdc7fe3a760761b7268d4f7",
+    "renderer.py": "3ac0b61858806c7575892b679f7d66b4fa2f0fa86aebc14c888ac93cd3abc163",
+    "tool_parser.py": "d1cd59f828a917875b2fb485fe1d7f2730558e4ff302da94542148637dd22b5f"
+  },
+  "verified_benchmarks_43l": {
+    "target_t1_tok_s": 18.77,
+    "target_batch4_agg_tok_s": 41.72,
+    "target_prefill_in_tok_s": 350.7,
+    "dspark_k5_code_tok_s": 38.48,
+    "dspark_k5_prose_tok_s": 30.49,
+    "dspark_k5_primes_tok_s": 59.03,
+    "dspark_k4_prose_tok_s": 32.2,
+    "dspark_k7_primes_tok_s": 69.61,
+    "spad3_default": 0,
+    "memory_cgroup_cap": "117g"
+  }
+}

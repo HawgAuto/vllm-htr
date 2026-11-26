@@ -725,6 +725,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
     ) -> torch.Tensor:
+        if not torch.compiler.is_compiling() and input_ids.is_cuda and ngram_context.is_cuda:
+            try:
+                from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+                _dm = _get_dm()
+            except Exception:
+                _dm = None
+            if _dm is not None and self.ngram_size <= 8:
+                return _dm.ple_compute_ngram_ids(
+                    input_ids, query_start_loc, ngram_context,
+                    self.layer_multipliers, self.ngram_heads_vocab_sizes, self.ngram_heads_offsets,
+                    int(self.ngram_size), int(self.heads_per_ngram), int(self.eos_token_id),
+                )
         input_ids = input_ids.reshape(-1).long()
         query_start_loc = query_start_loc.long()
         num_reqs = query_start_loc.numel() - 1

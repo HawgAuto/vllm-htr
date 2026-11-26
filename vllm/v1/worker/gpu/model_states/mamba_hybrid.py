@@ -212,18 +212,36 @@ class MambaHybridModelState(DefaultModelState):
         # the launch cost is ~0.3% of TPOT, so the GPU fast-exit suffices.)
         block = 256
         grid = (triton.cdiv(num_reqs, block),)
-        preprocess_mamba_align_fused_kernel[grid](
-            input_batch.idx_mapping,
-            self._mamba_state_idx_gpu,
-            num_computed_tokens,
-            input_batch.query_start_loc,
-            self.num_accepted_tokens_gpu,
-            self._mamba_src_col_gpu,
-            self._mamba_src_off_gpu,
-            num_reqs,
-            BLOCK_SIZE=block,
-            MAMBA_BLOCK_SIZE=mamba_spec.block_size,
-        )
+        try:
+            from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+            _dm = _get_dm()
+        except Exception:
+            _dm = None
+        if _dm is not None:
+            _dm.preprocess_mamba_align_fused(
+                input_batch.idx_mapping,
+                self._mamba_state_idx_gpu,
+                num_computed_tokens,
+                input_batch.query_start_loc,
+                self.num_accepted_tokens_gpu,
+                self._mamba_src_col_gpu,
+                self._mamba_src_off_gpu,
+                int(num_reqs),
+                int(mamba_spec.block_size),
+            )
+        else:
+            preprocess_mamba_align_fused_kernel[grid](
+                input_batch.idx_mapping,
+                self._mamba_state_idx_gpu,
+                num_computed_tokens,
+                input_batch.query_start_loc,
+                self.num_accepted_tokens_gpu,
+                self._mamba_src_col_gpu,
+                self._mamba_src_off_gpu,
+                num_reqs,
+                BLOCK_SIZE=block,
+                MAMBA_BLOCK_SIZE=mamba_spec.block_size,
+            )
         ctx.run_fused_precopy(
             num_reqs,
             self._mamba_state_idx_gpu,
@@ -380,18 +398,34 @@ class MambaHybridModelState(DefaultModelState):
             if not isinstance(num_sampled, int):
                 # idx_mapping may contain -1 sentinels (filtered rows) under PP; the
                 # kernel skips them rather than scattering with a host-side gather.
-                _scatter_num_accepted_kernel[(num_reqs,)](
-                    idx_mapping,
-                    num_sampled,
-                    self.num_accepted_tokens_gpu,
-                )
+                try:
+                    from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+                    _dm = _get_dm()
+                except Exception:
+                    _dm = None
+                if _dm is not None:
+                    _dm.scatter_num_accepted(idx_mapping, num_sampled, self.num_accepted_tokens_gpu)
+                else:
+                    _scatter_num_accepted_kernel[(num_reqs,)](
+                        idx_mapping,
+                        num_sampled,
+                        self.num_accepted_tokens_gpu,
+                    )
             else:
                 # Fill with single value.
-                _fill_num_accepted_kernel[(num_reqs,)](
-                    idx_mapping,
-                    self.num_accepted_tokens_gpu,
-                    max(num_sampled, 1),
-                )
+                try:
+                    from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+                    _dm = _get_dm()
+                except Exception:
+                    _dm = None
+                if _dm is not None:
+                    _dm.fill_num_accepted(idx_mapping, self.num_accepted_tokens_gpu, int(max(num_sampled, 1)))
+                else:
+                    _fill_num_accepted_kernel[(num_reqs,)](
+                        idx_mapping,
+                        self.num_accepted_tokens_gpu,
+                        max(num_sampled, 1),
+                    )
 
         if self.recoverssm is not None:
             self.recoverssm.commit_step(

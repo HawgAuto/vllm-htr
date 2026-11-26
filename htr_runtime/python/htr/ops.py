@@ -33,11 +33,18 @@ def counters(device):
     return _COUNTERS[key]
 
 
+_NSPLIT_EPI8 = os.environ.get("HTR_NSPLIT_EPI8", "0") == "1"
+
+
 def nsplit_for(mt, nt, M=1):
     # E10 T2 sweep (bench_kernels_K*.json): best split is ~nt/8 capped at 32; for M>=4 tall shapes want fewer splits
     # (mt=1536 -> 8). The old target_waves//mt rule chose ns=1-6 for tall/wide shapes (+90 us on 24576x4096).
     cap = 32 if M < 4 else max(4, min(32, 12288 // max(1, mt)))
-    return max(1, min((nt + 3) // 4, cap, max(2, nt // 8)))
+    ns = max(1, min((nt + 3) // 4, cap, max(2, nt // 8)))
+    if _NSPLIT_EPI8 and EPI8 and mt >= 128 and nt == 160 and ns > 8:
+        # nt=160: ns=8 -> tps=20 -> ns_eff=8 -> _e8=1 (in-WG 8-way reduction, 1x part vs 13-20x part!)
+        return 8
+    return ns
 
 
 def use_fused(m, n, M):

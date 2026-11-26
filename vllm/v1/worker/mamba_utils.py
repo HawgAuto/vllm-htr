@@ -1209,6 +1209,22 @@ class MambaSpecDecodeGPUContext:
             return
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        try:
+            from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+            _dm = _get_dm()
+        except Exception:
+            _dm = None
+        if _dm is not None:
+            _dm.precopy_mamba_align_fused(
+                state_idx_gpu, src_col_gpu, token_bias_gpu,
+                self.block_table_ptrs, int(self.block_table_stride_req),
+                self.state_base_addrs, self.state_block_strides, self.state_elem_sizes,
+                self.state_inner_sizes, self.state_conv_widths, self.state_group_indices,
+                self.state_dim_row_count, self.state_dim_row_stride,
+                idx_mapping, int(num_reqs), int(total_states), int(_TEMPORAL_TILES),
+                bool(is_conv_state_dim_first()),
+            )
+            return
         precopy_mamba_align_fused_kernel[grid](
             state_idx_gpu,
             src_col_gpu,
@@ -1259,6 +1275,23 @@ class MambaSpecDecodeGPUContext:
 
         total_states = self.num_states
         grid = (num_reqs, total_states, _TEMPORAL_TILES)
+        try:
+            from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+            _dm = _get_dm()
+        except Exception:
+            _dm = None
+        if _dm is not None:
+            _dm.postprocess_mamba_align_v2(
+                num_accepted_tokens_snapshot, state_idx_gpu, new_num_computed_tokens_gpu,
+                self.block_table_ptrs, int(self.block_table_stride_req),
+                self.state_base_addrs, self.state_block_strides, self.state_elem_sizes,
+                self.state_inner_sizes, self.state_conv_widths, self.state_group_indices,
+                self.state_dim_row_count, self.state_dim_row_stride,
+                num_accepted_tokens_gpu, idx_mapping,
+                int(num_reqs), int(total_states), int(self.block_size),
+                int(_TEMPORAL_TILES), bool(is_conv_state_dim_first()),
+            )
+            return
         postprocess_mamba_fused_kernel[grid](
             num_accepted_tokens_snapshot,
             state_idx_gpu,

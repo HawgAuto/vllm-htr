@@ -1,0 +1,10 @@
+FROM ghcr.io/hawgauto/vllm-htr:v0.2.6
+USER root
+COPY payload /payload
+RUN /opt/venv/bin/python3 /payload/install_v027.py
+USER 1000:1000
+WORKDIR /workspace
+LABEL org.opencontainers.image.version="0.2.7" \
+      org.opencontainers.image.source="https://github.com/HawgAuto/vllm-htr" \
+      org.opencontainers.image.description="vllm-htr v0.2.7 — Qwen3.8 W4A16 contig-N decode + RDNA 3.5 decode stack + fast boot + ERNIE-5.5-Flash-HTR (with DSpark)"
+ENTRYPOINT ["/opt/venv/bin/vllm", "serve"]

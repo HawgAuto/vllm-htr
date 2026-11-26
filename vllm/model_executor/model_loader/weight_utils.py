@@ -952,6 +952,15 @@ def safetensors_weights_iterator(
                         continue
                     param = f.get_tensor(name)
                     yield name, param
+        if total_bytes > 32 * 1024**3 and hasattr(os, "posix_fadvise"):
+            try:
+                _fd = os.open(st_file, os.O_RDONLY)
+                try:
+                    os.posix_fadvise(_fd, 0, 0, os.POSIX_FADV_DONTNEED)
+                finally:
+                    os.close(_fd)
+            except OSError:
+                pass
 
 
 def multi_thread_safetensors_weights_iterator(

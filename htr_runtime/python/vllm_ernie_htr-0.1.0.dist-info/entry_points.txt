@@ -1,0 +1,2 @@
+[vllm.general_plugins]
+ernie_htr = vllm_ernie_htr:register

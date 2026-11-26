@@ -197,14 +197,47 @@ def pack_chunks(source,destination,manifest,max_bytes=5_000_000_000):
     return {'chunk_count':len(chunks),'all_chunk_hashes_match':True,'payload_bytes':sum(r['size'] for r in records),'shards':shards}
 
 
-def read_chunk(root,relative,expected_sha256):
-    root=Path(root);idx=load_json(root/'chunks.index.json')
-    if idx['schema']!='htr-chunk-shards-v1':raise ValueError('unsupported chunk index')
-    r=idx['chunks'][relative];p=safe_path(root,r['file'])
-    off,size=r['offset'],r['size']
-    if type(off) is not int or type(size) is not int or off<0 or not 0<size<=64*1024*1024 or off+size>p.stat().st_size:
+import threading as _rs_threading
+_IDX_CACHE = {}
+_FD_CACHE = {}
+_RS_LOCK = _rs_threading.Lock()
+
+def _get_index_and_fd(root_str, relative):
+    idx = _IDX_CACHE.get(root_str)
+    if idx is None:
+        with _RS_LOCK:
+            idx = _IDX_CACHE.get(root_str)
+            if idx is None:
+                root = Path(root_str)
+                idx = load_json(root / 'chunks.index.json')
+                if idx['schema'] != 'htr-chunk-shards-v1':
+                    raise ValueError('unsupported chunk index')
+                _IDX_CACHE[root_str] = idx
+    r = idx['chunks'][relative]
+    fkey = (root_str, r['file'])
+    entry = _FD_CACHE.get(fkey)
+    if entry is None:
+        with _RS_LOCK:
+            entry = _FD_CACHE.get(fkey)
+            if entry is None:
+                p = safe_path(Path(root_str), r['file'])
+                st = p.stat()
+                fd = os.open(str(p), os.O_RDONLY)
+                entry = (fd, st.st_size)
+                _FD_CACHE[fkey] = entry
+    return r, entry
+
+def read_chunk(root, relative, expected_sha256, verify_sha=True):
+    root_str = str(Path(root))
+    r, (fd, fsize) = _get_index_and_fd(root_str, relative)
+    off, size = r['offset'], r['size']
+    if type(off) is not int or type(size) is not int or off < 0 or not 0 < size <= 64*1024*1024 or off + size > fsize:
         raise ValueError('invalid chunk bounds')
-    with p.open('rb') as f:f.seek(off);b=f.read(size)
-    if len(b)!=size or hashlib.sha256(b).hexdigest()!=expected_sha256 or r['sha256']!=expected_sha256:
+    if r['sha256'] != expected_sha256:
+        raise ValueError('chunk index hash mismatch')
+    b = os.pread(fd, size, off)
+    if len(b) != size:
+        raise ValueError('short chunk read')
+    if verify_sha and hashlib.sha256(b).hexdigest() != expected_sha256:
         raise ValueError('chunk hash mismatch')
     return b

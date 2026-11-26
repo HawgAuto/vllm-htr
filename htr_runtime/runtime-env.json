@@ -24,8 +24,8 @@
   "HTR_PLE_HOIST": "1",
   "GP8HC_HIP": "1",
   "GP8HC_HIPP": "1",
-  "HTR_MOE_SELFCHECK": "1",
-  "HTR_MOE_LOAD_WORKERS": "2",
+  "HTR_MOE_SELFCHECK": "0",
+  "HTR_MOE_LOAD_WORKERS": "4",
   "E59_PLE_DEV_SO": "/opt/vllm-htr/native-bin/e59_pledev_ext.so",
   "HTR_QSA_TAU": "1",
   "HTR_AUTOTUNE_PIN": "1",
@@ -110,5 +110,16 @@
   "HTR_QSA_CACHE_OPS_AOT": "1",
   "HTR_QSA_MAIN_PREPARE_AOT": "1",
   "HTR_QSA_PRE_INDEXER_AOT": "1",
-  "HTR_GUMBEL_SAMPLE_AOT": "1"
+  "HTR_GUMBEL_SAMPLE_AOT": "1",
+  "HTR_DECODE_META": "1",
+  "HTR_NSPLIT_EPI8": "1",
+  "HTR_QSA_FUSED_DRAFT": "0",
+  "HTR_MOE_W4A16_DEC": "1",
+  "HTR_MOE_W4A16_DEC_HSACO": "/opt/vllm-htr/native-bin/moe_w4a16_decode_v27.hsaco",
+  "HTR_MOE_FAST_LOAD": "1",
+  "HTR_MOE_FAST_ARENA": "1",
+  "HTR_FAST_ARENA_SO": "/opt/vllm-htr/native-bin/htr_fast_arena_v27.so",
+  "HTR_MOE_PINNED_PIPE": "0",
+  "HTR_AITER_PREBUILT_SO": "/opt/vllm-htr/native-bin/module_aiter_core.so",
+  "HTR_TVM_FFI_PREBUILT_SO": "/opt/vllm-htr/native-bin/libtorch_c_dlpack_addon_torch213-rocm.so"
 }

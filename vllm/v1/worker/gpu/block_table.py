@@ -162,6 +162,22 @@ class BlockTables:
             assert len(out) == self.num_kv_cache_groups
         num_reqs = idx_mapping.shape[0]
         # Launch kernel with num_reqs_padded to fuse zeroing of padded rows.
+        try:
+            from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+            _dm = _get_dm()
+        except Exception:
+            _dm = None
+        if _dm is not None:
+            _dm.gather_block_tables(
+                idx_mapping,
+                self.block_table_ptrs,
+                out_ptrs,
+                self.block_table_strides,
+                self.num_blocks.gpu,
+                int(num_reqs),
+                int(num_reqs_padded),
+            )
+            return tuple(bt[:num_reqs_padded] for bt in out)
         _gather_block_tables_kernel[(self.num_kv_cache_groups, num_reqs_padded)](
             idx_mapping,
             self.block_table_ptrs,
@@ -200,6 +216,29 @@ class BlockTables:
         num_reqs = idx_mapping.shape[0]
         num_groups = self.num_kv_cache_groups
         slot_mappings = self.slot_mappings if out is None else out
+        try:
+            from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+            _dm = _get_dm()
+        except Exception:
+            _dm = None
+        if _dm is not None:
+            _dm.compute_slot_mappings(
+                int(slot_mappings.shape[1]),
+                idx_mapping,
+                query_start_loc,
+                positions,
+                self.block_table_ptrs,
+                self.block_table_strides,
+                self.block_sizes_tensor,
+                self.kernel_block_sizes_tensor,
+                self.slot_mapping_enabled,
+                slot_mappings,
+                int(self.cp_rank),
+                int(self.cp_size),
+                int(self.cp_interleave),
+                int(PAD_SLOT_ID),
+            )
+            return slot_mappings[:, :num_tokens_padded]
         _compute_slot_mappings_kernel[(num_groups, num_reqs + 1)](
             slot_mappings.shape[1],
             idx_mapping,

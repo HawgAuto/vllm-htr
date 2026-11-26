@@ -1219,7 +1219,7 @@ def rocm_aiter_sparse_attn_indexer(
 
         # Decode logits buffer, used by rocm_fp8_paged_mqa_logits.
         decode_rows = _max_decode_logits_rows(hidden_states.shape[0])
-        if _ON_GFX942 or _ON_GFX950:
+        if _ON_GFX942 or _ON_GFX950 or getattr(rocm_fp8_paged_mqa_logits, '_ernie5_gfx1151_triton', False):
             workspace_manager.get_simultaneous(
                 ((decode_rows, max_model_len), torch.float32),
             )

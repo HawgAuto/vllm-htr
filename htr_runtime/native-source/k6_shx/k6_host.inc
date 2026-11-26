@@ -11,13 +11,26 @@ constexpr int K6_OPT = 1 | 32 | 64;
 // bps = split width (128-blocks of input per WG), NSC = ceil(nbt/bps) fixed at compile time, NBL = LDS blocks
 // reserved per row (>= bps). gate|up: nbt 20 -> 5/4/5. down: nbt 5 -> the adopted (3,2) split, 3/2/3;
 // the served (1,5) shape for the T=1 bitwise gate is bps 1 / NSC 5 / NBL 1.
+#if defined(K6_GU_NS1)
+// M=2,4: chunked NSC=1 (NBL=5, 5 KB LDS, ZERO split-K!); M=1: NSC=2 (NBL=10, 2.5 KB LDS, 220 WGs)
+constexpr int K6_BPS_GU = 20, K6_NSC_GU = 1, K6_NBL_GU = 5;
+constexpr int K6_BPS_GU_M1 = 10, K6_NSC_GU_M1 = 2, K6_NBL_GU_M1 = 10;
+#elif defined(K6_GU_NS2)
+constexpr int K6_BPS_GU = 10, K6_NSC_GU = 2, K6_NBL_GU = 10;
+#else
 constexpr int K6_BPS_GU = 5, K6_NSC_GU = 4, K6_NBL_GU = 5;
-constexpr int K6_BPS_DN = 3, K6_NSC_DN = 2, K6_NBL_DN = 3;
+#endif
+constexpr int K6_BPS_DN = 5, K6_NSC_DN = 1, K6_NBL_DN = 5;
 
 template <int KF, int M, int PH>
 static void k6_launch(dim3 grid, hipStream_t st, K6Args A6) {
+#ifdef K6_GU_NS1
+  constexpr int NBL = (PH == 0) ? ((M == 1) ? K6_NBL_GU_M1 : K6_NBL_GU) : K6_NBL_DN;
+  constexpr int NSC = (PH == 0) ? ((M == 1) ? K6_NSC_GU_M1 : K6_NSC_GU) : K6_NSC_DN;
+#else
   constexpr int NBL = PH == 0 ? K6_NBL_GU : K6_NBL_DN;
   constexpr int NSC = PH == 0 ? K6_NSC_GU : K6_NSC_DN;
+#endif
   const bool use_shx = (A6.sh_g < (int)grid.z);
   if constexpr (PH == 1) {
     TORCH_CHECK(A6.a.y != nullptr, "K6 down phase requires the fused-combine output");
@@ -92,9 +105,15 @@ void k6_gemv(int64_t kf, int64_t M, torch::Tensor qw, torch::Tensor qoff, torch:
              torch::Tensor xin, torch::Tensor part, torch::Tensor counters, torch::Tensor out, double cb,
              int64_t spad3, int64_t spad4, int64_t spad5, int64_t fence_ra) {
   const int G = grp_e.size(0);
+#ifdef K6_GU_NS1
+  const int m = 2 * MOE_I, n = MOE_H, nbt = n / 128;
+  const int bps = (M == 1) ? K6_BPS_GU_M1 : K6_BPS_GU;
+  const int ns  = (M == 1) ? K6_NSC_GU_M1 : K6_NSC_GU;
+#else
   const int m = 2 * MOE_I, n = MOE_H, nbt = n / 128, bps = K6_BPS_GU;
   const int ns = (nbt + bps - 1) / bps;
   TORCH_CHECK(ns == K6_NSC_GU && bps <= K6_NBL_GU);
+#endif
   TORCH_CHECK(part.numel() >= (int64_t)G * ns * M * m && out.numel() >= (int64_t)G * M * m && counters.numel() >= G * (m / 128));
   TORCH_CHECK(qw.scalar_type() == torch::kInt32 && qoff.scalar_type() == torch::kInt64 && kexp.scalar_type() == torch::kInt32);
   K6Args A6;
@@ -156,9 +175,15 @@ void k6_gemv_shx(int64_t kf, int64_t M, torch::Tensor qw, torch::Tensor qoff, to
                  torch::Tensor xin, torch::Tensor part, torch::Tensor counters, torch::Tensor out, double cb,
                  int64_t spad3, int64_t spad4, int64_t spad5, int64_t fence_ra, int64_t sh_g) {
   const int G = grp_e.size(0);
+#ifdef K6_GU_NS1
+  const int m = 2 * MOE_I, n = MOE_H, nbt = n / 128;
+  const int bps = (M == 1) ? K6_BPS_GU_M1 : K6_BPS_GU;
+  const int ns  = (M == 1) ? K6_NSC_GU_M1 : K6_NSC_GU;
+#else
   const int m = 2 * MOE_I, n = MOE_H, nbt = n / 128, bps = K6_BPS_GU;
   const int ns = (nbt + bps - 1) / bps;
   TORCH_CHECK(ns == K6_NSC_GU && bps <= K6_NBL_GU);
+#endif
   TORCH_CHECK(part.numel() >= (int64_t)G * ns * M * m && out.numel() >= (int64_t)G * M * m && counters.numel() >= G * (m / 128));
   TORCH_CHECK(qw.scalar_type() == torch::kInt32 && qoff.scalar_type() == torch::kInt64 && kexp.scalar_type() == torch::kInt32);
   K6Args A6;

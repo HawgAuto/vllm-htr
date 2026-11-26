@@ -421,6 +421,33 @@ def build_qsa_metadata_triton(
         return token_to_req, logical_positions, visible_blocks, slot_mapping
 
     block_table = common_attn_metadata.block_table_tensor
+    try:
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+    except Exception:
+        _dm = None
+    if _dm is not None and num_reqs <= 1024:
+        _dm.build_qsa_metadata(
+            common_attn_metadata.query_start_loc,
+            common_attn_metadata.seq_lens,
+            common_attn_metadata.slot_mapping,
+            block_table,
+            token_to_req,
+            logical_positions,
+            visible_blocks,
+            slot_mapping,
+            k_work_metadata_buffer,
+            int(num_reqs),
+            int(num_mapped_tokens),
+            int(num_tokens),
+            int(max_num_work),
+            int(storage_block_size),
+            int(compress_ratio),
+            int(circular_buffer_size),
+        )
+        if circular_buffer_size == 0 and compress_ratio == 1:
+            slot_mapping = common_attn_metadata.slot_mapping[:num_tokens]
+        return token_to_req, logical_positions, visible_blocks, slot_mapping
     num_search_steps = int(math.ceil(math.log2(num_reqs)))
     work_search_steps = int(math.ceil(math.log2(num_reqs)))
     # The same grid covers token tiles and, for the compressed cache, work tiles.
@@ -644,6 +671,13 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             self.k_work_metadata_buffer = torch.empty(
                 0, 2, dtype=torch.int32, device=device
             )
+        import os as _os
+        self.supports_draft_decode_metadata_update = (
+            _os.environ.get("HTR_QSA_FUSED_DRAFT") == "1"
+            and _os.environ.get("HTR_DECODE_META") == "1"
+        )
+        self._last_common_slot_mapping = None
+        self._last_num_mapped_tokens = 0
 
     def build(
         self,
@@ -655,24 +689,46 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
         num_tokens = common_attn_metadata.num_actual_tokens
         decode_threshold = self.reorder_batch_threshold
         assert decode_threshold is not None
-        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
-            split_decodes_and_prefills(
-                common_attn_metadata,
-                decode_threshold=decode_threshold,
-                require_uniform=True,
+        self._last_common_slot_mapping = common_attn_metadata.slot_mapping
+        qsl_cpu = common_attn_metadata.query_start_loc_cpu
+        n_reqs = common_attn_metadata.num_reqs
+        max_q = common_attn_metadata.max_query_len
+        self._last_num_mapped_tokens = int(qsl_cpu[-1]) if qsl_cpu.numel() > 0 else num_tokens
+        _fast_uniform = False
+        if n_reqs > 0 and max_q > 0 and max_q <= decode_threshold and num_tokens == n_reqs * max_q:
+            if max_q == 1 and int(qsl_cpu[n_reqs]) == num_tokens:
+                _fast_uniform = True
+            elif n_reqs == 1 and int(qsl_cpu[1]) == max_q:
+                _fast_uniform = True
+            elif n_reqs <= 32 and int(qsl_cpu[n_reqs]) == num_tokens:
+                _qnp = qsl_cpu[: n_reqs + 1].numpy()
+                if int((_qnp[1:] - _qnp[:-1] == max_q).all()):
+                    _fast_uniform = True
+        if _fast_uniform:
+            num_decodes = n_reqs
+            num_prefills = 0
+            num_decode_tokens = num_tokens
+            num_prefill_tokens = 0
+            decode_query_len = max_q
+        else:
+            num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+                split_decodes_and_prefills(
+                    common_attn_metadata,
+                    decode_threshold=decode_threshold,
+                    require_uniform=True,
+                )
             )
-        )
-        assert num_decodes + num_prefills == common_attn_metadata.num_reqs
-        assert num_decode_tokens + num_prefill_tokens == num_tokens
-        decode_query_len = 0
-        if num_decodes > 0:
-            query_lens_cpu = torch.diff(
-                common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
-            )
-            nonzero_query_lens = query_lens_cpu[query_lens_cpu > 0]
-            if nonzero_query_lens.numel() > 0:
-                decode_query_len = int(nonzero_query_lens[0].item())
-                assert torch.all(nonzero_query_lens == decode_query_len)
+            assert num_decodes + num_prefills == common_attn_metadata.num_reqs
+            assert num_decode_tokens + num_prefill_tokens == num_tokens
+            decode_query_len = 0
+            if num_decodes > 0:
+                query_lens_cpu = torch.diff(
+                    common_attn_metadata.query_start_loc_cpu[: num_decodes + 1]
+                )
+                nonzero_query_lens = query_lens_cpu[query_lens_cpu > 0]
+                if nonzero_query_lens.numel() > 0:
+                    decode_query_len = int(nonzero_query_lens[0].item())
+                    assert torch.all(nonzero_query_lens == decode_query_len)
         build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
         k_work_metadata = self.k_work_metadata_buffer
         request_capacity = None
@@ -718,6 +774,43 @@ class QSAMetadataBuilder(AttentionMetadataBuilder[QSAForwardMetadata]):
             max_seq_len=common_attn_metadata.max_seq_len,
             storage_block_size=self.storage_block_size,
             compress_ratio=self.compress_ratio,
+        )
+
+    def update_draft_decode_metadata(self, metadata: QSAForwardMetadata) -> None:
+        """In-place GPU QSA metadata refresh between fused MTP draft steps (100% HIP-graph safe!)."""
+        if metadata.num_actual_tokens == 0:
+            return
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+        assert _dm is not None, "HTR_QSA_FUSED_DRAFT=1 requires HTR_DECODE_META=1"
+        num_tokens = metadata.num_actual_tokens
+        num_reqs = metadata.query_start_loc.shape[0] - 1
+        num_mapped = self._last_num_mapped_tokens or num_tokens
+        build_k_work = not self.is_circular_buffer and self.compress_ratio != 1
+        max_num_work = metadata.k_work_metadata.shape[0] if build_k_work else 0
+        cbs = self.kv_cache_spec.block_size if self.is_circular_buffer else 0
+        common_sm = (
+            self._last_common_slot_mapping
+            if self._last_common_slot_mapping is not None
+            else metadata.slot_mapping
+        )
+        _dm.build_qsa_metadata(
+            metadata.query_start_loc,
+            metadata.seq_lens,
+            common_sm,
+            metadata.block_table,
+            self.token_to_req_buffer[:num_tokens],
+            self.logical_positions_buffer[:num_tokens],
+            self.visible_blocks_buffer[:num_tokens],
+            self.slot_mapping_buffer[:num_tokens],
+            metadata.k_work_metadata if build_k_work else None,
+            int(num_reqs),
+            int(num_mapped),
+            int(num_tokens),
+            int(max_num_work),
+            int(self.storage_block_size),
+            int(self.compress_ratio),
+            int(cbs),
         )
 
 

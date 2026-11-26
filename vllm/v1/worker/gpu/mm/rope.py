@@ -103,6 +103,19 @@ class RopeState:
         num_computed_tokens: torch.Tensor,
     ) -> None:
         num_reqs = idx_mapping.shape[0]
+        try:
+            from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+            _dm = _get_dm()
+        except Exception:
+            _dm = None
+        if _dm is not None:
+            _dm.prepare_rope_positions(
+                self.positions, self.prefill_positions.gpu,
+                int(self.num_dims * self.max_model_len), int(self.max_model_len),
+                self.prefill_delta.gpu, idx_mapping, query_start_loc,
+                prefill_lens, num_computed_tokens, int(self.num_dims),
+            )
+            return
         _prepare_rope_positions_kernel[(num_reqs,)](
             self.positions,
             self.positions.stride(0),

@@ -221,6 +221,73 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+        # v0.2.7 pure-spec-decode fast path (replaces ~25 PyTorch GPU ops x 3 groups = ~75 launches & 3.15 ms/step CPU!)
+        if (
+            self.use_full_cuda_graph
+            and self.use_spec_decode
+            and num_decode_draft_tokens_cpu is not None
+            and num_accepted_tokens is not None
+        ):
+            try:
+                from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+                _dm = _get_dm()
+            except Exception:
+                _dm = None
+            if _dm is not None:
+                _batch_size = m.num_reqs
+                _num_spec_toks = int(query_start_loc_cpu[-1].item())
+                if (
+                    _batch_size <= self.decode_cudagraph_max_bs
+                    and _num_spec_toks <= self.decode_cudagraph_max_bs
+                    and int((num_decode_draft_tokens_cpu >= 0).sum().item()) == _batch_size
+                    and int(num_decode_draft_tokens_cpu.sum().item()) > 0
+                ):
+                    _align = self.vllm_config.cache_config.mamba_cache_mode == "align"
+                    _n_cols = self.num_spec + 1
+                    _dm.gdn_prepare_pure_spec_decode(
+                        m.block_table_tensor,
+                        m.seq_lens,
+                        query_start_loc,
+                        num_accepted_tokens,
+                        self.spec_state_indices_tensor,
+                        self.spec_sequence_masks,
+                        self.spec_token_indx,
+                        self.spec_query_start_loc,
+                        self.num_accepted_tokens,
+                        int(_batch_size),
+                        int(_batch_size),
+                        int(_num_spec_toks),
+                        int(_n_cols),
+                        int(self.kv_cache_spec.block_size),
+                        bool(_align),
+                        int(NULL_BLOCK_ID),
+                    )
+                    return GDNAttentionMetadata(
+                        num_prefills=0,
+                        num_prefill_tokens=0,
+                        num_decodes=0,
+                        num_decode_tokens=0,
+                        num_spec_decodes=_batch_size,
+                        num_spec_decode_tokens=_num_spec_toks,
+                        num_actual_tokens=m.num_actual_tokens,
+                        has_initial_state=None,
+                        chunk_indices=None,
+                        chunk_offsets=None,
+                        prefill_query_start_loc=None,
+                        prefill_state_indices=None,
+                        prefill_has_initial_state=None,
+                        spec_query_start_loc=self.spec_query_start_loc[: _batch_size + 1],
+                        non_spec_query_start_loc=None,
+                        spec_state_indices_tensor=self.spec_state_indices_tensor[:_batch_size],
+                        non_spec_state_indices_tensor=None,
+                        spec_sequence_masks=self.spec_sequence_masks[:_batch_size],
+                        spec_token_indx=self.spec_token_indx[:_num_spec_toks],
+                        non_spec_token_indx=self.non_spec_token_indx[:0],
+                        num_accepted_tokens=self.num_accepted_tokens[:_batch_size],
+                        nums_dict=None,
+                        batch_ptr=None,
+                        token_chunk_offset_ptr=None,
+                    )
         block_table_tensor = mamba_get_block_table_tensor(
             m.block_table_tensor,
             m.seq_lens,

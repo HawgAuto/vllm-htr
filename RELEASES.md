@@ -1,5 +1,13 @@
 # vLLM HTR release history
 
+## v0.2.7 — Qwen3.8 decode + 2.32× faster cold boot & unified ERNIE-5.5-Flash-HTR (DSpark)
+
+- **Image:** `ghcr.io/hawgauto/vllm-htr:v0.2.7` *(staged locally)*
+- **What's new:** Unified zero-overlay `gfx1151` container adding **Qwen3.8 W4A16 `contig_N` MoE decode (`moe_w4a16_decode_cn_n128`) + RDNA 3.5 decode upgrades + 2.32× faster cold boot** (pre-seeded `module_aiter_core.so` & `tvm_ffi` addon, `htr_fast_arena_v27.so` with `fadvise`) AND **full ERNIE-5.5-Flash-Preview-HTR + 3L K=2 DSpark** support (`8` zero-spill Wave32 `.so` / `463` kernels, model-aware plugin gating, `8.00 GiB → 128 MiB` sparse indexer workspace fix, per-shard `POSIX_FADV_DONTNEED`, and `max_model_len`-capped RoPE tables).
+- **Verified Qwen3.8 gains vs `v0.2.6`:** Empty-workspace cold boot **`2.32×`** (`388.2 s → 167.3 s`), KV8 config-change boot **`1.52×`** (`309.8 s → 204.3 s`), BF16 `c=4` stoch **`+10.8%` agg / `+12.6%` sum** (`69.96 / 107.49 tok/s`), KV8 `c=1` greedy **`+7.3%`** (`48.45 tok/s`), KV8 13K cold prefill **`1.18×`** (`1,077.8 tok/s`) & 13K warm decode **`+21.5%`** (`54.15 tok/s`), `0` mid-inference Triton JITs.
+- **Verified ERNIE-5.5 DSpark-5 (128 GB Strix Halo, 32K ctx):** Boots cleanly in **`85.1 s`** (`107.0 GiB` model, `34,131` KV tokens, `6.1 GiB` host RAM free), `4.61` mean acceptance (`72.1%`), **`60.50 tok/s`** primes / **`39.16 tok/s`** chat code / **`31.04 tok/s`** chat prose on both `/v1/completions` and `/v1/chat/completions`.
+- **Details:** [htr_runtime/releases/v0.2.7/README.md](htr_runtime/releases/v0.2.7/README.md)
+
 ## v0.2.6 — 2× faster long-context prefill, zero Triton JIT & RDNA 3.5 ISA upgrades
 
 - **Image:** `ghcr.io/hawgauto/vllm-htr@sha256:dc11916549c534b207bb45048fe2f9b2177117995931f5aff5b384b274ea0fe8` (alias `ghcr.io/hawgauto/vllm-htr:v0.2.6`)

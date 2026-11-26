@@ -37,8 +37,14 @@ def environment_defaults(env=None, *, root=ROOT, base_defaults=None):
         base_defaults = json.loads(Path('/opt/haloloom/qwen38/data/runtime-env.json').read_text())
     defaults = dict(base_defaults)
     defaults.update(json.loads((root/'runtime-env.json').read_text()))
+    defaults['HTR_MOE_LOAD_WORKERS'] = '4'
+    _plugins = (
+        'htr,htr_moe,gp8hc,q38spec,htr_autotune_pin,htr_q38f,ernie_htr'
+        if _is_qwen_htr_model()
+        else 'htr,ernie_htr'
+    )
     defaults.update(DIRECT_W8A16='0', VLLM_ALLOW_LONG_MAX_MODEL_LEN='0',
-                    VLLM_PLUGINS='htr,htr_moe,gp8hc,q38spec,htr_autotune_pin,htr_q38f')
+                    VLLM_PLUGINS=_plugins)
     for key, value in defaults.items():
         if key.startswith('DIRECT_QSA_UNION_') or key.startswith('DIRECT_QSA_NATIVE_'):
             continue
@@ -51,6 +57,33 @@ def environment_defaults(env=None, *, root=ROOT, base_defaults=None):
         if value:
             try:
                 Path(value).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+    # v0.2.7 boot optimization: pre-seed prebuilt libtorch_c_dlpack_addon_torch213-rocm.so so tvm_ffi never recompiles (~35s)!
+    tvm_dir = env.get('TVM_FFI_CACHE_DIR')
+    prebuilt_tvm = Path(env.get('HTR_TVM_FFI_PREBUILT_SO', str(root / 'native-bin/libtorch_c_dlpack_addon_torch213-rocm.so')))
+    if tvm_dir and prebuilt_tvm.is_file():
+        dst_tvm = Path(tvm_dir) / prebuilt_tvm.name
+        if not dst_tvm.exists():
+            try:
+                import shutil
+                tmp_tvm = dst_tvm.with_suffix('.so.tmp.' + str(os.getpid()))
+                shutil.copy2(prebuilt_tvm, tmp_tvm)
+                os.replace(tmp_tvm, dst_tvm)
+            except OSError:
+                pass
+    # v0.2.7 boot optimization: pre-seed prebuilt module_aiter_core.so so aiter never
+    # recompiles from C++ (~120-250s cold start) on a fresh workspace or new config.
+    aiter_dir = env.get('AITER_JIT_DIR')
+    prebuilt_aiter = Path(env.get('HTR_AITER_PREBUILT_SO', str(root / 'native-bin/module_aiter_core.so')))
+    if aiter_dir and prebuilt_aiter.is_file():
+        dst_so = Path(aiter_dir) / 'module_aiter_core.so'
+        if not dst_so.exists():
+            try:
+                import shutil
+                tmp_so = dst_so.with_suffix('.so.tmp.' + str(os.getpid()))
+                shutil.copy2(prebuilt_aiter, tmp_so)
+                os.replace(tmp_so, dst_so)
             except OSError:
                 pass
     # V5-P5: unified ple_gather_v25.so (persistent scratch + APU thread cap + parallel scatter + built-in LRU cache)
@@ -122,7 +155,51 @@ def ple_budget(value):
     return int(value)
 
 
+
+def _detect_model_arg(argv=None):
+    import sys as _sys
+    args = list(_sys.argv[1:] if argv is None else argv)
+    for i, tok in enumerate(args):
+        if tok == '--model' and i + 1 < len(args):
+            return args[i + 1]
+        if tok.startswith('--model='):
+            return tok.split('=', 1)[1]
+    # Positional after `serve` subcommand
+    if 'serve' in args:
+        idx = args.index('serve') + 1
+        while idx < len(args):
+            tok = args[idx]
+            if not tok.startswith('-'):
+                return tok
+            idx += 1
+    return None
+
+
+def _is_qwen_htr_model(model_path=None):
+    if not model_path:
+        model_path = _detect_model_arg()
+    if not model_path:
+        return True
+    try:
+        cfg_p = Path(str(model_path)) / 'config.json'
+        if not cfg_p.is_file():
+            return True
+        cfg = json.loads(cfg_p.read_text())
+        mtype = str(cfg.get('model_type', '')).lower()
+        archs = [str(a) for a in (cfg.get('architectures') or [])]
+        if mtype in ('qwen4_exp', 'qwen4_exp_text', 'qwen4_exp_mtp'):
+            return True
+        if any(a.startswith('Qwen4Exp') for a in archs):
+            return True
+        if mtype or archs:
+            return False
+    except Exception:
+        pass
+    return True
+
 def parser_defaults(parser):
+    if not _is_qwen_htr_model():
+        return parser
     # Parsing our recorded command uses native argument types; set_defaults leaves
     # all explicit CLI/config values authoritative, even upstream-default values.
     argv = json.loads((ROOT/'server-argv.json').read_text())[3:]
@@ -172,6 +249,10 @@ def verify_installation():
 
 def prepare_engine(args):
     verify_installation()
+    if not _is_qwen_htr_model(getattr(args, 'model', None) or getattr(args, 'model_tag', None)):
+        # Non-Qwen model (e.g. ERNIE-5.5): keep shared pre-seeded aiter/tvm-ffi caches, skip Qwen3.8 MTP/PLE/YaRN overrides.
+        environment_defaults()
+        return
     spec = copy.deepcopy(args.speculative_config)
     mtp = 0 if spec is None else spec.get('num_speculative_tokens',3)
     if mtp == 0: spec = None
@@ -229,21 +310,49 @@ def prepare_engine(args):
         'max_num_batched_tokens','kv_cache_dtype','kv_cache_memory_bytes',
         'enable_prefix_caching','compilation_config','speculative_config','hf_overrides',
         'tensor_parallel_size','pipeline_parallel_size','generation_config','override_generation_config')}
-    bound_env={key:value for key,value in os.environ.items() if key.startswith(('HTR_','DIRECT_','GP8HC_','E53_','E59_','E92_','Q38SPEC_')) and key not in ('HTR_RUNTIME_CACHE_ROOT','HTR_PLE_ASYNC_MAXN_SOURCE')}
+    bound_env={key:value for key,value in os.environ.items() if key.startswith(('HTR_','DIRECT_','GP8HC_','E53_','E59_','E92_','Q38SPEC_')) and key not in ('HTR_RUNTIME_CACHE_ROOT','HTR_PLE_ASYNC_MAXN_SOURCE','HTR_MOE_SKIP_SHA', 'HTR_MOE_SELFCHECK', 'HTR_MOE_PINNED_PIPE', 'HTR_MOE_FAST_LOAD', 'HTR_MOE_FAST_ARENA', 'HTR_MOE_LOAD_WORKERS','HTR_MOE_FORCE_SHA','HTR_MOE_FAST_LOAD','HTR_MOE_FAST_ARENA','HTR_MOE_LOAD_WORKERS','HTR_FAST_ARENA_SO','HTR_AITER_PREBUILT_SO')}
     revision=(ROOT/'NATIVE-POLICY-REVISION').read_text().strip()
     identity=cache_identity(config,bound_env,revision)
     cache_root=Path(os.environ.get('HTR_CACHE_HOME','/workspace/cache'))/('htr-native-'+identity)
-    shared_root=Path(os.environ.get('HTR_CACHE_HOME','/workspace/cache'))/'htr-shared'
-    shared_root.mkdir(parents=True,exist_ok=True)
+    _orig_env = json.loads(Path('/opt/haloloom/qwen38/data/runtime-env.json').read_text())
     for key in CACHE_KEYS:
-        # Explicit locations are preserved. vLLM/Triton/Inductor all content-hash their own artifacts,
-        # so sharing a persistent root avoids 127s modelinfos + 24s inductor + 22s triton cold misses!
-        original=json.loads(Path('/opt/haloloom/qwen38/data/runtime-env.json').read_text()).get(key)
+        # v0.2.7: AITER_JIT_DIR only depends on the container toolchain (ROCm/PyTorch/aiter),
+        # never on serving args; sharing it eliminates a 140s duplicate C++ rebuild per config!
+        if key == 'AITER_JIT_DIR':
+            shared_aiter = Path(os.environ.get('HTR_CACHE_HOME', '/workspace/cache')) / 'aiter-jit'
+            shared_aiter.mkdir(parents=True, exist_ok=True)
+            if key not in os.environ or os.environ[key] == _orig_env.get(key):
+                os.environ[key] = str(shared_aiter)
+            prebuilt_aiter = Path(os.environ.get('HTR_AITER_PREBUILT_SO', str(ROOT / 'native-bin/module_aiter_core.so')))
+            dst_so = Path(os.environ[key]) / 'module_aiter_core.so'
+            if prebuilt_aiter.is_file() and not dst_so.exists():
+                try:
+                    import shutil
+                    tmp_so = dst_so.with_suffix('.so.tmp.' + str(os.getpid()))
+                    shutil.copy2(prebuilt_aiter, tmp_so)
+                    os.replace(tmp_so, dst_so)
+                except OSError:
+                    pass
+            continue
+        if key == 'TVM_FFI_CACHE_DIR':
+            shared_tvm = Path(os.environ.get('HTR_CACHE_HOME', '/workspace/cache')) / 'tvm-ffi'
+            shared_tvm.mkdir(parents=True, exist_ok=True)
+            if key not in os.environ or os.environ[key] == _orig_env.get(key):
+                os.environ[key] = str(shared_tvm)
+            prebuilt_tvm = Path(os.environ.get('HTR_TVM_FFI_PREBUILT_SO', str(ROOT / 'native-bin/libtorch_c_dlpack_addon_torch213-rocm.so')))
+            dst_tvm = Path(os.environ[key]) / prebuilt_tvm.name
+            if prebuilt_tvm.is_file() and not dst_tvm.exists():
+                try:
+                    import shutil
+                    tmp_tvm = dst_tvm.with_suffix('.so.tmp.' + str(os.getpid()))
+                    shutil.copy2(prebuilt_tvm, tmp_tvm)
+                    os.replace(tmp_tvm, dst_tvm)
+                except OSError:
+                    pass
+            continue
+        original = _orig_env.get(key)
         if key not in os.environ or os.environ[key]==original:
-            base = shared_root if (os.environ.get('HTR_SHARED_CACHE','1')=='1' and key in ('VLLM_CACHE_ROOT','TRITON_CACHE_DIR','TORCHINDUCTOR_CACHE_DIR','AITER_JIT_DIR')) else cache_root
-            d = base/key.lower()
-            d.mkdir(parents=True,exist_ok=True)
-            os.environ[key]=str(d)
+            os.environ[key]=str(cache_root/key.lower())
     os.environ['HTR_RUNTIME_CACHE_ROOT']=str(cache_root)
     cache_root.mkdir(parents=True,exist_ok=True)
     for name in ('tmp','config','profiles'): Path('/workspace',name).mkdir(parents=True,exist_ok=True)

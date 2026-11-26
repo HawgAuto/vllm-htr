@@ -1,0 +1,4 @@
+Metadata-Version: 2.1
+Name: vllm-ernie-htr
+Version: 0.1.0
+Summary: ROCm gfx1151 HTR-W1 serving plugin for ERNIE-5.5-Flash

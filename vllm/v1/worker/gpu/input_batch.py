@@ -378,6 +378,14 @@ def prepare_pos_seq_lens(
     num_reqs = idx_mapping.shape[0]
     # NOTE(woosuk): We do +1 because the last thread block is used
     # to pad unused seq_lens as 0 for full CUDA graphs.
+    try:
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+    except Exception:
+        _dm = None
+    if _dm is not None:
+        _dm.prepare_pos_seq_lens(idx_mapping, query_start_loc, num_computed_tokens, pos, seq_lens)
+        return
     _prepare_pos_seq_lens_kernel[(num_reqs + 1,)](
         pos,
         seq_lens,
@@ -470,6 +478,18 @@ def combine_sampled_and_draft_tokens(
     num_speculative_steps = draft_tokens.shape[-1]
 
     logits_indices = torch.empty(num_logits, dtype=torch.int64, device=input_ids.device)
+    try:
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+    except Exception:
+        _dm = None
+    if _dm is not None:
+        _dm.combine_sampled_and_draft(
+            input_ids, idx_mapping, last_sampled_tokens, query_start_loc,
+            seq_lens, prefill_len, draft_tokens, cu_num_logits, logits_indices,
+            int(num_new_sampled_tokens),
+        )
+        return logits_indices
     _combine_sampled_and_draft_tokens_kernel[(num_reqs,)](
         input_ids,
         idx_mapping,
@@ -529,6 +549,14 @@ def get_num_sampled_and_rejected(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     num_reqs = idx_mapping.shape[0]
     num_rejected = torch.empty_like(num_sampled)
+    try:
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+    except Exception:
+        _dm = None
+    if _dm is not None:
+        _dm.get_num_sampled_and_rejected(num_sampled, num_rejected, seq_lens, cu_num_logits, idx_mapping, prefill_len)
+        return num_sampled, num_rejected
     _get_num_sampled_and_rejected_kernel[(num_reqs,)](
         num_sampled,
         num_rejected,
@@ -645,6 +673,18 @@ def post_update(
     draft_tokens_out: torch.Tensor | None = None,
 ) -> None:
     num_reqs = idx_mapping.shape[0]
+    try:
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+    except Exception:
+        _dm = None
+    if _dm is not None:
+        _dm.post_update(
+            idx_mapping, num_computed_tokens, last_sampled_tokens, output_bin_counts,
+            sampled_tokens, num_sampled, num_rejected, query_start_loc, all_token_ids,
+            total_len, broadcast_drafts, draft_tokens_out,
+        )
+        return
     _post_update_kernel[(num_reqs,)](
         idx_mapping,
         num_computed_tokens,
@@ -729,6 +769,14 @@ def expand_idx_mapping(
     num_reqs = idx_mapping.shape[0]
     expanded_idx_mapping = idx_mapping.new_empty(total_num_logits)
     expanded_local_pos = idx_mapping.new_empty(total_num_logits)
+    try:
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+    except Exception:
+        _dm = None
+    if _dm is not None:
+        _dm.expand_idx_mapping(idx_mapping, expanded_idx_mapping, expanded_local_pos, cu_num_logits)
+        return expanded_idx_mapping, expanded_local_pos
     _expand_idx_mapping_kernel[(num_reqs,)](
         idx_mapping,
         expanded_idx_mapping,

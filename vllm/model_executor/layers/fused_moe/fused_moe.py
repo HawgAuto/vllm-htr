@@ -670,6 +670,25 @@ def invoke_fused_moe_wna16_cuda_kernel(
 # once we drop off sm75 support
 
 _MOE_W4A16_AOT = None
+_MOE_W4A16_DEC = None
+_MOE_W4A16_DEC_LOGGED = set()
+
+def _get_moe_w4a16_dec():
+    global _MOE_W4A16_DEC
+    if _MOE_W4A16_DEC is None:
+        import os as _os
+        if _os.environ.get("HTR_MOE_W4A16_DEC", "1") == "1":
+            for cand in (
+                _os.environ.get("HTR_MOE_W4A16_DEC_HSACO", ""),
+                _os.path.join(_os.environ.get("HTR_NATIVE_DIR", "/opt/vllm-htr/native-bin"), "moe_w4a16_decode_v27.hsaco"),
+            ):
+                if cand and _os.path.isfile(cand):
+                    import direct_hip_module_v1 as _hm
+                    _MOE_W4A16_DEC = (_hm, _hm.Module(cand))
+                    break
+        if _MOE_W4A16_DEC is None:
+            _MOE_W4A16_DEC = False
+    return _MOE_W4A16_DEC
 def _get_moe_w4a16_aot():
     global _MOE_W4A16_AOT
     if _MOE_W4A16_AOT is None:
@@ -742,6 +761,66 @@ def invoke_fused_moe_wna16_triton_kernel(
     _aot = _get_moe_w4a16_aot()
     _bm = int(config["BLOCK_SIZE_M"])
     _gs = int(block_shape[1])
+    _dec = _get_moe_w4a16_dec()
+    if (
+        _dec
+        and use_int4_w4a16
+        and not use_int8_w8a16
+        and B_zp is None
+        and num_tokens <= 160
+        and A.stride(1) == 1
+        and B.stride(1) == 1
+        and (B.stride(0) % 4) == 0
+        and (B.stride(2) % 4) == 0
+        and B_scale.stride(1) == 1
+        and (B_scale.stride(0) % 4) == 0
+        and (B_scale.stride(2) % 4) == 0
+        and C.stride(2) == 1
+        and C.stride(0) == C.size(1) * C.stride(1)
+        and A.dtype == torch.bfloat16
+        and C.dtype == torch.bfloat16
+        and B.dtype == torch.uint8
+        and B_scale.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        and sorted_token_ids.dtype == torch.int32
+        and expert_ids.dtype in (torch.int32, torch.int64)
+        and num_tokens_post_padded.dtype == torch.int32
+        and (not mul_routed_weight or (topk_weights is not None and topk_weights.dtype == torch.float32))
+        and _bm <= 128
+        and (B.size(1) % 128) == 0
+        and (A.size(1) % _gs) == 0
+        and (_gs % 128) == 0
+    ):
+        import ctypes as _ct
+        _log_key = ("ok", B.size(1), A.size(1), bool(mul_routed_weight))
+        if _log_key not in _MOE_W4A16_DEC_LOGGED:
+            _MOE_W4A16_DEC_LOGGED.add(_log_key)
+            print(f"HTR_MOE_W4A16_DEC_ACTIVE kernel=cn_n128 M={A.size(0)} nt={num_tokens} tk={top_k} N={B.size(1)} K={A.size(1)} gs={_gs} bm={_bm} mul={mul_routed_weight}", flush=True)
+        _hm, _dm = _dec
+        I32, I64 = _ct.c_int32, _ct.c_int64
+        _sd = (0 if B_scale.dtype == torch.float32 else (1 if B_scale.dtype == torch.bfloat16 else 2)) | (4 if expert_ids.dtype == torch.int64 else 0)
+        with torch.cuda.device(A.device):
+            _dm.launch(
+                "moe_w4a16_decode_cn_n128",
+                (B.size(1) // 128, (EM + _bm - 1) // _bm, 1),
+                (128, 1, 1),
+                [
+                    _hm.ptr(A), _hm.ptr(B), _hm.ptr(C), _hm.ptr(B_scale),
+                    _hm.ptr(topk_weights) if (mul_routed_weight and topk_weights is not None) else I64(0),
+                    _hm.ptr(sorted_token_ids), _hm.ptr(expert_ids), _hm.ptr(num_tokens_post_padded),
+                    I32(B.size(1)), I32(A.size(1)), I32(num_tokens), I32(top_k), I32(_gs),
+                    I64(A.stride(0)), I64(A.stride(1)),
+                    I64(B.stride(0)), I64(B.stride(2)), I64(B.stride(1)),
+                    I64(C.stride(1)), I64(C.stride(2)),
+                    I64(B_scale.stride(0)), I64(B_scale.stride(2)), I64(B_scale.stride(1)),
+                    I32(_bm), I32(1 if mul_routed_weight else 0), I32(_sd),
+                ],
+            )
+        return
+    if _dec and num_tokens <= 160:
+        _skip_key = ("skip", B.size(1), A.size(1), bool(mul_routed_weight))
+        if _skip_key not in _MOE_W4A16_DEC_LOGGED:
+            _MOE_W4A16_DEC_LOGGED.add(_skip_key)
+            print(f"HTR_MOE_W4A16_DEC_SKIPPED w4={use_int4_w4a16} zp={B_zp is not None} A={tuple(A.shape)}/{A.dtype}/{A.stride()} B={tuple(B.shape)}/{B.dtype}/{B.stride()} S={tuple(B_scale.shape)}/{B_scale.dtype}/{B_scale.stride()} C={tuple(C.shape)}/{C.stride()} gs={_gs} bm={_bm} nt={num_tokens} tk={top_k} mul={mul_routed_weight}", flush=True)
     if (
         _aot
         and use_int4_w4a16

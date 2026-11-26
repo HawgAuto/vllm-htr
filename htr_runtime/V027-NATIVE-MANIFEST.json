@@ -1,0 +1,56 @@
+{
+  "schema": "htr-v027-native-manifest-v1",
+  "version": "0.2.7",
+  "target": "gfx1151",
+  "qwen38_binaries": {
+    "hiphc_v2.so": {
+      "sha256": "aca88c25f0fb8e33c85bd05ae35f119b299ae7d8fc5cb9e32932495ed2ec14dc",
+      "bytes": 718040
+    },
+    "htr_decode_meta_v27.so": {
+      "sha256": "503a2da74197b367e2eee95ad52f44bcf0ceb68bac889d44e57e33e33fd1dda8",
+      "bytes": 580320
+    },
+    "htr_fast_arena_v27.so": {
+      "sha256": "c138574e8a4c194e5dde42d533565034f037649dd22bb8a0c44f983c41530f9c",
+      "bytes": 235960
+    },
+    "htr_moe_k6_shx.so": {
+      "sha256": "63f70fbb8f1d41d7139af18246f3afc42ec322dd80bb38e1a408238ee1260f9d",
+      "bytes": 957336
+    },
+    "htr_mtp_ddn_v2.so": {
+      "sha256": "bf22dfae85b7e2afc7f1b2de896c4b778254a31d0e94b7a88e18aa0e0518f0ef",
+      "bytes": 600984
+    },
+    "htr_ple_short_conv.so": {
+      "sha256": "298ef204423e2373018ed6268369b58ef92dd7163bb78097e016961dced30e75",
+      "bytes": 340528
+    },
+    "htr_spec_sample.so": {
+      "sha256": "d352fc3a45a3a83148232f65b8e39bf69969165065cd88aa08e858880f19a5a8",
+      "bytes": 935832
+    },
+    "libtorch_c_dlpack_addon_torch213-rocm.so": {
+      "sha256": "6ef990e0425148b8ef79fba67e2c54c9d10b31b6444e83526cfd62f7ed549272",
+      "bytes": 219712
+    },
+    "module_aiter_core.so": {
+      "sha256": "65a82a1363c13012c1567052ad91e11e98af74bd8b37fb07c13403eb98ff5008",
+      "bytes": 729064
+    },
+    "moe_w4a16_decode_v27.hsaco": {
+      "sha256": "3382ec77eb6721a83f943be3d2b96fa2e1d5ac18ffae329b541f978d8b7eb3b8",
+      "bytes": 17784
+    },
+    "qsa_canon_expand_fused.hsaco": {
+      "sha256": "8ee1fa9d9f17736879121ba09a40fa8f1f6d95991739579a31499533f76c0c59",
+      "bytes": 13304
+    },
+    "qsa_decode_union_kv8.hsaco": {
+      "sha256": "a07d37e3311e7758e5ed008cb5431caa4b0b2a0e3a8b75fb495c41ca26fad5a4",
+      "bytes": 49904
+    }
+  },
+  "ernie55_manifest": "/opt/vllm-htr/ERNIE55-MANIFEST.json"
+}

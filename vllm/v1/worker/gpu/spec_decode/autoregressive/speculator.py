@@ -848,6 +848,22 @@ def prepare_prefill_inputs(
     max_num_reqs,
 ) -> torch.Tensor:
     num_reqs = input_batch.num_reqs
+    try:
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+    except Exception:
+        _dm = None
+    if _dm is not None:
+        _dm.prepare_prefill_inputs(
+            last_token_indices, current_draft_step,
+            input_buffers.input_ids, input_buffers.positions,
+            input_buffers.query_start_loc, input_buffers.seq_lens,
+            input_batch.input_ids, input_batch.positions,
+            input_batch.idx_mapping, last_sampled, next_prefill_tokens,
+            num_sampled, num_rejected, input_batch.query_start_loc,
+            input_batch.seq_lens, int(max_num_reqs),
+        )
+        return last_token_indices
     _prepare_prefill_inputs_kernel[(num_reqs,)](
         last_token_indices,
         current_draft_step,
@@ -936,6 +952,20 @@ def prepare_decode_inputs(
     advance_draft_positions: bool = True,
 ):
     num_reqs = draft_tokens.shape[0]
+    try:
+        from htr_decode_meta_loader import get_decode_meta_mod as _get_dm
+        _dm = _get_dm()
+    except Exception:
+        _dm = None
+    if _dm is not None:
+        _dm.prepare_decode_inputs(
+            draft_tokens, target_seq_lens, num_rejected,
+            input_buffers.input_ids, input_buffers.positions,
+            sample_src_positions, input_buffers.query_start_loc,
+            input_buffers.seq_lens, int(max_model_len), int(max_num_reqs),
+            bool(advance_draft_positions),
+        )
+        return
     _prepare_decode_inputs_kernel[(num_reqs + 1,)](
         draft_tokens,
         draft_tokens.stride(0),
