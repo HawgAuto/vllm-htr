@@ -21,12 +21,12 @@ from htr import wire
 MOE_H = 2048
 MOE_I = 2048
 TOPK = 10
-# Cap M bucket at 4 by default (93 VGPRs / 8.5 KB LDS vs 145 VGPRs / 16.9 KB LDS at M=8 -> 2.3x CU occupancy!)
-# Also allows single-launch MAXT=16 (A=160<=256) with identical 36.7 MB scratch (0 extra VRAM, 2x fewer launches at T=9..16)!
-MAX_M = int(os.environ.get("ERNIE_HTR_MOE_MAX_M", "4"))
+# v0.2.8: MAX_M=8 + single-launch MAXT=16 (A=160<=256) beats M=4 across ALL routing regimes
+# (saves -3.0 ms/step @ B=1 T=6 and -6.05 ms/step @ B=2 T=12 on correlated DSpark-5 tokens, 0 regression on uniform!).
+MAX_M = int(os.environ.get("ERNIE_HTR_MOE_MAX_M", "8"))
 if MAX_M not in (1, 2, 4, 8):
-    MAX_M = 4
-MAXT = 16 if MAX_M <= 4 else 8
+    MAX_M = 8
+MAXT = 16
 SC_STRIDE = 6144   # w1 2048 | w3 2048 | w2 2048
 SV_STRIDE = 768    # w1 256  | w3 256  | w2 256
 SU_STRIDE = 512    # w1/w3 256 | w2 256
@@ -120,10 +120,13 @@ def _decode_scratch(dev: torch.device) -> dict[str, torch.Tensor]:
     if s is None:
         a = MAXT * TOPK
         m = MAX_M
-        bps_gu_min = min(BPS_GU, BPS_GU_K2)
-        bps_dn_min = min(BPS_DN, BPS_DN_K2)
-        ns_gu = (MOE_H // 128 + bps_gu_min - 1) // bps_gu_min
-        ns_dn = (MOE_I // 128 + bps_dn_min - 1) // bps_dn_min
+        ns_gu = (MOE_H // 128 + BPS_GU - 1) // BPS_GU
+        ns_dn = (MOE_I // 128 + BPS_DN - 1) // BPS_DN
+        ns_gu_k2 = (MOE_H // 128 + BPS_GU_K2 - 1) // BPS_GU_K2
+        ns_dn_k2 = (MOE_I // 128 + BPS_DN_K2 - 1) // BPS_DN_K2
+        # K=2 draft uses bps=4 only when T <= 8 (a_k2 <= a // 2), fitting inside the same lean 42 MiB part buffer!
+        ns_gu = max(ns_gu, (ns_gu_k2 + 1) // 2)
+        ns_dn = max(ns_dn, (ns_dn_k2 + 1) // 2)
         f = dict(dtype=torch.float32, device=dev)
         i32 = dict(dtype=torch.int32, device=dev)
         s = _SCRATCH[key] = dict(
@@ -268,8 +271,8 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
         else:
             ge, gr, gn, slot, ng = E.moe_plan2(ids32, M)
         sp3 = self.spad if self.K == 3 else 0
-        bps_gu = BPS_GU_K2 if self.K == 2 else BPS_GU
-        bps_dn = BPS_DN_K2 if self.K == 2 else BPS_DN
+        bps_gu = BPS_GU_K2 if (self.K == 2 and T <= 8) else BPS_GU
+        bps_dn = BPS_DN_K2 if (self.K == 2 and T <= 8) else BPS_DN
         E.moe_gemv(
             0, self.K, M,
             self.qw, self.qoff, self.kexp, self.scales, self.su, self.sv,
