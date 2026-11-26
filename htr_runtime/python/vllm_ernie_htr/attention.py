@@ -1201,6 +1201,20 @@ class Ernie5_5ROCmSparseMLAImpl(MLAAttentionImpl[Ernie5_5ROCmSparseMLAMetadata])
         )
         if use_nt_absorb:
             q_abs = fops.dsa_q_absorb_cat(q_nope, q_pe, self._w_uk_rm)
+        elif (
+            fops is not None
+            and hasattr(fops, "bmm_q_uk_cat_pe_bf16")
+            and hasattr(self, "_w_uk_rm")
+            and q_act.is_cuda
+            and q_act.dtype == torch.bfloat16
+            and self._w_uk_rm.dtype == torch.bfloat16
+            and self.num_heads == 64
+            and self.qk_nope_head_dim == 128
+            and self.kv_lora_rank == 512
+            and self.qk_rope_head_dim == 64
+        ):
+            # v0.2.8 native gfx1151 Wave32 WMMA fused Q@W_UK + cat(q_pe): 4.6-4.9x faster & saves 134-268 MiB VRAM
+            q_abs = fops.bmm_q_uk_cat_pe_bf16(q_nope, self._w_uk_rm, q_pe)
         else:
             # bmm: [H, T, nope] @ [H, nope, kv_lora] -> [H, T, kv_lora] -> [T, H, kv_lora]
             ql_nope = torch.bmm(q_nope.transpose(0, 1), self.W_UK_T).transpose(0, 1)
@@ -1288,6 +1302,20 @@ class Ernie5_5ROCmSparseMLAImpl(MLAAttentionImpl[Ernie5_5ROCmSparseMLAMetadata])
         ):
             out_view = output[:num_actual].view(num_actual, self.num_heads, self.v_head_dim)
             fops.dsa_uv_proj(attn_latent[..., : self.kv_lora_rank], self._w_uv_rm, out_view)
+        elif (
+            fops is not None
+            and hasattr(fops, "bmm_uv_bf16")
+            and hasattr(self, "_w_uv_rm")
+            and attn_latent.is_cuda
+            and attn_latent.dtype == torch.bfloat16
+            and self._w_uv_rm.dtype == torch.bfloat16
+            and self.num_heads == 64
+            and self.kv_lora_rank == 512
+            and self.v_head_dim == 128
+        ):
+            # v0.2.8 native gfx1151 Wave32 WMMA fused attn_latent@W_UV directly into output view (1.4-2.8x faster)
+            out_view = output[:num_actual].view(num_actual, self.num_heads, self.v_head_dim)
+            fops.bmm_uv_bf16(attn_latent, self._w_uv_rm, out_view)
         else:
             # bmm: [H, T, kv_lora] @ [H, kv_lora, v_dim] -> [H, T, v_dim] -> [T, H, v_dim]
             v_in = attn_latent[..., : self.kv_lora_rank].to(self.W_UV.dtype).transpose(0, 1)

@@ -520,12 +520,224 @@ __global__ __launch_bounds__(256) void k_hpf_ernie_reduce(
   *reinterpret_cast<uint4*>(out + (size_t)t * MOE_H + i0) = o;
 }
 
+
+// v0.2.8 RDNA3.5 2-N-Half (1x4 for bmw=32 -> 2x occupancy; 2x4 for bmw=64/128 -> 2x WMMA/LDS!)
+// Keeps SAD_HI + v_permlane16 + 3-stage B-pipeline + 100% exact FWHT-128 epilogue (64-pt reg + 1 butterfly via dead Bs LDS).
+template <int MSK> __device__ __forceinline__ void lane_stage4(float v[4], int lane) {
+  const bool up = (lane & MSK) != 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    const float o = shx<MSK>(v[j]);
+    v[j] = up ? (o - v[j]) : (v[j] + o);
+  }
+}
+template <int BIT> __device__ __forceinline__ void reg_stage4(float v[4]) {
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    if (!(j & BIT)) { const float a = v[j], b = v[j | BIT]; v[j] = a + b; v[j | BIT] = a - b; }
+  }
+}
+
+// MT = M-tiles per wave (1 for bmw=32 -> 4 waves = 32x128; 2 for bmw=64 -> 4 waves = 64x128; 2 for bmw=128 -> 8 waves = 128x128)
+// NWM = M-wave-groups (2 for bmw=32/64 -> 4 waves total; 4 for bmw=128 -> 8 waves total)
+template <int K, int PH, int NWM, int MT, int NT_LOAD>
+__global__ __launch_bounds__(NWM * 2 * 32)
+void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
+  constexpr int N = (PH == 0) ? (2 * MOE_I) : MOE_H;
+  constexpr int KDIM = (PH == 0) ? MOE_H : MOE_I;
+  constexpr int NT = KDIM / 16;
+  constexpr int NS = KDIM / BKS;
+  constexpr int NWT = 8 * K;
+  constexpr int LBMW = NWM * MT * BM;
+  constexpr int NWAVES = NWM * 2;
+  constexpr int NTHR = NWAVES * 32;
+  constexpr int B_ITERS = 256 / NTHR;
+  constexpr int W_PER_ROW = (K == 3) ? 2 : 1;
+
+  __shared__ __attribute__((aligned(16))) uint32_t Bs[2][BN * RS];
+  __shared__ int32_t s_tok[LBMW];
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
+  const int wm = wave >> 1;      // 0 .. NWM-1
+  const int wn = wave & 1;       // 0 .. 1 (0: cols 0..63, 1: cols 64..127)
+  const int g = blockIdx.y, nb = blockIdx.x;
+  if (g >= a.grp_cnt[0]) return;
+  const int y = a.grp_y[g];
+  const int nblk = a.grp_nblk[g];
+  const int e = a.expert_ids[y];
+  if (e < 0) return;
+
+  for (int i = tid; i < LBMW; i += NTHR) {
+    s_tok[i] = (i < BM * nblk) ? a.sorted_ids[y * BM + i] : a.num_valid;
+  }
+  __syncthreads();
+
+  const int role = (PH == 0) ? (nb < (MOE_I / BN) ? 0 : 1) : 2;
+  const int sblk = (PH == 0) ? (nb < (MOE_I / BN) ? nb : nb - (MOE_I / BN)) : nb;
+  const size_t pitch = (size_t)NT * NWT + a.pad;
+  const uint32_t* qm = a.qw + a.qoff[(size_t)e * 3 + role] + (size_t)sblk * 8 * pitch;
+
+  bool m_act[MT];
+  const _Float16* arow[MT];
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    const int mb = wm * MT + m;
+    m_act[m] = s_tok[mb * 16] < a.num_valid;
+    arow[m] = a.A + ((size_t)y * BM + mb * 16 + l16) * KDIM;
+  }
+
+  auto loadA = [&](u32x4 dst[MT][4], int k0) {
+#pragma unroll
+    for (int m = 0; m < MT; ++m) {
+      if (m_act[m]) {
+#pragma unroll
+        for (int c = 0; c < 4; ++c) dst[m][c] = *(const u32x4*)(arow[m] + k0 + 8 * c);
+      }
+    }
+  };
+  auto loadB = [&](uint32_t* br, int k0) {
+#pragma unroll
+    for (int bi = 0; bi < B_ITERS; ++bi) {
+      const int vtid = tid + bi * NTHR;
+      const int n2 = vtid & 127, r = n2 & 15, h2i = vtid >> 7;
+      const uint32_t* tile = qm + (size_t)(n2 >> 4) * pitch + (size_t)(k0 / 16 + h2i) * NWT;
+      if constexpr (K == 3) {
+        const int kk = r >> 1;
+        const u32x2a* p2 = reinterpret_cast<const u32x2a*>(tile + 3 * kk + (r & 1));
+        const u32x2 pair = NT_LOAD ? __builtin_nontemporal_load(p2) : *p2;
+        br[bi * 2 + 0] = pair[0];
+        br[bi * 2 + 1] = pair[1];
+      } else if constexpr (K == 2) {
+        br[bi] = NT_LOAD ? __builtin_nontemporal_load(tile + r) : tile[r];
+      }
+    }
+  };
+  auto storeB = [&](int buf, const uint32_t* br) {
+    uint32_t* bs = Bs[buf];
+#pragma unroll
+    for (int bi = 0; bi < B_ITERS; ++bi) {
+      const int vtid = tid + bi * NTHR;
+      const int n2 = vtid & 127, r = n2 & 15, h2i = vtid >> 7;
+      uint32_t o[8];
+      decode_row_k<K>(&br[bi * W_PER_ROW], r, o);
+      *(u32x4*)(&bs[sw4(n2, 2 * h2i)]) = (u32x4){o[0], o[1], o[2], o[3]};
+      *(u32x4*)(&bs[sw4(n2, 2 * h2i + 1)]) = (u32x4){o[4], o[5], o[6], o[7]};
+      if constexpr (B_ITERS > 1) __builtin_amdgcn_sched_barrier(0);
+    }
+  };
+
+  // Explicit register buffers (ZERO dynamic indexing -> ZERO scratch ops!)
+  u32x4 aX[MT][4], aY[MT][4];
+  uint32_t bX[B_ITERS * W_PER_ROW], bY[B_ITERS * W_PER_ROW], bZ[B_ITERS * W_PER_ROW];
+  f32x8 acc[MT][4];
+#pragma unroll
+  for (int m = 0; m < MT; ++m)
+#pragma unroll
+    for (int j = 0; j < 4; ++j) acc[m][j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+
+  const int n_base = wn * 64;
+  auto step = [&](int s, int buf, const u32x4 curA[MT][4], u32x4 nxtA[MT][4], const uint32_t* b1, uint32_t* b2) {
+    if (s + 1 < NS) loadA(nxtA, (s + 1) * BKS);
+    if (s + 2 < NS) loadB(b2, (s + 2) * BKS);
+    if (m_act[0]) {
+      const uint32_t* bs = Bs[buf];
+#pragma unroll
+      for (int kc = 0; kc < 2; ++kc) {
+        f16x16 af[MT];
+#pragma unroll
+        for (int m = 0; m < MT; ++m) {
+          const u32x4 x0 = curA[m][2 * kc], x1 = curA[m][2 * kc + 1];
+          af[m] = __builtin_bit_cast(f16x16, (u32x8){x0[0], x0[1], x0[2], x0[3], x1[0], x1[1], x1[2], x1[3]});
+        }
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const int n = n_base + 16 * j + l16;
+          const u32x4 y0 = *(const u32x4*)(&bs[sw4(n, 2 * kc)]);
+          const u32x4 y1 = *(const u32x4*)(&bs[sw4(n, 2 * kc + 1)]);
+          const f16x16 bf = __builtin_bit_cast(f16x16, (u32x8){y0[0], y0[1], y0[2], y0[3], y1[0], y1[1], y1[2], y1[3]});
+#pragma unroll
+          for (int m = 0; m < MT; ++m) {
+            if (m == 0 || m_act[m]) {
+              acc[m][j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af[m], bf, acc[m][j]);
+            }
+          }
+          __builtin_amdgcn_sched_barrier(0);
+        }
+      }
+    }
+    if (s + 1 < NS) storeB(buf ^ 1, b1);
+    __syncthreads();
+  };
+
+  loadA(aX, 0); loadB(bX, 0);
+  if (NS > 1) loadB(bY, BKS);
+  storeB(0, bX);
+  __syncthreads();
+  // Unroll by 6 = LCM(2 for aX/aY & buf, 3 for bX/bY/bZ) -> 100% static register addressing!
+  for (int s = 0; s < NS; s += 6) {
+    step(s + 0, 0, aX, aY, bY, bZ);
+    if (s + 1 < NS) step(s + 1, 1, aY, aX, bZ, bX);
+    if (s + 2 < NS) step(s + 2, 0, aX, aY, bX, bY);
+    if (s + 3 < NS) step(s + 3, 1, aY, aX, bY, bZ);
+    if (s + 4 < NS) step(s + 4, 0, aX, aY, bZ, bX);
+    if (s + 5 < NS) step(s + 5, 1, aY, aX, bX, bY);
+  }
+
+  // Exact FWHT-128 epilogue: 64-pt in-register + 1 butterfly (col ^ 64) via dead Bs LDS!
+  const int row0 = nb * 128;
+  const int soff = (PH == 0) ? 0 : (2 * MOE_I);
+  const int svoff = (PH == 0) ? 0 : (2 * MOE_I / 8);
+  const __half* scl = a.scales + (size_t)e * SC_STRIDE + soff + row0 + n_base;
+  const uint8_t* svp = a.sv + (size_t)e * SV_STRIDE + svoff + ((row0 + n_base) >> 3);
+  float sc[4]; uint32_t neg = 0;
+#pragma unroll
+  for (int j = 0; j < 4; ++j) {
+    sc[j] = __half2float(scl[16 * j + l16]) * a.cb;
+    neg |= ((uint32_t)(svp[2 * j + (l16 >> 3)] >> (l16 & 7)) & 1u) << j;
+  }
+  const int hrow = lane >> 4;
+  float* ep = reinterpret_cast<float*>(&Bs[0][0]); // 5120 floats available (we use NWAVES*32*4 <= 1024 floats!)
+  const int my_ep = (wave * 32 + lane) * 4;
+  const int peer_ep = ((wave ^ 1) * 32 + lane) * 4;
+
+#pragma unroll
+  for (int m = 0; m < MT; ++m) {
+    const int mb = wm * MT + m;
+    const size_t prow = (size_t)y * BM + mb * 16;
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      const int rl = mb * 16 + 2 * ei + hrow;
+      float v[4] = {0.f, 0.f, 0.f, 0.f};
+      if (m_act[m]) {
+        const float bias = VBIAS * a.S[prow + 2 * ei + hrow];
+#pragma unroll
+        for (int j = 0; j < 4; ++j) v[j] = (acc[m][j][ei] - bias) * sc[j];
+        reg_stage4<1>(v); reg_stage4<2>(v);
+        lane_stage4<1>(v, lane); lane_stage4<2>(v, lane); lane_stage4<4>(v, lane); lane_stage4<8>(v, lane);
+      }
+      *reinterpret_cast<float4*>(ep + my_ep) = make_float4(v[0], v[1], v[2], v[3]);
+      __syncthreads();
+      const float4 p4 = *reinterpret_cast<const float4*>(ep + peer_ep);
+      __syncthreads();
+      if (m_act[m] && s_tok[rl] < a.num_valid) {
+        const float pv[4] = {p4.x, p4.y, p4.z, p4.w};
+        uint16_t* yr = reinterpret_cast<uint16_t*>(a.Y) + (prow + 2 * ei + hrow) * (size_t)N + row0 + n_base + l16;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          float yv = ((wn == 0) ? (v[j] + pv[j]) : (pv[j] - v[j])) * INV128;
+          if ((neg >> j) & 1u) yv = -yv;
+          yr[16 * j] = f32_to_bf16_rne(yv);
+        }
+      }
+    }
+  }
+}
+
 template <int K, int PH>
 static void dispatch_gemm(int bmw, int nt_load, int max_g, hipStream_t st, ErnieGemmArgs a) {
   constexpr int N = (PH == 0) ? (2 * MOE_I) : MOE_H;
   if (bmw == 32) {
-    if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 2, 1>), dim3(N / BN, max_g), dim3(64), 0, st, a);
-    else         hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 2, 0>), dim3(N / BN, max_g), dim3(64), 0, st, a);
+    if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 2, 1, 1>), dim3(N / BN, max_g), dim3(128), 0, st, a);
+    else         hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 2, 1, 0>), dim3(N / BN, max_g), dim3(128), 0, st, a);
   } else if (bmw == 64) {
     if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 4, 1>), dim3(N / BN, max_g), dim3(128), 0, st, a);
     else         hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 4, 0>), dim3(N / BN, max_g), dim3(128), 0, st, a);

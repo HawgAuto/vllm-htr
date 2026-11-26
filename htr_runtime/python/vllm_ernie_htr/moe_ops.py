@@ -288,12 +288,22 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
         self, x: torch.Tensor, ids32: torch.Tensor, w32: torch.Tensor
     ) -> torch.Tensor:
         T = x.shape[0]
+        # v0.2.8 MALL-optimal chunking: T=2048 bmw=64 hits 18.41 TF/s (588 ms/1K) vs T=4096 bmw=128 (654 ms/1K),
+        # saving -263ms across 42L AND -203 MiB peak MoE scratch VRAM!
+        if T > 2048 and _HPF5_BMW_ENV is None:
+            out = x.new_empty((T, x.shape[1]))
+            for s0 in range(0, T, 2048):
+                s1 = min(s0 + 2048, T)
+                out[s0:s1] = self._prefill_hpf5(
+                    x[s0:s1].contiguous(), ids32[s0:s1].contiguous(), w32[s0:s1].contiguous()
+                )
+            return out
         topk = ids32.shape[1]
         nv = T * topk
         Pmax = ((nv + self.num_experts * 15 + 15) // 16) * 16
         s = _hpf5_scratch(x.device, Pmax, nv)
         # Dynamic bmw (v0.2.8 empirically tuned on gfx1151):
-        #   T<=1280: bmw=32 (1.22x faster @ T=1024); T<=2560: bmw=64 (18.2 TF/s @ T=2048); T>2560: 128
+        #   T<=1280: bmw=32 (1x4 V=111 -> 1.13x faster); T<=2048: bmw=64 (18.41 TF/s); env override respected
         if _HPF5_BMW_ENV is not None:
             bmw = 32 if T <= 128 else HPF5_BMW
         else:

@@ -2642,6 +2642,369 @@ void ernie_cp_gather_indexer_k_mxfp4_to_fp8(
       num_tokens, num_batches, (int)bt.size(1), num_blocks, (int)block_size);
 }
 
+
+// ============================================================================
+// v0.2.8 Fused DSA Prefill Q-Absorption + RoPE Concat & UV Projection (gfx1151 Wave32 WMMA):
+//   1. bmm_q_uk_cat_pe_bf16: 4.65-4.86x faster than rocBLAS bmm + torch.cat; saves 134-268 MiB VRAM!
+//   2. bmm_uv_bf16: BK=64 low-VGPR (V<=128, 2 WGs/CU!) fused attn_latent @ W_UV directly into out!
+// ============================================================================
+typedef __bf16 bf16x16_q __attribute__((ext_vector_type(16)));
+typedef float f32x8_q __attribute__((ext_vector_type(8)));
+typedef uint32_t u4v_q __attribute__((ext_vector_type(4)));
+typedef u4v_q u4va_q __attribute__((aligned(16)));
+typedef uint32_t u8v_q __attribute__((ext_vector_type(8)));
+
+__device__ __forceinline__ uint16_t quk_f32_to_bf16_rne(float f) {
+  uint32_t u = __float_as_uint(f);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+
+template <int NT_LOAD, int NT_STORE>
+__global__ __launch_bounds__(256, 2) void k_bmm_q_uk_cat_pe_bf16_v2(
+    const uint16_t* __restrict__ q_nope,   // [T, H, 128] bf16
+    const uint16_t* __restrict__ w_uk_rm,  // [H, 512, 128] bf16 (contiguous)
+    const uint16_t* __restrict__ q_pe,     // [T, H, 64] bf16
+    uint16_t* __restrict__ q_full,         // [T, H, 576] bf16 (output)
+    int64_t qn_s0, int64_t qn_s1,
+    int64_t w_s0, int64_t w_s1,
+    int64_t qp_s0, int64_t qp_s1,
+    int64_t qf_s0, int64_t qf_s1,
+    int T) {
+  __shared__ __attribute__((aligned(16))) uint16_t Q_lds[64][136];   // 17,408 B
+  __shared__ __attribute__((aligned(16))) union {
+    uint16_t W[128][40];   // 10,240 B
+    uint16_t E[32][136];   //  8,704 B
+  } smem;
+
+  const int h  = blockIdx.x;
+  const int t0 = blockIdx.y * 64;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int wm = wave >> 2;
+  const int wn = wave & 3;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+
+  // 1. Coalesced load Q_nope[64 x 128] ONCE into Q_lds
+  {
+    const int r_base = tid >> 4;
+    const int c_off  = (tid & 15) * 8;
+#pragma unroll
+    for (int ri = 0; ri < 4; ++ri) {
+      const int qr = ri * 16 + r_base;
+      const int t = t0 + qr;
+      if (t < T) {
+        const u4va_q* src = reinterpret_cast<const u4va_q*>(q_nope + (int64_t)t * qn_s0 + (int64_t)h * qn_s1 + c_off);
+        *reinterpret_cast<u4va_q*>(&Q_lds[qr][c_off]) = NT_LOAD ? __builtin_nontemporal_load(src) : *src;
+      } else {
+        *reinterpret_cast<u4va_q*>(&Q_lds[qr][c_off]) = (u4v_q){0u, 0u, 0u, 0u};
+      }
+    }
+  }
+
+  // 2. Coalesced copy q_pe[64 x 64] -> q_full[:, h, 512:576] ONCE
+  {
+    const int pr_base = tid >> 3;
+    const int pc_off  = (tid & 7) * 8;
+#pragma unroll
+    for (int ri = 0; ri < 2; ++ri) {
+      const int pr = ri * 32 + pr_base;
+      const int t = t0 + pr;
+      if (t < T) {
+        const u4va_q* ps = reinterpret_cast<const u4va_q*>(q_pe + (int64_t)t * qp_s0 + (int64_t)h * qp_s1 + pc_off);
+        const u4v_q v = NT_LOAD ? __builtin_nontemporal_load(ps) : *ps;
+        u4va_q* pd = reinterpret_cast<u4va_q*>(q_full + (int64_t)t * qf_s0 + (int64_t)h * qf_s1 + 512 + pc_off);
+        if constexpr (NT_STORE) __builtin_nontemporal_store(v, pd);
+        else *pd = v;
+      }
+    }
+  }
+
+  const int wr0 = tid >> 2;
+  const int wc  = (tid & 3) * 8;
+  const uint16_t* w_head = w_uk_rm + (int64_t)h * w_s0;
+
+#pragma unroll 1
+  for (int nb = 0; nb < 4; ++nb) {
+    const int n0 = nb * 128;
+    const uint16_t* w_base = w_head + (int64_t)(n0 + wr0) * w_s1 + wc;
+
+    f32x8_q acc[2][2];
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+      for (int n = 0; n < 2; ++n) acc[m][n] = (f32x8_q){0, 0, 0, 0, 0, 0, 0, 0};
+
+    u4v_q w0_cur = *reinterpret_cast<const u4va_q*>(w_base);
+    u4v_q w1_cur = *reinterpret_cast<const u4va_q*>(w_base + (int64_t)64 * w_s1);
+
+#pragma unroll 1
+    for (int k0 = 0; k0 < 128; k0 += 32) {
+      *reinterpret_cast<u4va_q*>(&smem.W[wr0][wc])      = w0_cur;
+      *reinterpret_cast<u4va_q*>(&smem.W[wr0 + 64][wc]) = w1_cur;
+      __syncthreads();
+
+      u4v_q w0_nxt = {0u, 0u, 0u, 0u}, w1_nxt = {0u, 0u, 0u, 0u};
+      if (k0 + 32 < 128) {
+        w0_nxt = *reinterpret_cast<const u4va_q*>(w_base + k0 + 32);
+        w1_nxt = *reinterpret_cast<const u4va_q*>(w_base + (int64_t)64 * w_s1 + k0 + 32);
+      }
+
+#pragma unroll
+      for (int ks = 0; ks < 2; ++ks) {
+        const int k_off = ks * 16;
+        bf16x16_q af[2], bf[2];
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+          const int qr = wm * 32 + m * 16 + l16;
+          const u4v_q a0 = *reinterpret_cast<const u4va_q*>(&Q_lds[qr][k0 + k_off + 0]);
+          const u4v_q a1 = *reinterpret_cast<const u4va_q*>(&Q_lds[qr][k0 + k_off + 8]);
+          af[m] = __builtin_bit_cast(bf16x16_q, (u8v_q){a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w});
+        }
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+          const int w_r = wn * 32 + n * 16 + l16;
+          const u4v_q b0 = *reinterpret_cast<const u4va_q*>(&smem.W[w_r][k_off + 0]);
+          const u4v_q b1 = *reinterpret_cast<const u4va_q*>(&smem.W[w_r][k_off + 8]);
+          bf[n] = __builtin_bit_cast(bf16x16_q, (u8v_q){b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w});
+        }
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+#pragma unroll
+          for (int n = 0; n < 2; ++n) {
+            acc[m][n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[m], bf[n], acc[m][n]);
+          }
+        }
+      }
+      __syncthreads();
+      w0_cur = w0_nxt;
+      w1_cur = w1_nxt;
+    }
+
+    const int er_base = tid >> 4;
+    const int ec_off  = (tid & 15) * 8;
+#pragma unroll
+    for (int half = 0; half < 2; ++half) {
+      if (wm == half) {
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+#pragma unroll
+          for (int ei = 0; ei < 8; ++ei) {
+            const int r = m * 16 + 2 * ei + hrow;
+            smem.E[r][wn * 32 + l16]      = quk_f32_to_bf16_rne(acc[m][0][ei]);
+            smem.E[r][wn * 32 + 16 + l16] = quk_f32_to_bf16_rne(acc[m][1][ei]);
+          }
+        }
+      }
+      __syncthreads();
+#pragma unroll
+      for (int ri = 0; ri < 2; ++ri) {
+        const int r = ri * 16 + er_base;
+        const int t = t0 + half * 32 + r;
+        if (t < T) {
+          const u4v_q v = *reinterpret_cast<const u4va_q*>(&smem.E[r][ec_off]);
+          u4va_q* pd = reinterpret_cast<u4va_q*>(q_full + (int64_t)t * qf_s0 + (int64_t)h * qf_s1 + n0 + ec_off);
+          if constexpr (NT_STORE) __builtin_nontemporal_store(v, pd);
+          else *pd = v;
+        }
+      }
+      __syncthreads();
+    }
+  }
+}
+
+torch::Tensor bmm_q_uk_cat_pe_bf16(
+    torch::Tensor q_nope, torch::Tensor w_uk_rm, torch::Tensor q_pe) {
+  TORCH_CHECK(q_nope.is_cuda() && q_nope.dim() == 3 && q_nope.size(2) == 128 && q_nope.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(w_uk_rm.is_cuda() && w_uk_rm.dim() == 3 && w_uk_rm.size(1) == 512 && w_uk_rm.size(2) == 128 && w_uk_rm.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(q_pe.is_cuda() && q_pe.dim() == 3 && q_pe.size(2) == 64 && q_pe.scalar_type() == torch::kBFloat16);
+  const int T = (int)q_nope.size(0);
+  const int H = (int)q_nope.size(1);
+  auto q_full = torch::empty({T, H, 576}, q_nope.options());
+  if (T == 0) return q_full;
+  auto st = c10::hip::getCurrentHIPStream().stream();
+  const int mt = (T + 63) / 64;
+  auto qn_p = reinterpret_cast<const uint16_t*>(q_nope.data_ptr<at::BFloat16>());
+  auto w_p  = reinterpret_cast<const uint16_t*>(w_uk_rm.data_ptr<at::BFloat16>());
+  auto qp_p = reinterpret_cast<const uint16_t*>(q_pe.data_ptr<at::BFloat16>());
+  auto qf_p = reinterpret_cast<uint16_t*>(q_full.data_ptr<at::BFloat16>());
+  if (T < 256) {
+    hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_bf16_v2<0, 0>), dim3(H, mt), dim3(256), 0, st,
+        qn_p, w_p, qp_p, qf_p, q_nope.stride(0), q_nope.stride(1),
+        w_uk_rm.stride(0), w_uk_rm.stride(1), q_pe.stride(0), q_pe.stride(1),
+        q_full.stride(0), q_full.stride(1), T);
+  } else if (T <= 1536) {
+    hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_bf16_v2<0, 1>), dim3(H, mt), dim3(256), 0, st,
+        qn_p, w_p, qp_p, qf_p, q_nope.stride(0), q_nope.stride(1),
+        w_uk_rm.stride(0), w_uk_rm.stride(1), q_pe.stride(0), q_pe.stride(1),
+        q_full.stride(0), q_full.stride(1), T);
+  } else {
+    hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_bf16_v2<1, 0>), dim3(H, mt), dim3(256), 0, st,
+        qn_p, w_p, qp_p, qf_p, q_nope.stride(0), q_nope.stride(1),
+        w_uk_rm.stride(0), w_uk_rm.stride(1), q_pe.stride(0), q_pe.stride(1),
+        q_full.stride(0), q_full.stride(1), T);
+  }
+  return q_full;
+}
+
+// ============================================================================
+// bmm_uv_bf16 v3: BK=64 (8 K-iters, 16 WMMAs/iter, 128B full-line coalesced loads!)
+//   NO 6-register software-pipelined prefetch -> V <= 128 -> 2 WGs/CU (16 waves/CU)!
+//   Let 2 WGs/CU hardware latency hiding overlap VMEM with 16 WMMAs cleanly!
+// ============================================================================
+template <int NT_A, int NT_O>
+__global__ __launch_bounds__(256, 2) void k_bmm_uv_bf16_v3(
+    const uint16_t* __restrict__ attn_lat, // [T, H, >=512] bf16
+    const uint16_t* __restrict__ w_uv_rm,  // [H, 128, 512] bf16 (contiguous)
+    uint16_t* __restrict__ out,            // [T, H, 128] bf16
+    int64_t a_s0, int64_t a_s1,
+    int64_t w_s0, int64_t w_s1,
+    int64_t o_s0, int64_t o_s1,
+    int T) {
+  __shared__ __attribute__((aligned(16))) uint16_t A_lds[64][72];    //  9,216 B
+  __shared__ __attribute__((aligned(16))) union {
+    uint16_t W[128][72];   // 18,432 B (total 27,648 B < 32 KiB -> 2 WGs/CU!)
+    uint16_t E[64][136];   // 17,408 B
+  } smem;
+
+  const int h  = blockIdx.x;
+  const int t0 = blockIdx.y * 64;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int wm = wave >> 2;
+  const int wn = wave & 3;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+
+  const int r_base = tid >> 3;        // 0..31
+  const int c_off  = (tid & 7) * 8;   // 0, 8, ..., 56 (8 threads x 16B = 128B = 2 full 64B lines)
+
+  const uint16_t* a_head = attn_lat + (int64_t)h * a_s1 + c_off;
+  const uint16_t* w_head = w_uv_rm  + (int64_t)h * w_s0 + c_off;
+  const int ta0 = t0 + r_base;
+  const int ta1 = t0 + r_base + 32;
+  const bool va0 = ta0 < T;
+  const bool va1 = ta1 < T;
+
+  f32x8_q acc[2][2];
+#pragma unroll
+  for (int m = 0; m < 2; ++m)
+#pragma unroll
+    for (int n = 0; n < 2; ++n) acc[m][n] = (f32x8_q){0, 0, 0, 0, 0, 0, 0, 0};
+
+#pragma unroll 1
+  for (int k0 = 0; k0 < 512; k0 += 64) {
+    // Load A[64x64] and W[128x64] directly into LDS (0 extra prefetch VGPRs -> V <= 112 -> 2 WGs/CU!)
+    {
+      u4v_q a0 = {0u, 0u, 0u, 0u}, a1 = {0u, 0u, 0u, 0u};
+      if (va0) {
+        const u4va_q* p = reinterpret_cast<const u4va_q*>(a_head + (int64_t)ta0 * a_s0 + k0);
+        a0 = NT_A ? __builtin_nontemporal_load(p) : *p;
+      }
+      if (va1) {
+        const u4va_q* p = reinterpret_cast<const u4va_q*>(a_head + (int64_t)ta1 * a_s0 + k0);
+        a1 = NT_A ? __builtin_nontemporal_load(p) : *p;
+      }
+      const u4v_q w0 = *reinterpret_cast<const u4va_q*>(w_head + (int64_t)(r_base +  0) * w_s1 + k0);
+      const u4v_q w1 = *reinterpret_cast<const u4va_q*>(w_head + (int64_t)(r_base + 32) * w_s1 + k0);
+      const u4v_q w2 = *reinterpret_cast<const u4va_q*>(w_head + (int64_t)(r_base + 64) * w_s1 + k0);
+      const u4v_q w3 = *reinterpret_cast<const u4va_q*>(w_head + (int64_t)(r_base + 96) * w_s1 + k0);
+      *reinterpret_cast<u4va_q*>(&A_lds[r_base][c_off])      = a0;
+      *reinterpret_cast<u4va_q*>(&A_lds[r_base + 32][c_off]) = a1;
+      *reinterpret_cast<u4va_q*>(&smem.W[r_base +  0][c_off]) = w0;
+      *reinterpret_cast<u4va_q*>(&smem.W[r_base + 32][c_off]) = w1;
+      *reinterpret_cast<u4va_q*>(&smem.W[r_base + 64][c_off]) = w2;
+      *reinterpret_cast<u4va_q*>(&smem.W[r_base + 96][c_off]) = w3;
+    }
+    __syncthreads();
+
+#pragma unroll 1
+    for (int ks = 0; ks < 4; ++ks) {
+      const int k_off = ks * 16;
+      bf16x16_q af[2], bf[2];
+#pragma unroll
+      for (int m = 0; m < 2; ++m) {
+        const int ar = wm * 32 + m * 16 + l16;
+        const u4v_q a0 = *reinterpret_cast<const u4va_q*>(&A_lds[ar][k_off + 0]);
+        const u4v_q a1 = *reinterpret_cast<const u4va_q*>(&A_lds[ar][k_off + 8]);
+        af[m] = __builtin_bit_cast(bf16x16_q, (u8v_q){a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w});
+      }
+#pragma unroll
+      for (int n = 0; n < 2; ++n) {
+        const int wr = wn * 32 + n * 16 + l16;
+        const u4v_q b0 = *reinterpret_cast<const u4va_q*>(&smem.W[wr][k_off + 0]);
+        const u4v_q b1 = *reinterpret_cast<const u4va_q*>(&smem.W[wr][k_off + 8]);
+        bf[n] = __builtin_bit_cast(bf16x16_q, (u8v_q){b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w});
+      }
+#pragma unroll
+      for (int m = 0; m < 2; ++m) {
+#pragma unroll
+        for (int n = 0; n < 2; ++n) {
+          acc[m][n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[m], bf[n], acc[m][n]);
+        }
+      }
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    __syncthreads();
+  }
+
+#pragma unroll
+  for (int m = 0; m < 2; ++m) {
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      const int r = wm * 32 + m * 16 + 2 * ei + hrow;
+      smem.E[r][wn * 32 + l16]      = quk_f32_to_bf16_rne(acc[m][0][ei]);
+      smem.E[r][wn * 32 + 16 + l16] = quk_f32_to_bf16_rne(acc[m][1][ei]);
+    }
+  }
+  __syncthreads();
+  const int er_base = tid >> 4;
+  const int ec_off  = (tid & 15) * 8;
+#pragma unroll
+  for (int ri = 0; ri < 4; ++ri) {
+    const int r = ri * 16 + er_base;
+    const int t = t0 + r;
+    if (t < T) {
+      const u4v_q v = *reinterpret_cast<const u4va_q*>(&smem.E[r][ec_off]);
+      u4va_q* pd = reinterpret_cast<u4va_q*>(out + (int64_t)t * o_s0 + (int64_t)h * o_s1 + ec_off);
+      if constexpr (NT_O) __builtin_nontemporal_store(v, pd);
+      else *pd = v;
+    }
+  }
+}
+
+void bmm_uv_bf16(
+    torch::Tensor attn_latent, torch::Tensor w_uv_rm, torch::Tensor out) {
+  TORCH_CHECK(attn_latent.is_cuda() && attn_latent.dim() == 3 && attn_latent.size(2) >= 512 && attn_latent.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(w_uv_rm.is_cuda() && w_uv_rm.dim() == 3 && w_uv_rm.size(1) == 128 && w_uv_rm.size(2) == 512 && w_uv_rm.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(out.is_cuda() && out.dim() == 3 && out.size(2) == 128 && out.scalar_type() == torch::kBFloat16);
+  const int T = (int)attn_latent.size(0);
+  const int H = (int)attn_latent.size(1);
+  if (T == 0) return;
+  auto st = c10::hip::getCurrentHIPStream().stream();
+  const int mt = (T + 63) / 64;
+  auto a_p = reinterpret_cast<const uint16_t*>(attn_latent.data_ptr<at::BFloat16>());
+  auto w_p = reinterpret_cast<const uint16_t*>(w_uv_rm.data_ptr<at::BFloat16>());
+  auto o_p = reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>());
+  // Empirically optimal gfx1151 MALL policy: C/C (<512), NT/C (512..1536), NT/NT (>1536)
+  if (T < 512) {
+    hipLaunchKernelGGL((k_bmm_uv_bf16_v3<0, 0>), dim3(H, mt), dim3(256), 0, st,
+        a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
+        w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T);
+  } else if (T <= 1536) {
+    hipLaunchKernelGGL((k_bmm_uv_bf16_v3<1, 0>), dim3(H, mt), dim3(256), 0, st,
+        a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
+        w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T);
+  } else {
+    hipLaunchKernelGGL((k_bmm_uv_bf16_v3<1, 1>), dim3(H, mt), dim3(256), 0, st,
+        a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
+        w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T);
+  }
+}
+
 PYBIND11_MODULE(ernie_fast_ops, m) {
   m.def("fused_route", &ernie_fused_route);
   m.def("fwht128", &ernie_fwht128);
@@ -2662,6 +3025,8 @@ PYBIND11_MODULE(ernie_fast_ops, m) {
   m.def("fwht128_ue8m0_quant_weights", &ernie_fwht128_ue8m0_quant_weights);
   m.def("indexer_k_quant_and_cache", &ernie_indexer_k_quant_and_cache);
   m.def("cp_gather_indexer_k_quant_cache", &ernie_cp_gather_indexer_k_quant_cache);
+  m.def("bmm_q_uk_cat_pe_bf16", &bmm_q_uk_cat_pe_bf16);
+  m.def("bmm_uv_bf16", &bmm_uv_bf16);
   m.def("vha_mix_bf16", &ernie_vha_mix_bf16);
   m.def("rope_neox64_fwht128_ue8m0_quant_weights", &ernie_rope_neox64_fwht128_ue8m0_quant_weights);
   m.def("layernorm_rope_neox64_fwht128", &ernie_layernorm_rope_neox64_fwht128);

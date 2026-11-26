@@ -1097,17 +1097,30 @@ def _get_k5sp_cfg() -> tuple[int, bool, int, int]:
 def _use_k5_unsplit_gemv(M: int, mt: int) -> bool:
     """Empirically optimal gfx1151 crossover between K=5 unsplit GEMV and WMMA.
     - M == 1: gemv_k5_unsplit_epi beats htr_ops.gemv_epi on small (mt<=128, 1.53x) and lm_head (mt>=4096, 236 GB/s).
-    - 2 <= M <= 8: gemv_k5_unsplit_epi wins across all shapes.
-    - 9 <= M <= 16: 2-subpass gemv_k5_unsplit_epi beats WMMA on mt<=256 (1.32-1.63x) and lm_head (1.05x),
-      while 256 < mt < 4096 (q_b/kv_b) saturates 40 CUs faster with WMMA.
+    - 2 <= M <= 16: with optimal ns=8/16 (_k5_unsplit_nsplit), gemv_k5_unsplit_epi beats WMMA across ALL
+      ERNIE-5.5 shapes (1.9-2.3x faster at T=9..16, saving -20.5 ms/step on B=2 concurrent decode!).
     """
     if M == 1:
         return mt <= 128 or mt >= 4096
-    if 2 <= M <= 8:
+    if 2 <= M <= 16:
         return True
-    if 9 <= M <= 16:
-        return mt <= 256 or mt >= 4096
     return False
+
+
+def _k5_unsplit_nsplit(mt: int, nt: int, M: int) -> int:
+    """Empirically optimal K-split for gemv_k5_unsplit_epi on gfx1151 (40 CUs, 32 MiB MALL).
+    Avoids ns=24/32 partial-buffer & atomic-barrier thrashing (saves -7.75 ms/step @ T=6,
+    -18.8 ms/step @ T=12, -27.4 ms/step @ T=16 across all ERNIE-5.5 dense K=5 projections!).
+    """
+    if nt < 16:
+        return max(1, nt)
+    if M >= 8:
+        if mt == 128 and nt >= 320 and M >= 12:
+            return 16
+        return 8
+    if mt <= 128 or nt <= 96 or (mt > 1792 and M >= 4):
+        return 8
+    return 16
 
 def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
     """Execute an ERNIE-5.5 K=5 linear (unsplit or repacked) using pre-computed (xt, xs, tok)."""
@@ -1130,9 +1143,7 @@ def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
             and _use_k5_unsplit_gemv(M, mt)
         ):
             cnt = htr_ops.counters(xt.device)
-            ns = htr_ops.nsplit_for(mt, nt, min(M, 8))
-            if nt >= 32:
-                ns = min(32, max(8, ((ns + 7) // 8) * 8))
+            ns = _k5_unsplit_nsplit(mt, nt, M)
             _e8 = int(htr_ops.EPI8 and htr_ops._ns_eff(mt, nt, ns) % 8 == 0)
             return sp_ext.gemv_k5_unsplit_epi(
                 qweight, xt, xs, tok, scales, float(htr_ops.CB), sv, bias, cnt, ns, _e8
