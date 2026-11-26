@@ -1,7 +1,7 @@
-# HTR v0.2.6 optimized serving
+# HTR v0.2.7 optimized serving
 
 This serving update keeps the model weights, tokenizer, KV formats, and native
-`vllm serve` interface unchanged. All **v0.2.6** optimizations are enabled by
+`vllm serve` interface unchanged. All **v0.2.7** optimizations (Qwen3.8 + unified ERNIE-5.5) are enabled by
 default via `runtime-env.json` with zero extra `-e` flags required:
 
 - **Zero-Triton-JIT hot path (`20` new zero-spill AOT `gfx1151` Wave32 HIP kernels):**
@@ -20,7 +20,7 @@ default via `runtime-env.json` with zero extra `-e` flags required:
   fused GDN MTP spec decode, native QSA decode union (BF16 / INT8 / INT4 KV),
   `ple_gather_v25`, native Q38 draft filter, and async PLE defaults.
 
-See the [v0.2.6 release notes](../releases/v0.2.6/README.md) for exact verified
+See the [v0.2.7 release notes](../releases/v0.2.7/README.md) for exact verified
 zero-overlay E2E results and INT8 WMMA parity data.
 
 ## Native controls
@@ -30,7 +30,7 @@ sampling, context, KV budget, concurrency, and speculation flags remain native.
 Pull the qualified image first (no registry login required):
 
 ```sh
-docker pull ghcr.io/hawgauto/vllm-htr@sha256:dc11916549c534b207bb45048fe2f9b2177117995931f5aff5b384b274ea0fe8
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:ac7d31a9fcf22da19c412f3d2db2192d163a2e0a06d9a40de7f4697542186e5b
 ```
 
 Then start it:
@@ -38,7 +38,7 @@ Then start it:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:dc11916549c534b207bb45048fe2f9b2177117995931f5aff5b384b274ea0fe8
+IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:ac7d31a9fcf22da19c412f3d2db2192d163a2e0a06d9a40de7f4697542186e5b
 MODEL=${MODEL:-"$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"}
 WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v026"}
 mkdir -p "$WORKSPACE"
@@ -81,8 +81,8 @@ Optional environment overrides go before the image name:
 
 ## Source build
 
-`v0.2.6` builds cleanly on top of the pinned `ghcr.io/hawgauto/vllm-htr:v0.2.5`
-base image via `htr_runtime/Dockerfile.v0.2.6` and `htr_runtime/install_v026.py`,
+`v0.2.6` builds cleanly on top of the pinned `ghcr.io/hawgauto/vllm-htr:v0.2.6`
+base image via `htr_runtime/Dockerfile.v0.2.7` and `htr_runtime/install_v027.py`,
 verifying every Python file and native `.so`/`.hsaco` SHA-256 against
 `htr_runtime/V026-NATIVE-MANIFEST.json` via `htr_native_policy.verify_installation()`
 at image build time.
@@ -90,6 +90,6 @@ at image build time.
 ```sh
 git clone https://github.com/HawgAuto/vllm-htr.git
 cd vllm-htr
-git checkout htr-v0.2.6
-docker build -f htr_runtime/Dockerfile.v0.2.6 -t vllm-htr:v0.2.6 .
+git checkout htr-v0.2.7
+docker build -f htr_runtime/Dockerfile.v0.2.7 -t vllm-htr:v0.2.7 .
 ```

@@ -7,6 +7,7 @@
 - **Verified Qwen3.8 gains vs `v0.2.6`:** Empty-workspace cold boot **`2.32×`** (`388.2 s → 167.3 s`), KV8 config-change boot **`1.52×`** (`309.8 s → 204.3 s`), BF16 `c=4` stoch **`+10.8%` agg / `+12.6%` sum** (`69.96 / 107.49 tok/s`), KV8 `c=1` greedy **`+7.3%`** (`48.45 tok/s`), KV8 13K cold prefill **`1.18×`** (`1,077.8 tok/s`) & 13K warm decode **`+21.5%`** (`54.15 tok/s`), `0` mid-inference Triton JITs.
 - **Verified ERNIE-5.5 DSpark-5 (128 GB Strix Halo, 32K ctx):** Boots cleanly in **`85.1 s`** (`107.0 GiB` model, `34,131` KV tokens, `6.1 GiB` host RAM free), `4.61` mean acceptance (`72.1%`), **`60.50 tok/s`** primes / **`39.16 tok/s`** chat code / **`31.04 tok/s`** chat prose on both `/v1/completions` and `/v1/chat/completions`.
 - **Details:** [htr_runtime/releases/v0.2.7/README.md](htr_runtime/releases/v0.2.7/README.md)
+- **Verified ERNIE-5.5 1M/2M KV on 128 GB Strix Halo (`kho=off`):** 1M Pure FP8 (`1,058,592` tok, `5.40 GiB`, `1.01×` @ 1M, `57.6 tok/s` primes, 8K Needle PASS) & 2M+ NVFP4 Pool (`2,118,842` tok, `6.55 GiB`, `2.02×` @ 1M, `37.6–39.5 tok/s` 2-way parallel, 8K Needle PASS).
 
 ## v0.2.6 — 2× faster long-context prefill, zero Triton JIT & RDNA 3.5 ISA upgrades
 

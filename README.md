@@ -1,4 +1,56 @@
-# vLLM HTR — v0.2.6
+# vLLM HTR — v0.2.7
+
+Unified native HTR serving for **AMD Strix Halo / `gfx1151` (Radeon 8060S, 128 GB unified memory)** — serving **both** [**Qwen3.8-Flash-Next-HTR**](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) (**2.32× faster cold boot**, up to **+21.5% faster decode**) and [**ERNIE-5.5-Flash-Preview-HTR**](https://huggingface.co/hstolte/ERNIE-5.5-Flash-Preview-HTR) (**280B MoE + DSpark-5**, **472 native Wave32 HIP kernels**, **1M Pure FP8** & **2M+ NVFP4 `2.02×` KV pools**, up to **59–60 tok/s**) from a single zero-overlay container image built for models quantized with **[HTR v0.2.0 (Halo Trellis)](https://github.com/HawgAuto/HTR/tree/v0.2.0)**.
+
+[Run v0.2.7](htr_runtime/docs/optimized-serving.md) · [ERNIE-5.5-HTR Model](https://huggingface.co/hstolte/ERNIE-5.5-Flash-Preview-HTR) · [Qwen3.8-HTR Model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [HTR v0.2.0 Quantizer](https://github.com/HawgAuto/HTR/tree/v0.2.0) · [Release Notes](htr_runtime/releases/v0.2.7/README.md) · [Release History](RELEASES.md)
+
+```sh
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:ac7d31a9fcf22da19c412f3d2db2192d163a2e0a06d9a40de7f4697542186e5b
+```
+
+Version alias: `ghcr.io/hawgauto/vllm-htr:v0.2.7`. Standard `vllm serve` auto-detects Qwen3.8 vs ERNIE-5.5 and enables every native `gfx1151` Wave32 HIP optimization automatically with zero overlays.
+
+## What's new in v0.2.7
+
+### Unified ERNIE-5.5-Flash-Preview-HTR (280B MoE) + DSpark-5 on 128 GB Strix Halo
+- **472 native `gfx1151` Wave32 HIP kernels** across 8 `.so` libraries (`0` VGPR spills, `0` SGPR spills, `0` integer divOps), strictly auto-gated from Qwen3.8 (`_serving_ernie5`).
+- **Native Wave32 HIP quantized KV caches:**
+  - **1M Pure FP8 (`--kv-cache-dtype fp8`, `5.40 GiB` KV):** **`1,058,592` GPU KV tokens (`1.01×` at 1M)**, `57.6 tok/s` primes, `31.7 tok/s` code, 8K Needle-in-a-Haystack **PASS** (`30.3 s`), DSpark-5 `3.74` mean accept, `2.1 GiB` host RAM free (`cos = 0.99966` vs BF16).
+  - **2M+ NVFP4 Pool (`--kv-cache-dtype nvfp4_ds_mla` + MXFP4 Indexer, `6.55 GiB` KV, `--max-num-seqs 2`):** **`2,118,842` GPU KV tokens (`2.02×` concurrency at 1M)**, `37.6–39.5 tok/s` 2-way parallel, `43.5 tok/s` single, 8K Needle-in-a-Haystack **PASS** (`27.5 s`), DSpark-5 `3.63` mean accept (`cos = 0.99550` DSA / `0.99946` MXFP4 Indexer, **1.66× faster** indexer decode).
+  - **1M NVFP4 Comfort (`3.40 GiB` KV):** **`1,099,854` tokens (`1.05×` at 1M)**, `59.2 tok/s` primes, `37.1 tok/s` code, ~4 GiB free host RAM.
+- **Long-context allocator & workspace fixes:** Eliminated a `4,096 MiB` upstream `_max_decode_logits_rows` workspace blowup (`4,096 → 132 MiB`), fixed `SlidingWindowSpec` KV anchor inflation (`293 → 158 KiB/block`), added per-shard `POSIX_FADV_DONTNEED` streaming weight load, added `empty_cache()` after `profile_run()` in the `--kv-cache-memory-bytes` path, and bitwise-exact `cos_sin_cache` sharing.
+
+### Qwen3.8-Flash-Next-HTR — Fast Boot & Decode Upgrades
+- **2.32× faster cold empty-workspace boot:** `388.2 s → 167.3 s` (**−221 s**), warm BF16 boot **1.24× faster** (`114.7 s → 92.6 s`), and KV8 config-change boot **1.52× faster** (`309.8 s → 204.3 s`).
+- **Faster decode across BF16 and INT8 KV (`int8_per_token_head`, MTP-3):** KV8 greedy `c=1` **`45.16 → 48.45 tok/s` (+7.3%)**, KV8 13K warm decode **`44.55 → 54.15 tok/s` (+21.5%)**, 13K cold prefill **`14.30 → 12.08 s` (1.18×)**, BF16 `c=4` stochastic **`63.15 / 95.48 → 69.96 / 107.49 tok/s` (+10.8% / +12.6%)**, **`0`** mid-inference Triton JIT warnings.
+
+### Verified Zero-Overlay E2E Gates (AMD Strix Halo `gfx1151`, 128 GB)
+
+#### ERNIE-5.5-Flash-Preview-HTR + DSpark-5 (`1M` Native Context)
+
+| Serving Profile | KV Format | KV Size | GPU KV Tokens | Concurrency @ 1M | Throughput | 8K Needle | DSpark-5 Mean Accept |
+|---|---|---:|---:|---:|---|---:|---:|
+| **1M Pure FP8** | `fp8` | 5.40 GiB | **1,058,592** | **1.01×** | **57.6 tok/s** primes · **31.7 tok/s** code | **PASS** (`30.3 s`) | **3.74** |
+| **2M+ NVFP4 Pool** | `nvfp4_ds_mla` + MXFP4 | 6.55 GiB | **2,118,842** | **2.02×** | **37.6–39.5 tok/s** 2-way · **43.5 tok/s** single | **PASS** (`27.5 s`) | **3.63** |
+| **1M NVFP4 Comfort** | `nvfp4_ds_mla` + MXFP4 | 3.40 GiB | **1,099,854** | **1.05×** | **59.2 tok/s** primes · **37.1 tok/s** code | **PASS** | **4.86** |
+| **128K Pure FP8** | `fp8` | 1.30 GiB | **162,429** | — | **60.5 tok/s** primes · **39.2 tok/s** code | **PASS** | **4.93** |
+
+#### Qwen3.8-Flash-Next-HTR (`int8_per_token_head`, MTP-3, `seqs=16`)
+
+| Workload | `v0.2.6` KV8 | **`v0.2.7` KV8 Zero-Overlay** | Delta |
+|---|---:|---:|---:|
+| **Config-change boot** | `309.8 s` | **`204.3 s`** | **1.52× faster (−105.5 s)** |
+| **Greedy `c=1`** | `45.16 tok/s` | **`48.45 tok/s`** | **+7.3%** |
+| **13K cold prefill / decode** | `14.30 s (910.5)` / `54.50` | **`12.08 s (1,077.8)` / `60.11`** | **1.18× / +10.3%** |
+| **13K warm prefill / decode** | `11.44 s (1,137.7)` / `44.55` | **`11.69 s (1,113.6)` / `54.15`** | **−2.1% / +21.5%** |
+| **`c=4 × 4K` (`wall` / `sum_dec`)** | `21.77 s` / `61.65 tok/s` | **`21.46 s` / `62.82 tok/s`** | **1.01× / +1.9%** |
+| **`c=8` (`wall` / `agg` / `sum_dec`)** | `15.51 s` / `66.01` / `90.39` | **`15.23 s` / `67.25` / `91.20`** | **1.02× / +1.9% / +0.9%** |
+
+> **Strix Halo 128 GB Host Tuning (Ubuntu HWE Kernel 7.0+):** Ubuntu 7.0+ enables `CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y`, silently reserving ~9 GiB as `MIGRATE_CMA` (unusable by ROCm/TTM while `CmaTotal` reports `0 kB`). Add `kho=off` to `GRUB_CMDLINE_LINUX_DEFAULT`, run `sudo update-grub`, and reboot (and optionally lower `user.slice` `MemoryMin=512M`) to unlock the full ~118 GiB GPU unified-memory ceiling for ERNIE-5.5 1M Pure FP8 and 2M+ NVFP4.
+
+Full manifests & notes: [v0.2.7 README](htr_runtime/releases/v0.2.7/README.md) · [V027-NATIVE-MANIFEST.json](htr_runtime/V027-NATIVE-MANIFEST.json) · [ERNIE55-MANIFEST.json](htr_runtime/ERNIE55-MANIFEST.json) · [GitHub Release `htr-v0.2.7`](https://github.com/HawgAuto/vllm-htr/releases/tag/htr-v0.2.7).
+
+## Preserved v0.2.6 release
 
 Native HTR serving for **AMD Strix Halo / gfx1151** — now with **2× faster long-context prefill**, **zero mid-inference Triton JIT pauses**, and **RDNA 3.5 ISA decode upgrades**. All model weights, tokenizers, configs, and sampling defaults are unchanged — just pull the new image.
 
