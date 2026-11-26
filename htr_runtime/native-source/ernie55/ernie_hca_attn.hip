@@ -1506,14 +1506,14 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
     __attribute__((aligned(16))) uint16_t KV_lds[16][HCA_STRIDE];
     __attribute__((aligned(16))) uint16_t VT_lds_g[16][32 * HCA_VT_STRIDE + 2];
   } u_kv;
-  __shared__ float S_part[2][3][16][16];                                  // 6,144 B
+  __shared__ float S_part[2][4][16][16];                                  // 8,192 B (4-way parallel softmax!)
   __shared__ __attribute__((aligned(16))) uint16_t P_lds[2][16][16];      // 1,024 B
   __shared__ float s_alpha[32];
   __shared__ float s_m[32];
   __shared__ float s_l[32];
 
-  const int t = blockIdx.x;
-  const int hg32 = blockIdx.y;
+  const int hg32 = blockIdx.x;
+  const int t = blockIdx.y;
   const int tid = threadIdx.x;               // 0..255
   const int wave = tid >> 5;                 // 0..7
   const int wh = wave >> 2;                  // 0..1 (head group of 16)
@@ -1604,22 +1604,42 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
       k0_c = k0_n; k1_c = k1_n;
     }
 
-    if (wd > 0) {
 #pragma unroll
-      for (int ei = 0; ei < 8; ++ei) S_part[wh][wd - 1][2 * ei + hrow][l16] = s_acc[ei];
-    }
+    for (int ei = 0; ei < 8; ++ei) S_part[wh][wd][2 * ei + hrow][l16] = s_acc[ei];
     __syncthreads();
 
-    // 3. Online softmax (wd == 0) + write u_kv.VT_lds (KV_lds is now dead!)
-    if (wd == 0) {
+    // 3a. Write u_kv.VT_lds FIRST (KV_lds is dead!) then IMMEDIATELY prefetch NEXT tile into v_hold
+    //     so DRAM/L2 gather overlaps with BOTH 4-way parallel softmax AND all 8 P@V WMMAs!
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const int col0 = c * 128 + sub_ld * 8;
+      const uint32_t w0 = v_hold[c].x, w1 = v_hold[c].y, w2 = v_hold[c].z, w3 = v_hold[c].w;
+      uint16_t* vtg = &u_kv.VT_lds_g[col0 >> 5][(col0 & 31) * HCA_VT_STRIDE + kr_ld];
+      vtg[0 * HCA_VT_STRIDE] = (uint16_t)(w0 & 0xFFFFu);
+      vtg[1 * HCA_VT_STRIDE] = (uint16_t)(w0 >> 16);
+      vtg[2 * HCA_VT_STRIDE] = (uint16_t)(w1 & 0xFFFFu);
+      vtg[3 * HCA_VT_STRIDE] = (uint16_t)(w1 >> 16);
+      vtg[4 * HCA_VT_STRIDE] = (uint16_t)(w2 & 0xFFFFu);
+      vtg[5 * HCA_VT_STRIDE] = (uint16_t)(w2 >> 16);
+      vtg[6 * HCA_VT_STRIDE] = (uint16_t)(w3 & 0xFFFFu);
+      vtg[7 * HCA_VT_STRIDE] = (uint16_t)(w3 >> 16);
+    }
+    if (k0 + 16 < klen) {
+      load_kv_tile(k0 + 16, v_hold);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    // 3b. 4-way parallel online softmax across ALL 4 wd waves (2 ei/wave instead of 8 on wd==0!)
+    {
       const int kp = k0 + l16;
       const int32_t sl_v = (kp < klen) ? idx_row[kp] : -1;
       const bool vld = (sl_v >= 0 && sl_v < num_kv_rows);
 #pragma unroll
-      for (int ei = 0; ei < 8; ++ei) {
+      for (int e_sub = 0; e_sub < 2; ++e_sub) {
+        const int ei = wd * 2 + e_sub;
         const int hm = 2 * ei + hrow;
         const int h_loc = wh * 16 + hm;
-        float sc = s_acc[ei] + S_part[wh][0][hm][l16] + S_part[wh][1][hm][l16] + S_part[wh][2][hm][l16];
+        float sc = S_part[wh][0][hm][l16] + S_part[wh][1][hm][l16] + S_part[wh][2][hm][l16] + S_part[wh][3][hm][l16];
         sc = (vld && (h0 + hm) < num_heads) ? (sc * scale) : NEG_INF;
         const float bmax = halfwave_max16(sc);
         const float mold = s_m[h_loc];
@@ -1635,26 +1655,7 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
         }
       }
     }
-#pragma unroll
-    for (int c = 0; c < 4; ++c) {
-      const int col0 = c * 128 + sub_ld * 8;
-      const uint32_t w0 = v_hold[c].x, w1 = v_hold[c].y, w2 = v_hold[c].z, w3 = v_hold[c].w;
-      uint16_t* vtg = &u_kv.VT_lds_g[col0 >> 5][(col0 & 31) * HCA_VT_STRIDE + kr_ld];
-      vtg[0 * HCA_VT_STRIDE] = (uint16_t)(w0 & 0xFFFFu);
-      vtg[1 * HCA_VT_STRIDE] = (uint16_t)(w0 >> 16);
-      vtg[2 * HCA_VT_STRIDE] = (uint16_t)(w1 & 0xFFFFu);
-      vtg[3 * HCA_VT_STRIDE] = (uint16_t)(w1 >> 16);
-      vtg[4 * HCA_VT_STRIDE] = (uint16_t)(w2 & 0xFFFFu);
-      vtg[5 * HCA_VT_STRIDE] = (uint16_t)(w2 >> 16);
-      vtg[6 * HCA_VT_STRIDE] = (uint16_t)(w3 & 0xFFFFu);
-      vtg[7 * HCA_VT_STRIDE] = (uint16_t)(w3 >> 16);
-    }
     __syncthreads();
-
-    // 4. Prefetch NEXT tile's KV into v_hold[4] BEFORE P@V WMMAs (overlaps DRAM/L2 with 8 WMMAs, 0 extra VGPRs!)
-    if (k0 + 16 < klen) {
-      load_kv_tile(k0 + 16, v_hold);
-    }
 
     float al[8];
 #pragma unroll
@@ -1768,7 +1769,7 @@ void ernie_hca_prefill(
                        sp, nullptr, nullptr, op, out.stride(0), out.stride(1), 0, H);
   } else {
     hipLaunchKernelGGL(
-        k_ernie_hca_prefill_qreg_pipe_v28, dim3(T, (H + 31) / 32), dim3(256), 0, st,
+        k_ernie_hca_prefill_qreg_pipe_v28, dim3((H + 31) / 32, T), dim3(256), 0, st,
         qp, kvp, idx_2d.data_ptr<int32_t>(), tl_p, sp, op,
         q.stride(0), q.stride(1), kv_2d.stride(0), idx_2d.stride(0),
         out.stride(0), out.stride(1), H, N_kv, K_max, (float)scale);
