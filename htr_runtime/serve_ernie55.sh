@@ -8,7 +8,7 @@
 #   MODE=target   ./serve_ernie55.sh   # 43L target-only (batch/long-ctx serving)
 set -euo pipefail
 
-IMAGE="${IMAGE:-ghcr.io/hawgauto/vllm-htr:v0.2.7}"
+IMAGE="${IMAGE:-ghcr.io/hawgauto/vllm-htr:v0.2.8}"
 MODEL="${MODEL:-/home/hawg/models/ERNIE-5.5-Flash-Preview-HTR}"
 WORKSPACE="${WORKSPACE:-/home/hawg/vllm-htr-ernie55-workspace}"
 MODE="${MODE:-dspark5}"
@@ -16,7 +16,7 @@ PORT="${PORT:-8000}"
 MEM_LIMIT="${MEM_LIMIT:-117g}"
 MAX_MODEL_LEN="${MAX_MODEL_LEN:-32768}"
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-1}"
-MAX_BATCH="${MAX_BATCH:-1024}"
+MAX_BATCH="${MAX_BATCH:-2048}"
 # 1.30 GiB KV cache (~34,131 tokens, 1.04x at 32K) fits safely under default Linux CMA ceilings (~110 GiB GTT).
 # On hosts with GRUB `cma=64M` (unlocking +6 GiB GTT), override KV_MEM or set USE_GPU_UTIL=1 GPU_UTIL=0.89.
 KV_MEM="${KV_MEM:-1395864371}"
@@ -68,6 +68,10 @@ exec docker run --rm --name "ernie55_${MODE}" \
   -v "${MODEL}:${MODEL}:ro" \
   -e TMPDIR=/tmp \
   -e ERNIE_HTR_MOE_SPAD3=0 \
+  -e PYTORCH_HIP_ALLOC_CONF="${PYTORCH_HIP_ALLOC_CONF:-garbage_collection_threshold:0.6}" \
+  -e VLLM_SPARSE_INDEXER_MAX_LOGITS_MB="${VLLM_SPARSE_INDEXER_MAX_LOGITS_MB:-128}" \
+  -e ERNIE_DSPARK_DRAFT_FILTER="${ERNIE_DSPARK_DRAFT_FILTER:-1}" \
+  -e ERNIE_FLASHINDEXER_DECODE="${ERNIE_FLASHINDEXER_DECODE:-1}" \
   "${IMAGE}" \
   "${MODEL}" \
   --trust-remote-code \
@@ -75,6 +79,7 @@ exec docker run --rm --name "ernie55_${MODE}" \
   --max-model-len "${MAX_MODEL_LEN}" \
   --max-num-batched-tokens "${MAX_BATCH}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
+  --hf-overrides '{"enable_flashindexer": true}' \
   "${MEM_ARGS[@]}" \
   --compilation-config "{\"mode\":0,\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"cudagraph_capture_sizes\":${CG_SIZES}}" \
   "${SPEC_ARGS[@]}"
