@@ -1208,12 +1208,13 @@ class Ernie5_5ROCmSparseMLAImpl(MLAAttentionImpl[Ernie5_5ROCmSparseMLAMetadata])
             and q_act.is_cuda
             and q_act.dtype == torch.bfloat16
             and self._w_uk_rm.dtype == torch.bfloat16
+            and num_actual >= 64
             and self.num_heads == 64
-            and self.qk_nope_head_dim == 128
+            and self.qk_nope_head_dim in (128, 192)
             and self.kv_lora_rank == 512
             and self.qk_rope_head_dim == 64
         ):
-            # v0.2.8 native gfx1151 Wave32 WMMA fused Q@W_UK + cat(q_pe): 4.6-4.9x faster & saves 134-268 MiB VRAM
+            # v0.2.8 native gfx1151 Wave32 WMMA fused Q@W_UK + cat(q_pe): 3.1-4.9x faster & saves 134-335 MiB VRAM
             q_abs = fops.bmm_q_uk_cat_pe_bf16(q_nope, self._w_uk_rm, q_pe)
         else:
             # bmm: [H, T, nope] @ [H, nope, kv_lora] -> [H, T, kv_lora] -> [T, H, kv_lora]
@@ -1309,9 +1310,10 @@ class Ernie5_5ROCmSparseMLAImpl(MLAAttentionImpl[Ernie5_5ROCmSparseMLAMetadata])
             and attn_latent.is_cuda
             and attn_latent.dtype == torch.bfloat16
             and self._w_uv_rm.dtype == torch.bfloat16
+            and num_actual >= 256
             and self.num_heads == 64
             and self.kv_lora_rank == 512
-            and self.v_head_dim == 128
+            and self.v_head_dim in (128, 256)
         ):
             # v0.2.8 native gfx1151 Wave32 WMMA fused attn_latent@W_UV directly into output view (1.4-2.8x faster)
             out_view = output[:num_actual].view(num_actual, self.num_heads, self.v_head_dim)

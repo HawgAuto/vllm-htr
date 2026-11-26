@@ -720,15 +720,36 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
       __syncthreads();
       if (m_act[m] && s_tok[rl] < a.num_valid) {
         const float pv[4] = {p4.x, p4.y, p4.z, p4.w};
-        uint16_t* yr = reinterpret_cast<uint16_t*>(a.Y) + (prow + 2 * ei + hrow) * (size_t)N + row0 + n_base + l16;
+        uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[1][0]); // 10,240 B holds all 32x128 BF16 (8,192 B)!
+        uint16_t* dst_lds = eb + (wm * 16 + 2 * ei + hrow) * 128 + n_base + l16;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float yv = ((wn == 0) ? (v[j] + pv[j]) : (pv[j] - v[j])) * INV128;
           if ((neg >> j) & 1u) yv = -yv;
-          yr[16 * j] = f32_to_bf16_rne(yv);
+          dst_lds[16 * j] = f32_to_bf16_rne(yv);
         }
       }
     }
+    __syncthreads();
+    // ONE single coalesced u32x4 (16B x 16 threads = 256B = 4 full 64B lines) pass for all 32 rows!
+    {
+      uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[1][0]);
+      const int sr_base = tid >> 4;
+      const int sc_off  = (tid & 15) * 8;
+#pragma unroll
+      for (int r0 = 0; r0 < NWM * 16; r0 += (NTHR >> 4)) {
+        const int r_loc = r0 + sr_base;
+        const int s_wm = r_loc >> 4;
+        const int s_mb = s_wm * MT + m;
+        const int s_rl = s_mb * 16 + (r_loc & 15);
+        if (s_tok[s_rl] < a.num_valid) {
+          const size_t s_prow = (size_t)y * BM + s_rl;
+          const u32x4 v4 = *reinterpret_cast<const u32x4*>(eb + r_loc * 128 + sc_off);
+          *reinterpret_cast<u32x4*>(reinterpret_cast<uint16_t*>(a.Y) + s_prow * (size_t)N + row0 + sc_off) = v4;
+        }
+      }
+    }
+    if constexpr (MT > 1) __syncthreads();
   }
 }
 

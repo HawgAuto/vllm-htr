@@ -288,26 +288,18 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
         self, x: torch.Tensor, ids32: torch.Tensor, w32: torch.Tensor
     ) -> torch.Tensor:
         T = x.shape[0]
-        # v0.2.8 MALL-optimal chunking: T=2048 bmw=64 hits 18.41 TF/s (588 ms/1K) vs T=4096 bmw=128 (654 ms/1K),
-        # saving -263ms across 42L AND -203 MiB peak MoE scratch VRAM!
-        if T > 2048 and _HPF5_BMW_ENV is None:
-            out = x.new_empty((T, x.shape[1]))
-            for s0 in range(0, T, 2048):
-                s1 = min(s0 + 2048, T)
-                out[s0:s1] = self._prefill_hpf5(
-                    x[s0:s1].contiguous(), ids32[s0:s1].contiguous(), w32[s0:s1].contiguous()
-                )
-            return out
         topk = ids32.shape[1]
         nv = T * topk
         Pmax = ((nv + self.num_experts * 15 + 15) // 16) * 16
         s = _hpf5_scratch(x.device, Pmax, nv)
-        # Dynamic bmw (v0.2.8 empirically tuned on gfx1151):
-        #   T<=1280: bmw=32 (1x4 V=111 -> 1.13x faster); T<=2048: bmw=64 (18.41 TF/s); env override respected
+        # Dynamic bmw (v0.2.8 empirically tuned on gfx1151 E=512 topk=10):
+        #   T<=1280: bmw=32 (1x4 V=110 + 256B coalesced epilogue, nt=0 -> 1.22x vs v27);
+        #   T<=2560: bmw=64 (708 ms/1K); T>2560: bmw=128 (660 ms/1K)
         if _HPF5_BMW_ENV is not None:
             bmw = 32 if T <= 128 else HPF5_BMW
         else:
             bmw = 32 if T <= 1280 else (64 if T <= 2560 else 128)
+        nt_use = 0 if (bmw == 32 and os.environ.get("ERNIE_HPF5_NT") is None) else HPF5_NT
         return _hpf5().hpf5_ernie_forward(
             x, ids32, w32,
             self.qw, self.qoff, self.scales, self.su, self.sv,
@@ -316,7 +308,7 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
             s["grp_y"][: Pmax // 16], s["grp_nblk"][: Pmax // 16], s["grp_cnt"],
             s["A_buf"][:Pmax], s["Y_buf"][:Pmax], s["S_buf"][:Pmax],
             s["inv_buf"][:nv], s["nsat"],
-            bmw, HPF5_NT,
+            bmw, nt_use,
         )
 
     def _prefill_tiled(

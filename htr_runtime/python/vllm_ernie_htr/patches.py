@@ -1108,19 +1108,22 @@ def _use_k5_unsplit_gemv(M: int, mt: int) -> bool:
 
 
 def _k5_unsplit_nsplit(mt: int, nt: int, M: int) -> int:
-    """Empirically optimal K-split for gemv_k5_unsplit_epi on gfx1151 (40 CUs, 32 MiB MALL).
-    Avoids ns=24/32 partial-buffer & atomic-barrier thrashing (saves -7.75 ms/step @ T=6,
-    -18.8 ms/step @ T=12, -27.4 ms/step @ T=16 across all ERNIE-5.5 dense K=5 projections!).
+    """Empirically optimal K-split for gemv_k5_unsplit_epi on real ERNIE-5.5 (H=4096) gfx1151 shapes:
+    - Tall projections (mt >= 512: wq_b_hca 2048x64, wq_b_dsa 1024x64, lm_head 12576x256): ns=8
+      (2.0-2.1x faster than WMMA at T=12, avoids ns=16/32 partial-buffer overhead).
+    - Narrow-K projections (nt <= 64: wo_b 256x64): ns=16.
+    - Wide-K projections (mt <= 256, nt >= 256: wq_a, fc1_lt, sh_gu): ns=32.
+    - Mid-K projections (mt <= 256, nt == 128: sh_dn, fc2_lt): ns=32 (M<=8) / ns=16 (M>8).
     """
     if nt < 16:
         return max(1, nt)
-    if M >= 8:
-        if mt == 128 and nt >= 320 and M >= 12:
-            return 16
+    if mt >= 512:
         return 8
-    if mt <= 128 or nt <= 96 or (mt > 1792 and M >= 4):
-        return 8
-    return 16
+    if nt <= 64:
+        return 16
+    if nt >= 256:
+        return 32
+    return 32 if M <= 8 else 16
 
 def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
     """Execute an ERNIE-5.5 K=5 linear (unsplit or repacked) using pre-computed (xt, xs, tok)."""
