@@ -42,7 +42,7 @@ PREFILL_TILE_E = int(os.environ.get("ERNIE_HTR_MOE_TILE_E", "16"))
 USE_HPF5 = os.environ.get("ERNIE_HPF5_PREFILL", "1") == "1"
 _HPF5_BMW_ENV = os.environ.get("ERNIE_HPF5_BMW")
 HPF5_BMW = int(_HPF5_BMW_ENV) if _HPF5_BMW_ENV is not None else 64
-HPF5_NT = int(os.environ.get("ERNIE_HPF5_NT", "1"))
+HPF5_NT = int(os.environ.get("ERNIE_HPF5_NT", "0"))
 
 _EXT = None
 _HPF5 = None
@@ -302,7 +302,7 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
             bmw = 32 if T <= 128 else HPF5_BMW
         else:
             bmw = 32 if T <= 1280 else (64 if T <= 2560 else 128)
-        nt_use = 0 if (bmw == 32 and os.environ.get("ERNIE_HPF5_NT") is None) else HPF5_NT
+        nt_use = HPF5_NT
         return _hpf5().hpf5_ernie_forward(
             x, ids32, w32,
             self.qw, self.qoff, self.scales, self.su, self.sv,

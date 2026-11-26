@@ -280,8 +280,10 @@ __global__ __launch_bounds__(128) void k_hpf_ernie_act(
       v[2] = __uint_as_float((raw.y & 0xFFFFu) << 16);
       v[3] = __uint_as_float(raw.y & 0xFFFF0000u);
     } else {
-      const uint2 rg = *reinterpret_cast<const uint2*>(src + (size_t)p * (2 * MOE_I) + c0);
-      const uint2 ru = *reinterpret_cast<const uint2*>(src + (size_t)p * (2 * MOE_I) + MOE_I + c0);
+      const uint64_t qg = __builtin_nontemporal_load(reinterpret_cast<const uint64_t*>(src + (size_t)p * (2 * MOE_I) + c0));
+      const uint64_t qu = __builtin_nontemporal_load(reinterpret_cast<const uint64_t*>(src + (size_t)p * (2 * MOE_I) + MOE_I + c0));
+      const uint2 rg = make_uint2((uint32_t)qg, (uint32_t)(qg >> 32));
+      const uint2 ru = make_uint2((uint32_t)qu, (uint32_t)(qu >> 32));
       v[0] = situ_glu_f(__uint_as_float((rg.x & 0xFFFFu) << 16), __uint_as_float((ru.x & 0xFFFFu) << 16));
       v[1] = situ_glu_f(__uint_as_float(rg.x & 0xFFFF0000u),     __uint_as_float(ru.x & 0xFFFF0000u));
       v[2] = situ_glu_f(__uint_as_float((rg.y & 0xFFFFu) << 16), __uint_as_float((ru.y & 0xFFFFu) << 16));
@@ -402,15 +404,15 @@ void k_hpf_ernie_gemm(ErnieGemmArgs a) {
     }
   };
 
-  u32x4 aX[4], aY[4], aZ[4];
+  u32x4 aX[4], aY[4];
   uint32_t bX[B_ITERS * W_PER_ROW], bY[B_ITERS * W_PER_ROW], bZ[B_ITERS * W_PER_ROW];
   f32x8 acc[8];
 #pragma unroll
   for (int j = 0; j < 8; ++j) acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
 
-  auto step = [&](int s, const u32x4* cur, const uint32_t* b1, u32x4* nx, uint32_t* b2) {
-    const int buf = s & 1;
-    if (s + 2 < NS) { loadA(nx, (s + 2) * BKS); loadB(b2, (s + 2) * BKS); }
+  auto step = [&](int s, int buf, const u32x4* cur, u32x4* nx, const uint32_t* b1, uint32_t* b2) {
+    if (s + 1 < NS) loadA(nx, (s + 1) * BKS);
+    if (s + 2 < NS) loadB(b2, (s + 2) * BKS);
     if (wave_active) {
       const uint32_t* bs = Bs[buf];
 #pragma unroll
@@ -433,13 +435,16 @@ void k_hpf_ernie_gemm(ErnieGemmArgs a) {
   };
 
   loadA(aX, 0); loadB(bX, 0);
-  if (NS > 1) { loadA(aY, BKS); loadB(bY, BKS); }
+  if (NS > 1) loadB(bY, BKS);
   storeB(0, bX);
   __syncthreads();
-  for (int s = 0; s < NS; s += 3) {
-    step(s, aX, bY, aZ, bZ);
-    if (s + 1 < NS) step(s + 1, aY, bZ, aX, bX);
-    if (s + 2 < NS) step(s + 2, aZ, bX, aY, bY);
+  for (int s = 0; s < NS; s += 6) {
+    step(s + 0, 0, aX, aY, bY, bZ);
+    if (s + 1 < NS) step(s + 1, 1, aY, aX, bZ, bX);
+    if (s + 2 < NS) step(s + 2, 0, aX, aY, bX, bY);
+    if (s + 3 < NS) step(s + 3, 1, aY, aX, bY, bZ);
+    if (s + 4 < NS) step(s + 4, 0, aX, aY, bZ, bX);
+    if (s + 5 < NS) step(s + 5, 1, aY, aX, bX, bY);
   }
   if (!wave_active) return;
 
@@ -455,6 +460,9 @@ void k_hpf_ernie_gemm(ErnieGemmArgs a) {
     neg |= ((uint32_t)(svp[2 * j + (l16 >> 3)] >> (l16 & 7)) & 1u) << j;
   }
   const int hrow = lane >> 4;
+  // Zero-barrier wave-private 512 B staging slice in dead Bs[0] (8 waves * 512 B = 4 KiB << 20 KiB)!
+  // Keeps if (!wave_active) return; 100% intact and replaces 64x scattered 2B RFO stores with 256B u32x4!
+  uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[0][0]) + wave * 256;
 #pragma unroll
   for (int ei = 0; ei < 8; ++ei) {
     const int rl = wave * 16 + 2 * ei + hrow;
@@ -465,13 +473,16 @@ void k_hpf_ernie_gemm(ErnieGemmArgs a) {
     reg_stage8<1>(v); reg_stage8<2>(v); reg_stage8<4>(v);
     lane_stage8<1>(v, lane); lane_stage8<2>(v, lane); lane_stage8<4>(v, lane); lane_stage8<8>(v, lane);
     if (s_tok[rl] < a.num_valid) {
-      uint16_t* yr = reinterpret_cast<uint16_t*>(a.Y) + (prow + 2 * ei + hrow) * (size_t)N + row0 + l16;
+      uint16_t* dst_l = eb + hrow * 128 + l16;
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
         float yv = v[j] * INV128;
         if ((neg >> j) & 1u) yv = -yv;
-        yr[16 * j] = f32_to_bf16_rne(yv);
+        dst_l[16 * j] = f32_to_bf16_rne(yv);
       }
+      __builtin_amdgcn_wave_barrier();
+      const u32x4 v4 = *reinterpret_cast<const u32x4*>(eb + hrow * 128 + l16 * 8);
+      *reinterpret_cast<u32x4*>(reinterpret_cast<uint16_t*>(a.Y) + (prow + 2 * ei + hrow) * (size_t)N + row0 + l16 * 8) = v4;
     }
   }
 }
