@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 from typing import Literal, get_args
 
 from vllm.logger import init_logger
@@ -86,7 +87,33 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                 if ext is not None and hasattr(ext, "fp8_paged_mqa_logits_decode"):
                     import torch
                     from vllm.v1.worker.workspace import current_workspace_manager
-                    rows = q_fp8.shape[0] * q_fp8.shape[1]
+                    B_dec, next_n_dec = q_fp8.shape[0], q_fp8.shape[1]
+                    rows = B_dec * next_n_dec
+                    if os.environ.get("ERNIE_FLASHINDEXER_DECODE", "1") == "1":
+                        from .flashindexer import (
+                            flashindexer_select_heads_rocm,
+                            get_active_flashindexer,
+                            slice_hidden_for_weights,
+                        )
+                        fi_ctx = get_active_flashindexer()
+                        if fi_ctx is not None and weights.shape[-1] == 64 and weights.numel() == rows * 64:
+                            fi_indexer, fi_hidden, fi_base_weights = fi_ctx
+                            if getattr(fi_indexer, "linear_gate", None) is not None and fi_hidden.shape[0] >= rows:
+                                w_2d = weights.reshape(rows, 64)
+                                if w_2d.untyped_storage().data_ptr() == fi_base_weights.untyped_storage().data_ptr():
+                                    h_dec = slice_hidden_for_weights(fi_hidden, fi_base_weights, w_2d)
+                                else:
+                                    h_dec = fi_hidden[:rows]
+                                q_sel, w_sel = flashindexer_select_heads_rocm(
+                                    q_fp8.reshape(rows, 64, 128),
+                                    w_2d,
+                                    fi_indexer.linear_gate.weight,
+                                    fi_indexer.flashindexer_bias,
+                                    h_dec,
+                                    topk_heads=getattr(fi_indexer, "flashindexer_topk", 8),
+                                )
+                                q_fp8 = q_sel.view(B_dec, next_n_dec, -1, 128)
+                                weights = w_sel
                     (out_logits,) = current_workspace_manager().get_simultaneous(
                         ((rows, max_model_len), torch.float32),
                     )

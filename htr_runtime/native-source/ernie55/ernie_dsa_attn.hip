@@ -1284,11 +1284,205 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_paged_mqa_logits_decode(
   }
 }
 
+
+// ================================================================== 5B-FP8: Native FlashIndexer (H=8) FP8 Paged MQA Logits Decode
+// Batches up to 8 verify rows (e.g. ALL 6 DSpark-5 rows!) in ONE WG (4 waves x 2 rows x 8 heads = 16x16x16 WMMA):
+//   - Streams K-cache ONCE per request instead of NEXT_N times (6x less DRAM bandwidth at 64K-1M ctx!)
+//   - 8x fewer heads (H=8 vs H=64), zero s_wsum LDS barrier, NT K-cache loads, zero v_div!
+//   - 100% HIP-graph safe (static grid, zero host sync).
+template <int IS_SHUFFLE>
+__global__ __launch_bounds__(128) void k_ernie_fp8_paged_mqa_logits_decode_h8(
+    const uint8_t* __restrict__ q_fp8,       // [B, NEXT_N, 8, 128]
+    const uint8_t* __restrict__ kv_flat,     // [num_blocks, stride_blk_bytes] uint8
+    const float* __restrict__ weights,       // [B*NEXT_N, 8] fp32
+    const int32_t* __restrict__ ctx_lens,    // [B*NEXT_N] or [B] int32
+    const int32_t* __restrict__ block_tables,// [B, max_blocks] int32
+    float* __restrict__ out_logits,          // [B*NEXT_N, max_model_len] fp32
+    int64_t q_sb, int64_t q_sn, int64_t q_sh,
+    int64_t kv_s0, int64_t w_s0, int64_t bt_s0, int64_t out_s0,
+    int block_size, int blk_shift, int max_blocks, int max_model_len,
+    int next_n, int n_splits, int ctx_per_row, int is_fnuz) {
+  __shared__ _Float16 fp8_lut[256];
+  __shared__ __attribute__((aligned(16))) _Float16 K_lds[16][136];
+  __shared__ float s_weights[8][8];
+  __shared__ int32_t s_sl[8];
+  __shared__ float s_sc[16];
+
+  const int b = blockIdx.x;
+  const int split = blockIdx.y;
+  const int chunk = blockIdx.z;
+  const int n_base = chunk * 8;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+
+  if (tid < 8) {
+    const int n_i = n_base + tid;
+    int sl = 0;
+    if (n_i < next_n) {
+      const int r_i = b * next_n + n_i;
+      sl = ctx_per_row ? ctx_lens[r_i] : (ctx_lens[b] - next_n + n_i + 1);
+      if (sl < 0) sl = 0;
+      if (sl > max_model_len) sl = max_model_len;
+    }
+    s_sl[tid] = sl;
+  }
+  fp8_lut[tid] = fp8_byte_to_f16((uint32_t)tid, is_fnuz);
+  fp8_lut[tid + 128] = fp8_byte_to_f16((uint32_t)(tid + 128), is_fnuz);
+  if (tid < 64) {
+    const int r_loc = tid >> 3;
+    const int h_loc = tid & 7;
+    const int n_i = n_base + r_loc;
+    s_weights[r_loc][h_loc] = (n_i < next_n) ? weights[(int64_t)(b * next_n + n_i) * w_s0 + h_loc] : 0.0f;
+  }
+  __syncthreads();
+
+  int max_sl = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) max_sl = max(max_sl, s_sl[i]);
+  if (split * 16 >= max_sl) return;
+
+  // Wave w owns 2 rows (w*2 + 0, w*2 + 1) x 8 heads = 16 Q-rows -> 16x16x16 WMMA!
+  const int r_q = wave * 2 + (l16 >> 3);
+  const int h_q = l16 & 7;
+  const int n_q = n_base + r_q;
+  const bool q_valid = (n_q < next_n);
+  const uint8_t* qp = q_valid ? (q_fp8 + (int64_t)b * q_sb + (int64_t)n_q * q_sn + (int64_t)h_q * q_sh) : nullptr;
+  f16x16 q_reg[8];
+#pragma unroll
+  for (int pair = 0; pair < 4; ++pair) {
+    const u4v raw0 = q_valid ? *reinterpret_cast<const u4va*>(qp + (pair * 2 + 0) * 16) : (u4v){0u,0u,0u,0u};
+    const u4v raw1 = q_valid ? *reinterpret_cast<const u4va*>(qp + (pair * 2 + 1) * 16) : (u4v){0u,0u,0u,0u};
+    const u4v raws[2] = {raw0, raw1};
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+      const uint32_t ws[4] = {raws[s].x, raws[s].y, raws[s].z, raws[s].w};
+      f16x16 qf;
+#pragma unroll
+      for (int w4 = 0; w4 < 4; ++w4) {
+        const uint32_t x = ws[w4];
+        qf[w4 * 4 + 0] = q_valid ? fp8_lut[x & 0xFFu] : (_Float16)0.0f;
+        qf[w4 * 4 + 1] = q_valid ? fp8_lut[(x >> 8) & 0xFFu] : (_Float16)0.0f;
+        qf[w4 * 4 + 2] = q_valid ? fp8_lut[(x >> 16) & 0xFFu] : (_Float16)0.0f;
+        qf[w4 * 4 + 3] = q_valid ? fp8_lut[(x >> 24) & 0xFFu] : (_Float16)0.0f;
+      }
+      q_reg[pair * 2 + s] = qf;
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  }
+
+  const uint32_t scale_byte_off = (uint32_t)(block_size * 128);
+  const int kr = tid >> 3;
+  const int ht = tid & 7;
+  const int kc16 = ht * 16;
+  const uint32_t shuf_lane_off = (uint32_t)(ht * 256 + kr * 16);
+  const int stride_kv = n_splits * 16;
+  const int blk_mask = block_size - 1;
+
+  auto fetch_k_tile = [&](int kv_st, u4v& out_raw, float& out_sc) {
+    const int logical_blk = kv_st >> blk_shift;
+    const int64_t page = (int64_t)block_tables[(int64_t)b * bt_s0 + logical_blk];
+    const uint32_t base_in_blk = (uint32_t)(kv_st & blk_mask);
+    const uint8_t* blk_ptr = kv_flat + page * kv_s0;
+    if (kv_st + kr < max_sl) {
+      const uint32_t k_off = IS_SHUFFLE
+          ? (base_in_blk * 128u + shuf_lane_off)
+          : ((base_in_blk + (uint32_t)kr) * 128u + (uint32_t)kc16);
+      out_raw = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(blk_ptr + k_off));
+    } else {
+      out_raw = (u4v){0u, 0u, 0u, 0u};
+    }
+    if (tid < 16 && (kv_st + tid) < max_sl) {
+      out_sc = *reinterpret_cast<const float*>(blk_ptr + scale_byte_off + (base_in_blk + (uint32_t)tid) * 4u);
+    } else {
+      out_sc = 0.0f;
+    }
+  };
+
+  int kv_start = split * 16;
+  if ((kv_start >> blk_shift) >= max_blocks) return;
+  u4v raw_cur = {0u, 0u, 0u, 0u};
+  float sc_cur = 0.0f;
+  fetch_k_tile(kv_start, raw_cur, sc_cur);
+
+  const int n_out0 = n_base + wave * 2 + 0;
+  const int n_out1 = n_base + wave * 2 + 1;
+  const int sl0 = s_sl[wave * 2 + 0];
+  const int sl1 = s_sl[wave * 2 + 1];
+
+  for (; kv_start < max_sl && (kv_start >> blk_shift) < max_blocks; kv_start += stride_kv) {
+    if (tid < 16) s_sc[tid] = sc_cur;
+    if (kv_start + kr < max_sl) {
+      const uint32_t ws[4] = {raw_cur.x, raw_cur.y, raw_cur.z, raw_cur.w};
+      uint32_t pk[8];
+#pragma unroll
+      for (int w4 = 0; w4 < 4; ++w4) {
+        const uint32_t x = ws[w4];
+        const uint32_t h0 = (uint32_t)__builtin_bit_cast(uint16_t, fp8_lut[x & 0xFFu]);
+        const uint32_t h1 = (uint32_t)__builtin_bit_cast(uint16_t, fp8_lut[(x >> 8) & 0xFFu]);
+        const uint32_t h2 = (uint32_t)__builtin_bit_cast(uint16_t, fp8_lut[(x >> 16) & 0xFFu]);
+        const uint32_t h3 = (uint32_t)__builtin_bit_cast(uint16_t, fp8_lut[(x >> 24) & 0xFFu]);
+        pk[w4 * 2 + 0] = h0 | (h1 << 16);
+        pk[w4 * 2 + 1] = h2 | (h3 << 16);
+      }
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 0]) = (u4v){pk[0], pk[1], pk[2], pk[3]};
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 8]) = (u4v){pk[4], pk[5], pk[6], pk[7]};
+    } else {
+      const u4v z = {0u, 0u, 0u, 0u};
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16]) = z;
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 8]) = z;
+    }
+    __syncthreads();
+
+    const int kv_next = kv_start + stride_kv;
+    u4v raw_nxt = {0u, 0u, 0u, 0u};
+    float sc_nxt = 0.0f;
+    if (kv_next < max_sl && (kv_next >> blk_shift) < max_blocks) {
+      fetch_k_tile(kv_next, raw_nxt, sc_nxt);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    f32x8 acc = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (int step = 0; step < 8; ++step) {
+      const int d = step * 16;
+      const u4v k0 = *reinterpret_cast<const u4va*>(&K_lds[l16][d]);
+      const u4v k1 = *reinterpret_cast<const u4va*>(&K_lds[l16][d + 8]);
+      const f16x16 kf = __builtin_bit_cast(f16x16, (u8v){k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w});
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(q_reg[step], kf, acc);
+    }
+
+    float sum0 = 0.0f, sum1 = 0.0f;
+#pragma unroll
+    for (int ei = 0; ei < 4; ++ei) {
+      sum0 = __builtin_fmaf(fmaxf(acc[ei], 0.0f), s_weights[wave * 2 + 0][2 * ei + hrow], sum0);
+      sum1 = __builtin_fmaf(fmaxf(acc[ei + 4], 0.0f), s_weights[wave * 2 + 1][2 * ei + hrow], sum1);
+    }
+    sum0 += shx_f<16>(sum0);
+    sum1 += shx_f<16>(sum1);
+    if (hrow == 0) {
+      const int pos = kv_start + l16;
+      const float ks = s_sc[l16];
+      if (n_out0 < next_n && pos < sl0) {
+        out_logits[(int64_t)(b * next_n + n_out0) * out_s0 + pos] = sum0 * ks;
+      }
+      if (n_out1 < next_n && pos < sl1) {
+        out_logits[(int64_t)(b * next_n + n_out1) * out_s0 + pos] = sum1 * ks;
+      }
+    }
+    __syncthreads();
+    raw_cur = raw_nxt;
+    sc_cur = sc_nxt;
+  }
+}
+
 void ernie_fp8_paged_mqa_logits_decode(
     torch::Tensor q_fp8, torch::Tensor kv_cache_fp8, torch::Tensor weights,
     torch::Tensor context_lens, torch::Tensor block_tables,
     torch::Tensor out_logits, int64_t max_model_len, bool is_shuffle) {
-  TORCH_CHECK(q_fp8.is_cuda() && q_fp8.dim() == 4 && q_fp8.size(2) == 64 && q_fp8.size(3) == 128);
+  TORCH_CHECK(q_fp8.is_cuda() && q_fp8.dim() == 4 && (q_fp8.size(2) == 64 || q_fp8.size(2) == 8) && q_fp8.size(3) == 128);
   const int B = (int)q_fp8.size(0);
   const int next_n = (int)q_fp8.size(1);
   const int rows = B * next_n;
@@ -1302,6 +1496,37 @@ void ernie_fp8_paged_mqa_logits_decode(
   const int tiles_cap = ((int)max_model_len + 15) / 16;
   const int n_splits = max(1, min(40, min(tiles_cap, max(1, 512 / rows))));
   auto st = c10::hip::getCurrentHIPStream().stream();
+  if (q_fp8.size(2) == 8 && (block_size & (block_size - 1)) == 0) {
+    int blk_shift = 0;
+    while ((1 << blk_shift) < block_size) ++blk_shift;
+    const int n_chunks = (next_n + 7) / 8;
+    const int g_x = B * n_chunks;
+    const int n_sp = max(1, min(160, min(tiles_cap, max(40, 640 / g_x))));
+    if (is_shuffle) {
+      hipLaunchKernelGGL(
+          (k_ernie_fp8_paged_mqa_logits_decode_h8<1>), dim3(B, n_sp, n_chunks), dim3(128), 0, st,
+          reinterpret_cast<const uint8_t*>(q_fp8.data_ptr()),
+          kv_flat.data_ptr<uint8_t>(), weights.data_ptr<float>(),
+          cl.data_ptr<int32_t>(), block_tables.data_ptr<int32_t>(),
+          out_logits.data_ptr<float>(),
+          q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
+          kv_flat.stride(0), weights.stride(0), block_tables.stride(0), out_logits.stride(0),
+          block_size, blk_shift, (int)block_tables.size(1), (int)max_model_len,
+          next_n, n_sp, ctx_per_row, is_fnuz);
+    } else {
+      hipLaunchKernelGGL(
+          (k_ernie_fp8_paged_mqa_logits_decode_h8<0>), dim3(B, n_sp, n_chunks), dim3(128), 0, st,
+          reinterpret_cast<const uint8_t*>(q_fp8.data_ptr()),
+          kv_flat.data_ptr<uint8_t>(), weights.data_ptr<float>(),
+          cl.data_ptr<int32_t>(), block_tables.data_ptr<int32_t>(),
+          out_logits.data_ptr<float>(),
+          q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
+          kv_flat.stride(0), weights.stride(0), block_tables.stride(0), out_logits.stride(0),
+          block_size, blk_shift, (int)block_tables.size(1), (int)max_model_len,
+          next_n, n_sp, ctx_per_row, is_fnuz);
+    }
+    return;
+  }
   if (is_shuffle) {
     hipLaunchKernelGGL(
         (k_ernie_fp8_paged_mqa_logits_decode<1>), dim3(rows, n_splits), dim3(128), 0, st,
@@ -1879,6 +2104,282 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_prefill_v28(
   }
 }
 
+
+// v0.2.8 Pipelined Register-Resident-Q Union-LDS Quantized DSA Prefill (KV_FMT: 1=fp8 656B, 2=nvfp4 352B)
+//  - 32H/WG (2 head-groups x 4 D-quarters: Q@K^T 144 dims = 9 WMMAs, P@V 128 dims = 8 WMMAs)
+//  - Q[16x144] 100% in VGPRs across all W=2048 tiles (ZERO Q loads in loop!)
+//  - Union KV_lds/VT_lds_g -> 27.1 KiB LDS (<32 KiB -> 2 WGs/CU = 16 waves/CU on gfx1151!)
+//  - Direct idx_row load (4 barriers/tile instead of 5!) + pipelined raw KV prefetch during P@V WMMAs!
+template <int KV_FMT>
+__global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_qreg_v28(
+    const uint16_t* __restrict__ q_ptr,      // [T, 64, 576] bf16
+    const uint8_t* __restrict__ kv_ptr,      // [num_blocks, block_size, ROW_BYTES] uint8
+    const int32_t* __restrict__ idx_ptr,     // [T, W] int32
+    uint16_t* __restrict__ out_ptr,          // [T, 64, 512] bf16
+    int64_t q_s0, int64_t q_s1,
+    int64_t kv_blk_stride, int64_t kv_row_stride,
+    int64_t idx_s0, int64_t out_s0, int64_t out_s1,
+    int num_blocks, int block_size, int W, float scale) {
+  __shared__ union {
+    __attribute__((aligned(16))) uint16_t KV_lds[16][DSA_STRIDE];               // 18,688 B
+    __attribute__((aligned(16))) uint16_t VT_lds_g[16][32 * DSA_VT_STRIDE + 2]; // 18,496 B
+  } u_kv;
+  __shared__ float S_part[2][3][16][16];                                        //  6,144 B
+  __shared__ __attribute__((aligned(16))) uint16_t P_lds[2][16][16];            //  1,024 B
+  __shared__ float fp8_lut[256];                                                //  1,024 B
+  __shared__ float s_alpha[32];
+  __shared__ float s_m[32];
+  __shared__ float s_l[32];
+
+  const int t = blockIdx.x;
+  const int hg32 = blockIdx.y;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int wh = wave >> 2;     // 0..1
+  const int wd = wave & 3;      // 0..3
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+  const int h_base = hg32 * 32;
+  const int h0 = h_base + wh * 16;
+
+  fp8_lut[tid] = dsa_fp8_ocp_to_f32((uint32_t)tid);
+  if (tid < 32) {
+    s_m[tid] = NEG_INF;
+    s_l[tid] = 0.0f;
+  }
+
+  // Preload Q[16 x 144] ONCE into VGPRs -> ZERO Q global/L1 loads in 128-tile loop!
+  const int kd_start = wd * 144;
+  const int vd_start = wd * 128;
+  const uint16_t* q_base = q_ptr + (int64_t)t * q_s0 + (int64_t)(h0 + l16) * q_s1 + kd_start;
+  bf16x16 q_reg[9];
+#pragma unroll
+  for (int step = 0; step < 9; ++step) {
+    const u4v q0 = *reinterpret_cast<const u4va*>(q_base + step * 16 + 0);
+    const u4v q1 = *reinterpret_cast<const u4va*>(q_base + step * 16 + 8);
+    q_reg[step] = __builtin_bit_cast(bf16x16, (u8v){q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w});
+  }
+
+  f32x8 o_acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) o_acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+
+  const int32_t* idx_row = idx_ptr + (int64_t)t * idx_s0;
+  const int total_slots = num_blocks * block_size;
+  const int kr_ld = tid >> 4;   // 0..15 (16 tokens)
+  const int sub16 = tid & 15;   // 0..15 (32 NOPE dims/thread!)
+  const int total_blks = (W + 15) >> 4;
+
+  // Compact raw tile storage for pipelining (reused across iterations!)
+  struct RawKV {
+    int32_t sl;
+    u4v raw0, raw1;   // FP8: 32 bytes nope; NVFP4: raw0={fp4_0.x, fp4_0.y, fp4_1.x, fp4_1.y}, raw1.x=sc2
+    u4v rope_raw;     // FP8: 8 bf16 rope; NVFP4: rope_raw.xy = 8 fp8 rope
+    float sc_fp8;
+  };
+
+  auto prefetch_raw = [&](int blk_i, RawKV& dst) {
+    const int c = blk_i * 16 + kr_ld;
+    int32_t sl = (c < W) ? idx_row[c] : -1;
+    if (sl < 0 || sl >= total_slots) sl = -1;
+    dst.sl = sl;
+    if (sl >= 0) {
+      const int phys_blk = (block_size == 64) ? (sl >> 6) : (sl / block_size);
+      const int in_blk   = (block_size == 64) ? (sl & 63) : (sl % block_size);
+      const uint8_t* row_p = kv_ptr + (int64_t)phys_blk * kv_blk_stride + (int64_t)in_blk * kv_row_stride;
+      if constexpr (KV_FMT == 1) {
+        dst.sc_fp8 = *reinterpret_cast<const float*>(row_p + 512 + (sub16 >> 2) * 4);
+        dst.raw0 = *reinterpret_cast<const u4va*>(row_p + sub16 * 32 + 0);
+        dst.raw1 = *reinterpret_cast<const u4va*>(row_p + sub16 * 32 + 16);
+        if (sub16 < 8) dst.rope_raw = *reinterpret_cast<const u4va*>(row_p + 528 + sub16 * 16);
+      } else {
+        dst.raw0 = *reinterpret_cast<const u4va*>(row_p + sub16 * 16);
+        dst.raw1.x = (uint32_t)(*reinterpret_cast<const uint16_t*>(row_p + 320 + sub16 * 2));
+        if (sub16 < 8) {
+          const uint2 rr = *reinterpret_cast<const uint2*>(row_p + 256 + sub16 * 8);
+          dst.rope_raw.x = rr.x; dst.rope_raw.y = rr.y;
+        }
+      }
+    }
+  };
+
+  RawKV cur_raw;
+  if (total_blks > 0) prefetch_raw(0, cur_raw);
+  __syncthreads();
+
+#pragma unroll 1
+  for (int blk = 0; blk < total_blks; ++blk) {
+    // 1. Dequant cur_raw -> u_kv.KV_lds (keep pk_hold[16] in VGPRs for VT_lds_g after Q@K^T!)
+    uint32_t pk_hold[16];
+    if (cur_raw.sl >= 0) {
+      if constexpr (KV_FMT == 1) {
+        const float sc = cur_raw.sc_fp8;
+        const u4v raws[2] = {cur_raw.raw0, cur_raw.raw1};
+#pragma unroll
+        for (int c2 = 0; c2 < 2; ++c2) {
+          const uint32_t ws[4] = {raws[c2].x, raws[c2].y, raws[c2].z, raws[c2].w};
+#pragma unroll
+          for (int w = 0; w < 4; ++w) {
+            const uint32_t x = ws[w];
+            pk_hold[c2 * 8 + w * 2 + 0] = f32_to_bf16x2_fast(fp8_lut[x & 0xFFu] * sc, fp8_lut[(x >> 8) & 0xFFu] * sc);
+            pk_hold[c2 * 8 + w * 2 + 1] = f32_to_bf16x2_fast(fp8_lut[(x >> 16) & 0xFFu] * sc, fp8_lut[(x >> 24) & 0xFFu] * sc);
+          }
+          const int col0 = sub16 * 32 + c2 * 16;
+          *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][col0 + 0]) = (u4v){pk_hold[c2*8+0], pk_hold[c2*8+1], pk_hold[c2*8+2], pk_hold[c2*8+3]};
+          *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][col0 + 8]) = (u4v){pk_hold[c2*8+4], pk_hold[c2*8+5], pk_hold[c2*8+6], pk_hold[c2*8+7]};
+        }
+        if (sub16 < 8) {
+          *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][512 + sub16 * 8]) = cur_raw.rope_raw;
+        }
+      } else {
+        const uint32_t sc2 = cur_raw.raw1.x;
+        const uint32_t rwords[4] = {cur_raw.raw0.x, cur_raw.raw0.y, cur_raw.raw0.z, cur_raw.raw0.w};
+#pragma unroll
+        for (int mb = 0; mb < 2; ++mb) {
+          const float sc = fp8_lut[(sc2 >> (mb * 8)) & 0xFFu];
+          const uint32_t rx = rwords[mb * 2 + 0], ry = rwords[mb * 2 + 1];
+#pragma unroll
+          for (int b = 0; b < 4; ++b) {
+            const uint32_t byte0 = (rx >> (b * 8)) & 0xFFu;
+            const uint32_t byte1 = (ry >> (b * 8)) & 0xFFu;
+            pk_hold[mb * 8 + b]     = f32_to_bf16x2_fast(e2m1_reg_to_f32(byte0 & 0xFu) * sc, e2m1_reg_to_f32(byte0 >> 4) * sc);
+            pk_hold[mb * 8 + b + 4] = f32_to_bf16x2_fast(e2m1_reg_to_f32(byte1 & 0xFu) * sc, e2m1_reg_to_f32(byte1 >> 4) * sc);
+          }
+          const int col0 = sub16 * 32 + mb * 16;
+          *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][col0 + 0]) = (u4v){pk_hold[mb*8+0], pk_hold[mb*8+1], pk_hold[mb*8+2], pk_hold[mb*8+3]};
+          *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][col0 + 8]) = (u4v){pk_hold[mb*8+4], pk_hold[mb*8+5], pk_hold[mb*8+6], pk_hold[mb*8+7]};
+        }
+        if (sub16 < 8) {
+          const uint32_t rx = cur_raw.rope_raw.x, ry = cur_raw.rope_raw.y;
+          u4v rp;
+          rp.x = f32_to_bf16x2_fast(fp8_lut[rx & 0xFFu], fp8_lut[(rx >> 8) & 0xFFu]);
+          rp.y = f32_to_bf16x2_fast(fp8_lut[(rx >> 16) & 0xFFu], fp8_lut[(rx >> 24) & 0xFFu]);
+          rp.z = f32_to_bf16x2_fast(fp8_lut[ry & 0xFFu], fp8_lut[(ry >> 8) & 0xFFu]);
+          rp.w = f32_to_bf16x2_fast(fp8_lut[(ry >> 16) & 0xFFu], fp8_lut[(ry >> 24) & 0xFFu]);
+          *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][512 + sub16 * 8]) = rp;
+        }
+      }
+    } else {
+      const u4v z = {0u, 0u, 0u, 0u};
+#pragma unroll
+      for (int i = 0; i < 16; ++i) pk_hold[i] = 0u;
+#pragma unroll
+      for (int c4 = 0; c4 < 4; ++c4) *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][sub16 * 32 + c4 * 8]) = z;
+      if (sub16 < 8) *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][512 + sub16 * 8]) = z;
+    }
+    __syncthreads();
+
+    // 2. Q @ K^T: 9 WMMA steps, Q 100% in VGPRs, 1-ahead K_lds prefetch!
+    f32x8 s_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+    u4v k0_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][kd_start]);
+    u4v k1_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][kd_start + 8]);
+#pragma unroll
+    for (int step = 0; step < 9; ++step) {
+      u4v k0_n = {0u, 0u, 0u, 0u}, k1_n = {0u, 0u, 0u, 0u};
+      if (step + 1 < 9) {
+        const int dn = kd_start + (step + 1) * 16;
+        k0_n = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn]);
+        k1_n = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn + 8]);
+      }
+      const bf16x16 kf = __builtin_bit_cast(bf16x16, (u8v){k0_c.x, k0_c.y, k0_c.z, k0_c.w, k1_c.x, k1_c.y, k1_c.z, k1_c.w});
+      s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(q_reg[step], kf, s_acc);
+      k0_c = k0_n; k1_c = k1_n;
+    }
+
+    if (wd > 0) {
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) S_part[wh][wd - 1][2 * ei + hrow][l16] = s_acc[ei];
+    }
+    __syncthreads();
+
+    // 3. Online softmax (wd == 0) + write bank-conflict-free u_kv.VT_lds_g (KV_lds is dead!)
+    if (wd == 0) {
+      const int c = blk * 16 + l16;
+      const int32_t sl_v = (c < W) ? idx_row[c] : -1;
+      const bool vld = (sl_v >= 0 && sl_v < total_slots);
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) {
+        const int hm = 2 * ei + hrow;
+        const int h_loc = wh * 16 + hm;
+        float sc = s_acc[ei] + S_part[wh][0][hm][l16] + S_part[wh][1][hm][l16] + S_part[wh][2][hm][l16];
+        sc = vld ? (sc * scale) : NEG_INF;
+        const float bmax = halfwave_max16(sc);
+        const float mold = s_m[h_loc];
+        const float mnew = fmaxf(mold, bmax);
+        const float alpha = (mold > -1e30f) ? exp2f((mold - mnew) * LOG2E) : 0.0f;
+        const float pv = (vld && mnew > -1e30f) ? exp2f((sc - mnew) * LOG2E) : 0.0f;
+        const float bsum = halfwave_sum16(pv);
+        P_lds[wh][hm][l16] = f32_to_bf16_rne(pv);
+        if (l16 == 0) {
+          s_alpha[h_loc] = alpha;
+          s_m[h_loc] = mnew;
+          s_l[h_loc] = s_l[h_loc] * alpha + bsum;
+        }
+      }
+    }
+    {
+      uint16_t* vt_dst = &u_kv.VT_lds_g[sub16][kr_ld];
+#pragma unroll
+      for (int p = 0; p < 16; ++p) {
+        vt_dst[(p * 2 + 0) * DSA_VT_STRIDE] = (uint16_t)(pk_hold[p] & 0xFFFFu);
+        vt_dst[(p * 2 + 1) * DSA_VT_STRIDE] = (uint16_t)(pk_hold[p] >> 16);
+      }
+    }
+    __syncthreads();
+
+    // 4. Prefetch NEXT tile's raw quantized KV BEFORE P@V WMMAs (overlaps DRAM/L2 with 8 WMMAs!)
+    if (blk + 1 < total_blks) {
+      prefetch_raw(blk + 1, cur_raw);
+    }
+
+    float al[8];
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) al[ei] = s_alpha[wh * 16 + 2 * ei + hrow];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) o_acc[j][ei] *= al[ei];
+    }
+
+    const u4v p0 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][0]);
+    const u4v p1 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][8]);
+    const bf16x16 pf = __builtin_bit_cast(bf16x16, (u8v){p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w});
+
+    const int vg0 = vd_start >> 5;
+    u4v v0_c = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vg0][l16 * DSA_VT_STRIDE + 0]);
+    u4v v1_c = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vg0][l16 * DSA_VT_STRIDE + 8]);
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      u4v v0_n = {0u, 0u, 0u, 0u}, v1_n = {0u, 0u, 0u, 0u};
+      if (j + 1 < 8) {
+        const int vc_n = vd_start + (j + 1) * 16 + l16;
+        const int vgn = vc_n >> 5;
+        v0_n = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vgn][(vc_n & 31) * DSA_VT_STRIDE + 0]);
+        v1_n = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vgn][(vc_n & 31) * DSA_VT_STRIDE + 8]);
+      }
+      const bf16x16 vf = __builtin_bit_cast(bf16x16, (u8v){v0_c.x, v0_c.y, v0_c.z, v0_c.w, v1_c.x, v1_c.y, v1_c.z, v1_c.w});
+      o_acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pf, vf, o_acc[j]);
+      v0_c = v0_n; v1_c = v1_n;
+    }
+    __syncthreads();
+  }
+
+  // Finalize
+#pragma unroll
+  for (int ei = 0; ei < 8; ++ei) {
+    const int hm = 2 * ei + hrow;
+    const int h_loc = wh * 16 + hm;
+    const float lv = s_l[h_loc];
+    const float inv_l = (lv > 0.0f) ? __builtin_amdgcn_rcpf(lv) : 0.0f;
+    uint16_t* dst = out_ptr + (int64_t)t * out_s0 + (int64_t)(h0 + hm) * out_s1 + vd_start + l16;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      dst[j * 16] = f32_to_bf16_rne(o_acc[j][ei] * inv_l);
+    }
+  }
+}
+
 torch::Tensor ernie_dsa_sparse_mla_quant(
     torch::Tensor q, torch::Tensor kv_cache, torch::Tensor indices,
     c10::optional<torch::Tensor> attn_sink, double scale,
@@ -1906,6 +2407,24 @@ torch::Tensor ernie_dsa_sparse_mla_quant(
 
   if (num_splits <= 1 || W <= 32) {
     if (T >= 32) {
+      if (kv_fmt == 1) {
+        hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_qreg_v28<1>), dim3(T, 2, 1), dim3(256), 0, st,
+            reinterpret_cast<const uint16_t*>(q.data_ptr<at::BFloat16>()),
+            kv_cache.data_ptr<uint8_t>(), indices.data_ptr<int32_t>(),
+            reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>()),
+            q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+            indices.stride(0), out.stride(0), out.stride(1),
+            (int)kv_cache.size(0), (int)kv_cache.size(1), W, (float)scale);
+      } else {
+        hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_qreg_v28<2>), dim3(T, 2, 1), dim3(256), 0, st,
+            reinterpret_cast<const uint16_t*>(q.data_ptr<at::BFloat16>()),
+            kv_cache.data_ptr<uint8_t>(), indices.data_ptr<int32_t>(),
+            reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>()),
+            q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+            indices.stride(0), out.stride(0), out.stride(1),
+            (int)kv_cache.size(0), (int)kv_cache.size(1), W, (float)scale);
+      }
+      return out;
       if (kv_fmt == 1) {
         hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_prefill_v28<1>), dim3(T, 1, 1), dim3(256), 0, st,
                            qp, kvp, ip, sp, op,
@@ -2136,11 +2655,209 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_mxfp4_paged_mqa_logits_decode
   }
 }
 
+
+// ================================================================== 5B-MXFP4: Native FlashIndexer (H=8) MXFP4 Paged MQA Logits Decode
+typedef uint32_t u2v_a4 __attribute__((ext_vector_type(2), aligned(4)));
+
+__global__ __launch_bounds__(128) void k_ernie_fp8_mxfp4_paged_mqa_logits_decode_h8(
+    const uint8_t* __restrict__ q_fp8,       // [B, NEXT_N, 8, 128]
+    const uint8_t* __restrict__ kv_ptr,      // [num_blocks, block_size, 68] uint8
+    const float* __restrict__ weights,       // [B*NEXT_N, 8] fp32
+    const int32_t* __restrict__ ctx_lens,    // [B*NEXT_N] or [B] int32
+    const int32_t* __restrict__ block_tables,// [B, max_blocks] int32
+    float* __restrict__ out_logits,          // [B*NEXT_N, max_model_len] fp32
+    int64_t q_sb, int64_t q_sn, int64_t q_sh,
+    int64_t kv_s0, int64_t kv_s1, int64_t w_s0, int64_t bt_s0, int64_t out_s0,
+    int block_size, int blk_shift, int max_blocks, int max_model_len,
+    int next_n, int n_splits, int ctx_per_row, int is_fnuz) {
+  __shared__ _Float16 fp8_lut[256];
+  __shared__ float e2m1_lut[16];
+  __shared__ __attribute__((aligned(16))) _Float16 K_lds[16][136];
+  __shared__ float s_weights[8][8];
+  __shared__ int32_t s_sl[8];
+  __shared__ float s_tsc[16];
+
+  const int b = blockIdx.x;
+  const int split = blockIdx.y;
+  const int chunk = blockIdx.z;
+  const int n_base = chunk * 8;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+
+  if (tid < 16) {
+    static constexpr float E2M1_C[16] = {
+        0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+        -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f};
+    e2m1_lut[tid] = E2M1_C[tid];
+  }
+  if (tid < 8) {
+    const int n_i = n_base + tid;
+    int sl = 0;
+    if (n_i < next_n) {
+      const int r_i = b * next_n + n_i;
+      sl = ctx_per_row ? ctx_lens[r_i] : (ctx_lens[b] - next_n + n_i + 1);
+      if (sl < 0) sl = 0;
+      if (sl > max_model_len) sl = max_model_len;
+    }
+    s_sl[tid] = sl;
+  }
+  fp8_lut[tid] = fp8_byte_to_f16((uint32_t)tid, is_fnuz);
+  fp8_lut[tid + 128] = fp8_byte_to_f16((uint32_t)(tid + 128), is_fnuz);
+  if (tid < 64) {
+    const int r_loc = tid >> 3;
+    const int h_loc = tid & 7;
+    const int n_i = n_base + r_loc;
+    s_weights[r_loc][h_loc] = (n_i < next_n) ? weights[(int64_t)(b * next_n + n_i) * w_s0 + h_loc] : 0.0f;
+  }
+  __syncthreads();
+
+  int max_sl = 0;
+#pragma unroll
+  for (int i = 0; i < 8; ++i) max_sl = max(max_sl, s_sl[i]);
+  if (split * 16 >= max_sl) return;
+
+  const int r_q = wave * 2 + (l16 >> 3);
+  const int h_q = l16 & 7;
+  const int n_q = n_base + r_q;
+  const bool q_valid = (n_q < next_n);
+  const uint8_t* qp = q_valid ? (q_fp8 + (int64_t)b * q_sb + (int64_t)n_q * q_sn + (int64_t)h_q * q_sh) : nullptr;
+  f16x16 q_reg[8];
+#pragma unroll
+  for (int pair = 0; pair < 4; ++pair) {
+    const u4v raw0 = q_valid ? *reinterpret_cast<const u4va*>(qp + (pair * 2 + 0) * 16) : (u4v){0u,0u,0u,0u};
+    const u4v raw1 = q_valid ? *reinterpret_cast<const u4va*>(qp + (pair * 2 + 1) * 16) : (u4v){0u,0u,0u,0u};
+    const u4v raws[2] = {raw0, raw1};
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+      const uint32_t ws[4] = {raws[s].x, raws[s].y, raws[s].z, raws[s].w};
+      f16x16 qf;
+#pragma unroll
+      for (int w4 = 0; w4 < 4; ++w4) {
+        const uint32_t x = ws[w4];
+        qf[w4 * 4 + 0] = q_valid ? fp8_lut[x & 0xFFu] : (_Float16)0.0f;
+        qf[w4 * 4 + 1] = q_valid ? fp8_lut[(x >> 8) & 0xFFu] : (_Float16)0.0f;
+        qf[w4 * 4 + 2] = q_valid ? fp8_lut[(x >> 16) & 0xFFu] : (_Float16)0.0f;
+        qf[w4 * 4 + 3] = q_valid ? fp8_lut[(x >> 24) & 0xFFu] : (_Float16)0.0f;
+      }
+      q_reg[pair * 2 + s] = qf;
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  }
+
+  const int kr = tid >> 3;
+  const int ht = tid & 7;
+  const int grp = ht >> 1;
+  const int kc16 = ht * 16;
+  const int stride_kv = n_splits * 16;
+  const int blk_mask = block_size - 1;
+
+  auto fetch_mxfp4_tile = [&](int kv_st, u2v_a4& out_raw, uint32_t& out_sc4) {
+    const int logical_blk = kv_st >> blk_shift;
+    const int64_t page = (int64_t)block_tables[(int64_t)b * bt_s0 + logical_blk];
+    const int base_in_blk = kv_st & blk_mask;
+    const uint8_t* blk_ptr = kv_ptr + page * kv_s0;
+    if (kv_st + kr < max_sl) {
+      const uint8_t* rp = blk_ptr + (int64_t)(base_in_blk + kr) * kv_s1;
+      out_raw = __builtin_nontemporal_load(reinterpret_cast<const u2v_a4*>(rp + ht * 8));
+      out_sc4 = __builtin_nontemporal_load(reinterpret_cast<const uint32_t*>(rp + 64));
+    } else {
+      out_raw = (u2v_a4){0u, 0u};
+      out_sc4 = 0x7F7F7F7Fu;
+    }
+  };
+
+  int kv_start = split * 16;
+  if ((kv_start >> blk_shift) >= max_blocks) return;
+  u2v_a4 raw_cur = {0u, 0u};
+  uint32_t sc4_cur = 0x7F7F7F7Fu;
+  fetch_mxfp4_tile(kv_start, raw_cur, sc4_cur);
+
+  const int n_out0 = n_base + wave * 2 + 0;
+  const int n_out1 = n_base + wave * 2 + 1;
+  const int sl0 = s_sl[wave * 2 + 0];
+  const int sl1 = s_sl[wave * 2 + 1];
+
+  for (; kv_start < max_sl && (kv_start >> blk_shift) < max_blocks; kv_start += stride_kv) {
+    if (kv_start + kr < max_sl) {
+      const int e0 = (int)(sc4_cur & 0xFFu), e1 = (int)((sc4_cur >> 8) & 0xFFu);
+      const int e2 = (int)((sc4_cur >> 16) & 0xFFu), e3 = (int)((sc4_cur >> 24) & 0xFFu);
+      const int me = max(max(e0, e1), max(e2, e3));
+      if (ht == 0) s_tsc[kr] = __uint_as_float((uint32_t)me << 23);
+      const int eg = (int)((sc4_cur >> (grp * 8)) & 0xFFu);
+      const int re = 127 + eg - me;
+      const float rsc = (re > 0) ? __uint_as_float((uint32_t)re << 23) : 0.0f;
+      uint32_t pk[8];
+#pragma unroll
+      for (int bi = 0; bi < 4; ++bi) {
+        const uint32_t b0 = (raw_cur[0] >> (bi * 8)) & 0xFFu;
+        const uint32_t b1 = (raw_cur[1] >> (bi * 8)) & 0xFFu;
+        const uint32_t h0a = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)(e2m1_lut[b0 & 0xFu] * rsc));
+        const uint32_t h1a = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)(e2m1_lut[b0 >> 4] * rsc));
+        const uint32_t h0b = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)(e2m1_lut[b1 & 0xFu] * rsc));
+        const uint32_t h1b = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)(e2m1_lut[b1 >> 4] * rsc));
+        pk[bi] = h0a | (h1a << 16);
+        pk[bi + 4] = h0b | (h1b << 16);
+      }
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 0]) = (u4v){pk[0], pk[1], pk[2], pk[3]};
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 8]) = (u4v){pk[4], pk[5], pk[6], pk[7]};
+    } else {
+      if (ht == 0) s_tsc[kr] = 0.0f;
+      const u4v z = {0u, 0u, 0u, 0u};
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16]) = z;
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 8]) = z;
+    }
+    __syncthreads();
+
+    const int kv_next = kv_start + stride_kv;
+    u2v_a4 raw_nxt = {0u, 0u};
+    uint32_t sc4_nxt = 0x7F7F7F7Fu;
+    if (kv_next < max_sl && (kv_next >> blk_shift) < max_blocks) {
+      fetch_mxfp4_tile(kv_next, raw_nxt, sc4_nxt);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    f32x8 acc = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (int step = 0; step < 8; ++step) {
+      const int d = step * 16;
+      const u4v k0 = *reinterpret_cast<const u4va*>(&K_lds[l16][d]);
+      const u4v k1 = *reinterpret_cast<const u4va*>(&K_lds[l16][d + 8]);
+      const f16x16 kf = __builtin_bit_cast(f16x16, (u8v){k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w});
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(q_reg[step], kf, acc);
+    }
+
+    float sum0 = 0.0f, sum1 = 0.0f;
+#pragma unroll
+    for (int ei = 0; ei < 4; ++ei) {
+      sum0 = __builtin_fmaf(fmaxf(acc[ei], 0.0f), s_weights[wave * 2 + 0][2 * ei + hrow], sum0);
+      sum1 = __builtin_fmaf(fmaxf(acc[ei + 4], 0.0f), s_weights[wave * 2 + 1][2 * ei + hrow], sum1);
+    }
+    sum0 += shx_f<16>(sum0);
+    sum1 += shx_f<16>(sum1);
+    if (hrow == 0) {
+      const int pos = kv_start + l16;
+      const float ks = s_tsc[l16];
+      if (n_out0 < next_n && pos < sl0) {
+        out_logits[(int64_t)(b * next_n + n_out0) * out_s0 + pos] = sum0 * ks;
+      }
+      if (n_out1 < next_n && pos < sl1) {
+        out_logits[(int64_t)(b * next_n + n_out1) * out_s0 + pos] = sum1 * ks;
+      }
+    }
+    __syncthreads();
+    raw_cur = raw_nxt;
+    sc4_cur = sc4_nxt;
+  }
+}
+
 void ernie_fp8_mxfp4_paged_mqa_logits_decode(
     torch::Tensor q_fp8, torch::Tensor kv_cache_mxfp4, torch::Tensor weights,
     torch::Tensor context_lens, torch::Tensor block_tables,
     torch::Tensor out_logits, int64_t max_model_len) {
-  TORCH_CHECK(q_fp8.is_cuda() && q_fp8.dim() == 4 && q_fp8.size(2) == 64 && q_fp8.size(3) == 128);
+  TORCH_CHECK(q_fp8.is_cuda() && q_fp8.dim() == 4 && (q_fp8.size(2) == 64 || q_fp8.size(2) == 8) && q_fp8.size(3) == 128);
   auto kv3 = (kv_cache_mxfp4.dim() == 4 && kv_cache_mxfp4.size(2) == 1)
       ? kv_cache_mxfp4.squeeze(2) : kv_cache_mxfp4;
   TORCH_CHECK(kv3.is_cuda() && kv3.dim() == 3 && kv3.scalar_type() == torch::kUInt8 && kv3.size(2) == 68);
@@ -2156,6 +2873,24 @@ void ernie_fp8_mxfp4_paged_mqa_logits_decode(
   const int tiles_cap = ((int)max_model_len + 15) / 16;
   const int n_splits = max(1, min(40, min(tiles_cap, max(1, 512 / rows))));
   auto st = c10::hip::getCurrentHIPStream().stream();
+  if (q_fp8.size(2) == 8 && (block_size & (block_size - 1)) == 0) {
+    int blk_shift = 0;
+    while ((1 << blk_shift) < block_size) ++blk_shift;
+    const int n_chunks = (next_n + 7) / 8;
+    const int g_x = B * n_chunks;
+    const int n_sp = max(1, min(160, min(tiles_cap, max(40, 640 / g_x))));
+    hipLaunchKernelGGL(
+        k_ernie_fp8_mxfp4_paged_mqa_logits_decode_h8, dim3(B, n_sp, n_chunks), dim3(128), 0, st,
+        reinterpret_cast<const uint8_t*>(q_fp8.data_ptr()),
+        kv3.data_ptr<uint8_t>(), weights.data_ptr<float>(),
+        cl.data_ptr<int32_t>(), block_tables.data_ptr<int32_t>(),
+        out_logits.data_ptr<float>(),
+        q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
+        kv3.stride(0), kv3.stride(1), weights.stride(0), block_tables.stride(0), out_logits.stride(0),
+        block_size, blk_shift, (int)block_tables.size(1), (int)max_model_len,
+        next_n, n_sp, ctx_per_row, is_fnuz);
+    return;
+  }
   hipLaunchKernelGGL(
       k_ernie_fp8_mxfp4_paged_mqa_logits_decode, dim3(rows, n_splits), dim3(128), 0, st,
       reinterpret_cast<const uint8_t*>(q_fp8.data_ptr()),
