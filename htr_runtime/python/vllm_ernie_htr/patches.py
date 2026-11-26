@@ -618,6 +618,57 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
 
             _compress_norm_rope_store_hip._ernie5_gfx1151_hip = True  # type: ignore[attr-defined]
             comp_mod.compress_norm_rope_store_triton = _compress_norm_rope_store_hip
+
+        # Also replace prefill 2-stage Triton compressor (37x/chunk!) with single-pass Wave32 HIP
+        orig_comp2 = getattr(comp_mod, "compress_norm_rope_store_two_stage_triton", None)
+        if orig_comp2 is not None and not getattr(orig_comp2, "_ernie5_gfx1151_hip", False):
+            @functools.wraps(orig_comp2)
+            def _compress_norm_rope_store_two_stage_hip(
+                state_cache, num_actual, token_to_req_indices, positions, slot_mapping,
+                block_table, block_size, state_width, cos_sin_cache, kv_cache,
+                k_cache_metadata, pdl_kwargs, head_dim, rope_head_dim, compress_ratio,
+                overlap, use_fp4_cache, rms_norm_weight, rms_norm_eps,
+                quant_block, token_stride, scale_dim, num_decode_tokens, compress_scratch,
+            ):
+                import torch
+                if (
+                    not (getattr(rmod, "_ON_GFX950", False) or getattr(rmod, "_ON_GFX942", False))
+                    and head_dim == 512
+                    and rope_head_dim == 64
+                    and compress_ratio == 128
+                    and not overlap
+                    and not use_fp4_cache
+                    and state_cache.is_cuda
+                    and state_cache.dtype == torch.float32
+                    and kv_cache.dtype == torch.uint8
+                ):
+                    from .fast_ops import get_fast_ops
+                    fops = get_fast_ops()
+                    if fops is not None and hasattr(fops, "compress_norm_rope_store_c128"):
+                        fops.compress_norm_rope_store_c128(
+                            state_cache, int(num_actual), token_to_req_indices, positions,
+                            slot_mapping, block_table, int(block_size), int(state_width),
+                            rms_norm_weight, float(rms_norm_eps), cos_sin_cache,
+                            kv_cache, k_cache_metadata.slot_mapping, int(kv_cache.shape[1]),
+                        )
+                        return
+                return orig_comp2(
+                    state_cache=state_cache, num_actual=num_actual,
+                    token_to_req_indices=token_to_req_indices, positions=positions,
+                    slot_mapping=slot_mapping, block_table=block_table,
+                    block_size=block_size, state_width=state_width,
+                    cos_sin_cache=cos_sin_cache, kv_cache=kv_cache,
+                    k_cache_metadata=k_cache_metadata, pdl_kwargs=pdl_kwargs,
+                    head_dim=head_dim, rope_head_dim=rope_head_dim,
+                    compress_ratio=compress_ratio, overlap=overlap,
+                    use_fp4_cache=use_fp4_cache, rms_norm_weight=rms_norm_weight,
+                    rms_norm_eps=rms_norm_eps, quant_block=quant_block,
+                    token_stride=token_stride, scale_dim=scale_dim,
+                    num_decode_tokens=num_decode_tokens, compress_scratch=compress_scratch,
+                )
+
+            _compress_norm_rope_store_two_stage_hip._ernie5_gfx1151_hip = True  # type: ignore[attr-defined]
+            comp_mod.compress_norm_rope_store_two_stage_triton = _compress_norm_rope_store_two_stage_hip
     except Exception:
         pass
 

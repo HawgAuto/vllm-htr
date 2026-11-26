@@ -341,6 +341,33 @@ __global__ __launch_bounds__(128) void k_ernie_dsa_split_reduce(
 // - 4x fewer global KV loads & FP8/NVFP4 dequants (all 64 heads share ONE KV_lds + VT_lds!)
 // - Zero ds_load_u16 in P@V (128-bit VT_lds loads + 1-ahead prefetch + zero sched_barrier!)
 // - 4x parallel online softmax across all 4 head-groups simultaneously!
+
+// Fast NaN-free BF16x2 RNE pack for finite quantized dequant values (5 ops vs 14!)
+__device__ __forceinline__ uint32_t f32_to_bf16x2_fast(float a, float b) {
+  uint32_t ua = __float_as_uint(a);
+  uint32_t ub = __float_as_uint(b);
+  ua += 0x7fffu + ((ua >> 16) & 1u);
+  ub += 0x7fffu + ((ub >> 16) & 1u);
+  return __builtin_amdgcn_perm(ub, ua, 0x07060302u);
+}
+
+// Register-only branchless FP4 E2M1 -> FP32 (0 LDS loads, 0 bank conflicts!)
+// E2M1 nib = (s<<3)|(e<<1)|m -> {0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0} * (-1)^s
+__device__ __forceinline__ float e2m1_reg_to_f32(uint32_t nib) {
+  const uint32_t s = (nib & 8u) << 28;
+  const uint32_t mag = nib & 7u;
+  // Exact FP32 bits for mag 0..7:
+  // 0->0x00000000, 1->0x3f000000, 2->0x3f800000, 3->0x3fc00000,
+  // 4->0x40000000, 5->0x40400000, 6->0x40800000, 7->0x40c00000
+  // For mag>=2: bits = (0x3f000000 + ((mag >> 1) << 23)) | ((mag & 1) << 22)
+  // Wait: mag=2->0x3f800000, mag=3->0x3fc00000, mag=4->0x40000000, mag=5->0x40400000, mag=6->0x40800000, mag=7->0x40c00000!
+  // Check mag=1: 0x3f000000! Formula: exp_off = (mag >> 1) -> 0x3f000000 + (mag>>1)*0x00800000 + (mag&1)*0x00400000 for mag>=2,
+  // and for mag==1: 0x3f000000, mag==0: 0!
+  const uint32_t hi = (0x3f000000u + (mag << 22));
+  const uint32_t bits = (mag < 2u) ? (mag ? 0x3f000000u : 0u) : hi;
+  return __uint_as_float(s | bits);
+}
+
 #define DSA_VT_STRIDE 18  // 36B = 9 banks (odd -> low bank conflict, 18 KiB!)
 
 __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_prefill_v28(
@@ -1588,7 +1615,7 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_prefill_v28(
     int64_t idx_s0, int64_t out_s0, int64_t out_s1,
     int num_blocks, int block_size, int W, float scale) {
   __shared__ __attribute__((aligned(16))) uint16_t KV_lds[16][DSA_STRIDE];         // 18,688 B
-  __shared__ __attribute__((aligned(16))) uint16_t VT_lds[DSA_NOPE][DSA_VT_STRIDE]; // 18,432 B
+  __shared__ __attribute__((aligned(16))) uint16_t VT_lds_g[16][32 * DSA_VT_STRIDE + 2]; // 18,496 B (zero 16-way bank conflicts!)
   __shared__ float S_part[4][16][16];                                               //  4,096 B
   __shared__ __attribute__((aligned(16))) uint16_t P_lds[4][16][16];                //  2,048 B
   __shared__ float fp8_lut[256];                                                    //  1,024 B
@@ -1670,16 +1697,17 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_prefill_v28(
 #pragma unroll
           for (int w = 0; w < 4; ++w) {
             const uint32_t x = ws[w];
-            pk[w * 2 + 0] = f32_to_bf16x2_rne(fp8_lut[x & 0xFFu] * sc, fp8_lut[(x >> 8) & 0xFFu] * sc);
-            pk[w * 2 + 1] = f32_to_bf16x2_rne(fp8_lut[(x >> 16) & 0xFFu] * sc, fp8_lut[(x >> 24) & 0xFFu] * sc);
+            pk[w * 2 + 0] = f32_to_bf16x2_fast(fp8_lut[x & 0xFFu] * sc, fp8_lut[(x >> 8) & 0xFFu] * sc);
+            pk[w * 2 + 1] = f32_to_bf16x2_fast(fp8_lut[(x >> 16) & 0xFFu] * sc, fp8_lut[(x >> 24) & 0xFFu] * sc);
           }
           const int col0 = sub16 * 32 + c2 * 16;
           *reinterpret_cast<u4va*>(&KV_lds[kr_ld][col0 + 0]) = (u4v){pk[0], pk[1], pk[2], pk[3]};
           *reinterpret_cast<u4va*>(&KV_lds[kr_ld][col0 + 8]) = (u4v){pk[4], pk[5], pk[6], pk[7]};
+          uint16_t* vt_dst = &VT_lds_g[sub16][c2 * 16 * DSA_VT_STRIDE + kr_ld];
 #pragma unroll
           for (int p = 0; p < 8; ++p) {
-            VT_lds[col0 + p * 2 + 0][kr_ld] = (uint16_t)(pk[p] & 0xFFFFu);
-            VT_lds[col0 + p * 2 + 1][kr_ld] = (uint16_t)(pk[p] >> 16);
+            vt_dst[(p * 2 + 0) * DSA_VT_STRIDE] = (uint16_t)(pk[p] & 0xFFFFu);
+            vt_dst[(p * 2 + 1) * DSA_VT_STRIDE] = (uint16_t)(pk[p] >> 16);
           }
         }
         if (sub16 < 8) {
@@ -1698,25 +1726,26 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_prefill_v28(
           for (int b = 0; b < 4; ++b) {
             const uint32_t byte0 = (raw.x >> (b * 8)) & 0xFFu;
             const uint32_t byte1 = (raw.y >> (b * 8)) & 0xFFu;
-            pk[b]     = f32_to_bf16x2_rne(e2m1_lut[byte0 & 0xFu] * sc, e2m1_lut[byte0 >> 4] * sc);
-            pk[b + 4] = f32_to_bf16x2_rne(e2m1_lut[byte1 & 0xFu] * sc, e2m1_lut[byte1 >> 4] * sc);
+            pk[b]     = f32_to_bf16x2_fast(e2m1_reg_to_f32(byte0 & 0xFu) * sc, e2m1_reg_to_f32(byte0 >> 4) * sc);
+            pk[b + 4] = f32_to_bf16x2_fast(e2m1_reg_to_f32(byte1 & 0xFu) * sc, e2m1_reg_to_f32(byte1 >> 4) * sc);
           }
           const int col0 = sub16 * 32 + mb * 16;
           *reinterpret_cast<u4va*>(&KV_lds[kr_ld][col0 + 0]) = (u4v){pk[0], pk[1], pk[2], pk[3]};
           *reinterpret_cast<u4va*>(&KV_lds[kr_ld][col0 + 8]) = (u4v){pk[4], pk[5], pk[6], pk[7]};
+          uint16_t* vt_dst = &VT_lds_g[sub16][mb * 16 * DSA_VT_STRIDE + kr_ld];
 #pragma unroll
           for (int p = 0; p < 8; ++p) {
-            VT_lds[col0 + p * 2 + 0][kr_ld] = (uint16_t)(pk[p] & 0xFFFFu);
-            VT_lds[col0 + p * 2 + 1][kr_ld] = (uint16_t)(pk[p] >> 16);
+            vt_dst[(p * 2 + 0) * DSA_VT_STRIDE] = (uint16_t)(pk[p] & 0xFFFFu);
+            vt_dst[(p * 2 + 1) * DSA_VT_STRIDE] = (uint16_t)(pk[p] >> 16);
           }
         }
         if (sub16 < 8) {
           const uint2 rraw = *reinterpret_cast<const uint2*>(row_p + 256 + sub16 * 8);
           u4v rp;
-          rp.x = f32_to_bf16x2_rne(fp8_lut[rraw.x & 0xFFu], fp8_lut[(rraw.x >> 8) & 0xFFu]);
-          rp.y = f32_to_bf16x2_rne(fp8_lut[(rraw.x >> 16) & 0xFFu], fp8_lut[(rraw.x >> 24) & 0xFFu]);
-          rp.z = f32_to_bf16x2_rne(fp8_lut[rraw.y & 0xFFu], fp8_lut[(rraw.y >> 8) & 0xFFu]);
-          rp.w = f32_to_bf16x2_rne(fp8_lut[(rraw.y >> 16) & 0xFFu], fp8_lut[(rraw.y >> 24) & 0xFFu]);
+          rp.x = f32_to_bf16x2_fast(fp8_lut[rraw.x & 0xFFu], fp8_lut[(rraw.x >> 8) & 0xFFu]);
+          rp.y = f32_to_bf16x2_fast(fp8_lut[(rraw.x >> 16) & 0xFFu], fp8_lut[(rraw.x >> 24) & 0xFFu]);
+          rp.z = f32_to_bf16x2_fast(fp8_lut[rraw.y & 0xFFu], fp8_lut[(rraw.y >> 8) & 0xFFu]);
+          rp.w = f32_to_bf16x2_fast(fp8_lut[(rraw.y >> 16) & 0xFFu], fp8_lut[(rraw.y >> 24) & 0xFFu]);
           *reinterpret_cast<u4va*>(&KV_lds[kr_ld][512 + sub16 * 8]) = rp;
         }
       }
@@ -1727,7 +1756,7 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_prefill_v28(
         *reinterpret_cast<u4va*>(&KV_lds[kr_ld][sub16 * 32 + c4 * 8]) = z;
       }
 #pragma unroll
-      for (int e = 0; e < 32; ++e) VT_lds[sub16 * 32 + e][kr_ld] = 0u;
+      for (int e = 0; e < 32; ++e) VT_lds_g[sub16][e * DSA_VT_STRIDE + kr_ld] = 0u;
       if (sub16 < 8) *reinterpret_cast<u4va*>(&KV_lds[kr_ld][512 + sub16 * 8]) = z;
     }
     __syncthreads();
@@ -1800,15 +1829,18 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_prefill_v28(
     const u4v p1 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][8]);
     const bf16x16 pf = __builtin_bit_cast(bf16x16, (u8v){p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w});
 
-    u4v v0_c = *reinterpret_cast<const u4va*>(&VT_lds[vd_start + l16][0]);
-    u4v v1_c = *reinterpret_cast<const u4va*>(&VT_lds[vd_start + l16][8]);
+    const int vg0 = vd_start >> 5;
+    u4v v0_c = *reinterpret_cast<const u4va*>(&VT_lds_g[vg0][l16 * DSA_VT_STRIDE + 0]);
+    u4v v1_c = *reinterpret_cast<const u4va*>(&VT_lds_g[vg0][l16 * DSA_VT_STRIDE + 8]);
 #pragma unroll
     for (int j = 0; j < 16; ++j) {
       u4v v0_n = {0u, 0u, 0u, 0u}, v1_n = {0u, 0u, 0u, 0u};
       if (j + 1 < 16) {
         const int vc_n = vd_start + (j + 1) * 16 + l16;
-        v0_n = *reinterpret_cast<const u4va*>(&VT_lds[vc_n][0]);
-        v1_n = *reinterpret_cast<const u4va*>(&VT_lds[vc_n][8]);
+        const int vgn = vc_n >> 5;
+        const int vln = vc_n & 31;
+        v0_n = *reinterpret_cast<const u4va*>(&VT_lds_g[vgn][vln * DSA_VT_STRIDE + 0]);
+        v1_n = *reinterpret_cast<const u4va*>(&VT_lds_g[vgn][vln * DSA_VT_STRIDE + 8]);
       }
       const bf16x16 vf = __builtin_bit_cast(bf16x16, (u8v){v0_c.x, v0_c.y, v0_c.z, v0_c.w, v1_c.x, v1_c.y, v1_c.z, v1_c.w});
       o_acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pf, vf, o_acc[j]);

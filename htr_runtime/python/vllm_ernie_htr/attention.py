@@ -209,7 +209,8 @@ class VHAPostMix(nn.Module):
     def forward(self, o: torch.Tensor) -> torch.Tensor:
         if self.tp_size == 1:
             if o.dtype == torch.bfloat16 and self._m_bf16 is not None:
-                if _USE_VHA_HIP and o.is_cuda and o.dim() == 3 and o.shape[1] == 64 and (o.shape[2] % 64 == 0) and o.stride(2) == 1:
+                _vha_max_t = 12 if o.shape[2] >= 512 else 48
+                if _USE_VHA_HIP and o.is_cuda and o.dim() == 3 and o.shape[0] <= _vha_max_t and o.shape[1] == 64 and (o.shape[2] % 64 == 0) and o.stride(2) == 1:
                     fops = get_fast_ops()
                     if fops is not None and hasattr(fops, "vha_mix_bf16"):
                         return fops.vha_mix_bf16(self._m_bf16, o)
@@ -500,6 +501,7 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
         # o_padded is already inverse-RoPE'd by DeepseekV4ROCMAiterMLAAttention.forward_mqa;
         # VHA operates on the head axis so it commutes with inverse RoPE.
         o = self.vha(o_padded[:, : self.n_local_heads, :])
+        del o_padded
         o_groups = o.reshape(num_tokens, self.n_local_groups, -1)
 
         if (
@@ -524,8 +526,10 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
                 )
             elif hasattr(ext, "wo_a_k5_prefill_wmma"):
                 # Batched 8-group K=5 WMMA + SAD_HI + fused sigmoid(gate) for ALL T > 16 (chunk=2048 -> 1.27x faster)!
-                for i in range(0, num_tokens, 2048):
-                    j = min(i + 2048, num_tokens)
+                _woa_chunk_env = _os.environ.get("ERNIE_WOA_PREFILL_CHUNK")
+                _woa_chunk = int(_woa_chunk_env) if _woa_chunk_env else (256 if num_tokens <= 1024 else 512)
+                for i in range(0, num_tokens, _woa_chunk):
+                    j = min(i + _woa_chunk, num_tokens)
                     xt_b, tok_b = _woa_prefill_scratch(o_groups.device, j - i)
                     ext.wo_a_k5_prefill_wmma(
                         qw, sc, su, sv, o_groups[i:j], gl[i:j], xt_b, tok_b, z_gated[i:j],
@@ -1466,19 +1470,6 @@ class Ernie5_5DSAAttention(nn.Module):
             is_neox_style=False,
             rope_parameters=config.mla_rope_parameters,
         )
-        # _ernie5_dedup_dsa_rope: share bitwise-identical cos_sin_cache with indexer (-128 MiB @ 1M)
-        try:
-            _idx_rope = getattr(getattr(self, "indexer", None), "rotary_emb", None)
-            _c1 = getattr(self.rotary_emb, "cos_sin_cache", None)
-            _c2 = getattr(_idx_rope, "cos_sin_cache", None)
-            if (
-                _c1 is not None and _c2 is not None and _c1 is not _c2
-                and _c1.shape == _c2.shape and _c1.dtype == _c2.dtype and _c1.device == _c2.device
-                and torch.equal(_c1[:64], _c2[:64]) and torch.equal(_c1[-64:], _c2[-64:])
-            ):
-                _idx_rope.cos_sin_cache = _c1
-        except Exception:
-            pass
         self.attn_sink = nn.Parameter(
             torch.empty(self.num_local_heads, dtype=torch.float32), requires_grad=False
         )
@@ -1491,6 +1482,19 @@ class Ernie5_5DSAAttention(nn.Module):
             swa_topk_buffer,
             prefix=f"{prefix}.indexer",
         )
+        # _ernie5_dedup_dsa_rope: share bitwise-identical cos_sin_cache with indexer (-128 MiB @ 1M)
+        try:
+            _idx_rope = getattr(self.indexer, "rotary_emb", None)
+            _c1 = getattr(self.rotary_emb, "cos_sin_cache", None)
+            _c2 = getattr(_idx_rope, "cos_sin_cache", None)
+            if (
+                _c1 is not None and _c2 is not None and _c1 is not _c2
+                and _c1.shape == _c2.shape and _c1.dtype == _c2.dtype and _c1.device == _c2.device
+                and torch.equal(_c1[:64], _c2[:64]) and torch.equal(_c1[-64:], _c2[-64:])
+            ):
+                _idx_rope.cos_sin_cache = _c1
+        except Exception:
+            pass
         self.mla_attn = Ernie5_5MLAAttention(
             num_heads=self.num_local_heads,
             scale=self.qk_head_dim**-0.5,
