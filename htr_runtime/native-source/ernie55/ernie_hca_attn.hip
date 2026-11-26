@@ -568,8 +568,8 @@ __global__ __launch_bounds__(256, 2) void k_ernie_hca_decode_qreg_v28(
   __shared__ HcaPassArgs s_pass[2];
   // Total LDS ~ 27.9 KiB (< 32 KiB -> 2 WGs/CU!)
 
-  const int t = blockIdx.x;
-  const int hg2 = blockIdx.y;        // 0..(H/32 - 1), each WG handles 32 heads (2 x 16)
+  const int t = blockIdx.y;
+  const int hg2 = blockIdx.x;        // 0..(H/32 - 1), each WG handles 32 heads (2 x 16)
   const int sp = blockIdx.z;
   const int tid = threadIdx.x;       // 0..255
   const int wave = tid >> 5;         // 0..7
@@ -689,11 +689,12 @@ __global__ __launch_bounds__(256, 2) void k_ernie_hca_decode_qreg_v28(
         VT[v_col + 1][kr] = (uint16_t)(vt_tmp[kr] >> 16);
       }
 
-      // Online softmax in dq == 0 (BOTH mg == 0 and mg == 1 in parallel across 2 waves!)
-      if (dq == 0) {
+      // 4-way parallel online softmax across ALL 4 dq waves (2 ei/wave instead of 8 on dq==0!)
+      {
         const bool vld = (s_valid[l16] != 0);
 #pragma unroll
-        for (int ei = 0; ei < 8; ++ei) {
+        for (int e_sub = 0; e_sub < 2; ++e_sub) {
+          const int ei = dq * 2 + e_sub;
           const int hm = 2 * ei + hrow;
           float sc = S_part[mg][0][hm][l16] + S_part[mg][1][hm][l16]
                    + S_part[mg][2][hm][l16] + S_part[mg][3][hm][l16];
@@ -830,14 +831,14 @@ void ernie_hca_decode(
     auto run_qreg = [&](auto tag) {
       constexpr int S = decltype(tag)::value;
       if (has_extra) {
-        hipLaunchKernelGGL((k_ernie_hca_decode_qreg_v28<S, 1>), dim3(T, hg2, S), dim3(256), 0, st,
+        hipLaunchKernelGGL((k_ernie_hca_decode_qreg_v28<S, 1>), dim3(hg2, T, S), dim3(256), 0, st,
                            qp, mc, mi, mip, ec, ei, eip,
                            part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
                            q.stride(0), q.stride(1), main_cache.stride(0), es0,
                            (int)(main_cache.size(0) * main_cache.size(1)), enr,
                            mbs, ebs, H, (float)scale, is_fnuz_main ? 1 : 0);
       } else {
-        hipLaunchKernelGGL((k_ernie_hca_decode_qreg_v28<S, 0>), dim3(T, hg2, S), dim3(256), 0, st,
+        hipLaunchKernelGGL((k_ernie_hca_decode_qreg_v28<S, 0>), dim3(hg2, T, S), dim3(256), 0, st,
                            qp, mc, mi, mip, ec, ei, eip,
                            part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
                            q.stride(0), q.stride(1), main_cache.stride(0), es0,
