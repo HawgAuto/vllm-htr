@@ -844,10 +844,13 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_mqa_logits_prefill(
   }
 }
 
-// FlashIndexer H=8 FP8 MQA Logits Prefill: 4 query rows per 128-thread block!
-// Each Wave32 owns 1 distinct query row m (8 heads in l16=0..7) and all 4 waves share K_lds[16][136]
-// -> 4x fewer K-cache fetches + 8x fewer WMMA ops vs H=64! Zero spills, zero divOps.
-__global__ __launch_bounds__(128) void k_ernie_fp8_mqa_logits_prefill_h8(
+// FlashIndexer H=8 FP8 MQA Logits Prefill (v0.2.8 Wave 11A):
+//   - Block=256 (8 Wave32s), M_BLK=16 (2 query tokens x 8 heads = 16 Q-rows/wave -> 100% WMMA!)
+//   - N_TILE=32 (2 K-tiles/iter, 16 tokens share every K_lds[32][136] -> 4x fewer K loads & FP8 decodes)
+//   - Ping-pong kf0/kf1 register overlap across 16 WMMAs (zero lgkmcnt(0) stalls!)
+//   - Weights hoisted into VGPRs once; full 32-lane 128B coalesced output stores; GL2-resident dim3(m_blocks, n_splits)
+template <int NT_OUT>
+__global__ __launch_bounds__(256, 2) void k_ernie_fp8_mqa_logits_prefill_h8(
     const uint8_t* __restrict__ q_fp8,       // [M, 8, 128]
     const uint8_t* __restrict__ k_fp8,       // [N, 128]
     const float* __restrict__ k_scale,       // [N]
@@ -858,61 +861,57 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_mqa_logits_prefill_h8(
     int64_t q_s0, int64_t q_s1, int64_t k_s0, int64_t w_s0,
     int M, int N, int n_splits, int is_fnuz) {
   __shared__ _Float16 fp8_lut[256];
-  __shared__ __attribute__((aligned(16))) _Float16 K_lds[16][136];
-  __shared__ float s_weights[4][8];
-  __shared__ float s_kscale[16];
-  __shared__ int s_ks[4];
-  __shared__ int s_ke[4];
+  __shared__ __attribute__((aligned(16))) _Float16 K_lds[32][136]; // 8.5 KiB
+  __shared__ float s_kscale[32];
+  __shared__ int s_ks[16];
+  __shared__ int s_ke[16];
   __shared__ int s_blk_lo;
   __shared__ int s_blk_hi;
 
-  const int split = blockIdx.x;
-  const int m_base = blockIdx.y * 4;
+  const int m_base = blockIdx.x * 16;
+  const int split = blockIdx.y;
   const int tid = threadIdx.x;
-  const int wave = tid >> 5;
-  const int lane = tid & 31;
-  const int l16 = lane & 15;
-  const int hrow = lane >> 4;
-  const int m = m_base + wave;
-  const bool m_valid = (m < M);
+  const int wave = tid >> 5;   // 0..7
+  const int lane = tid & 31;   // 0..31
+  const int l16 = lane & 15;   // 0..15
+  const int hrow = lane >> 4;  // 0..1
+  const int m0 = m_base + wave * 2;
+  const int m1 = m0 + 1;
+  const bool m0_valid = (m0 < M);
+  const bool m1_valid = (m1 < M);
 
-  const int n_tiles = (N + 15) >> 4;
+  const int n_tiles = (N + 31) >> 5;
   const int tiles_per_sp = (n_tiles + n_splits - 1) / n_splits;
   const int t_lo = split * tiles_per_sp;
   const int t_hi = min(n_tiles, t_lo + tiles_per_sp);
   if (t_lo >= t_hi) return;
 
-  const int n_lo = t_lo << 4;
-  const int n_hi = min(N, t_hi << 4);
+  const int n_lo = t_lo << 5;
+  const int n_hi = min(N, t_hi << 5);
 
   fp8_lut[tid] = fp8_byte_to_f16((uint32_t)tid, is_fnuz);
-  fp8_lut[tid + 128] = fp8_byte_to_f16((uint32_t)(tid + 128), is_fnuz);
 
-  if (lane == 0) {
-    if (m_valid) {
-      int ks_v = max(0, min(N, cu_ks[m]));
-      int ke_v = max(ks_v, min(N, cu_ke[m]));
-      s_ks[wave] = ks_v;
-      s_ke[wave] = ke_v;
+  if (tid < 16) {
+    const int m_i = m_base + tid;
+    if (m_i < M) {
+      int ks_v = max(0, min(N, cu_ks[m_i]));
+      int ke_v = max(ks_v, min(N, cu_ke[m_i]));
+      s_ks[tid] = ks_v;
+      s_ke[tid] = ke_v;
     } else {
-      s_ks[wave] = N;
-      s_ke[wave] = N;
+      s_ks[tid] = N;
+      s_ke[tid] = N;
     }
-  }
-  if (m_valid && lane < 8) {
-    s_weights[wave][lane] = weights[(int64_t)m * w_s0 + lane];
-  } else if (lane < 8) {
-    s_weights[wave][lane] = 0.0f;
   }
   __syncthreads();
 
   if (tid == 0) {
     int blo = t_hi;
     int bhi = t_lo;
-    for (int w = 0; w < 4; ++w) {
+    for (int w = 0; w < 16; ++w) {
       if (m_base + w < M && s_ks[w] < s_ke[w]) {
-        int alo = max(t_lo, s_ks[w] >> 4);
-        int ahi = min(t_hi, (s_ke[w] + 15) >> 4);
+        int alo = max(t_lo, s_ks[w] >> 5);
+        int ahi = min(t_hi, (s_ke[w] + 31) >> 5);
         if (alo < ahi) {
           if (alo < blo) blo = alo;
           if (ahi > bhi) bhi = ahi;
@@ -926,27 +925,59 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_mqa_logits_prefill_h8(
 
   const int blk_lo = s_blk_lo;
   const int blk_hi = s_blk_hi;
-  const int ks_m = s_ks[wave];
-  const int ke_m = s_ke[wave];
-  float* out_row = m_valid ? (out_logits + (int64_t)m * N) : nullptr;
+  const int ks_m0 = s_ks[wave * 2 + 0];
+  const int ke_m0 = s_ke[wave * 2 + 0];
+  const int ks_m1 = s_ks[wave * 2 + 1];
+  const int ke_m1 = s_ke[wave * 2 + 1];
+  float* out_row0 = m0_valid ? (out_logits + (int64_t)m0 * N) : nullptr;
+  float* out_row1 = m1_valid ? (out_logits + (int64_t)m1 * N) : nullptr;
+
+  auto store_out = [](float* ptr, float val) {
+    if constexpr (NT_OUT) {
+      __builtin_nontemporal_store(val, ptr);
+    } else {
+      *ptr = val;
+    }
+  };
 
   if (blk_lo >= blk_hi) {
-    if (m_valid) {
-      for (int gn = n_lo + lane; gn < n_hi; gn += 32) out_row[gn] = -INFINITY;
+    if (m0_valid) {
+      for (int gn = n_lo + lane; gn < n_hi; gn += 32) store_out(out_row0 + gn, -INFINITY);
+    }
+    if (m1_valid) {
+      for (int gn = n_lo + lane; gn < n_hi; gn += 32) store_out(out_row1 + gn, -INFINITY);
     }
     return;
   }
-  if (m_valid) {
-    const int pre_end = min(n_hi, blk_lo << 4);
-    for (int gn = n_lo + lane; gn < pre_end; gn += 32) out_row[gn] = -INFINITY;
-    const int suf_start = max(n_lo, blk_hi << 4);
-    for (int gn = suf_start + lane; gn < n_hi; gn += 32) out_row[gn] = -INFINITY;
+  {
+    const int pre_end = min(n_hi, blk_lo << 5);
+    const int suf_start = max(n_lo, blk_hi << 5);
+    if (m0_valid) {
+      for (int gn = n_lo + lane; gn < pre_end; gn += 32) store_out(out_row0 + gn, -INFINITY);
+      for (int gn = suf_start + lane; gn < n_hi; gn += 32) store_out(out_row0 + gn, -INFINITY);
+    }
+    if (m1_valid) {
+      for (int gn = n_lo + lane; gn < pre_end; gn += 32) store_out(out_row1 + gn, -INFINITY);
+      for (int gn = suf_start + lane; gn < n_hi; gn += 32) store_out(out_row1 + gn, -INFINITY);
+    }
   }
 
-  // Decode Q[m, 0..7, 0..127] ONCE into registers (l16 < 8 valid, l16 >= 8 zero)
+  // Hoist per-wave weights for m0 & m1 into 8 VGPRs ONCE (zero LDS reads in loop!)
+  float w0[4], w1[4];
+#pragma unroll
+  for (int ei = 0; ei < 4; ++ei) {
+    const int h = 2 * ei + hrow;
+    w0[ei] = m0_valid ? weights[(int64_t)m0 * w_s0 + h] : 0.0f;
+    w1[ei] = m1_valid ? weights[(int64_t)m1 * w_s0 + h] : 0.0f;
+  }
+
+  // Decode Q[m0..m1, 0..7, 0..127] ONCE into registers (l16<8 -> m0, l16>=8 -> m1)
+  const int m_q = (l16 < 8) ? m0 : m1;
+  const int h_q = l16 & 7;
+  const bool q_valid = (m_q < M);
   f16x16 q_reg[8];
-  if (m_valid && l16 < 8) {
-    const uint8_t* qp = q_fp8 + (int64_t)m * q_s0 + (int64_t)l16 * q_s1;
+  if (q_valid) {
+    const uint8_t* qp = q_fp8 + (int64_t)m_q * q_s0 + (int64_t)h_q * q_s1;
 #pragma unroll
     for (int pair = 0; pair < 4; ++pair) {
       const u4v raw0 = *reinterpret_cast<const u4va*>(qp + (pair * 2 + 0) * 16);
@@ -974,20 +1005,20 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_mqa_logits_prefill_h8(
     for (int s = 0; s < 8; ++s) q_reg[s] = zf;
   }
 
-  const int kr = tid >> 3;         // 0..15
+  const int kr = tid >> 3;         // 0..31 (exact 1 row per 8 threads!)
   const int kc16 = (tid & 7) * 16; // 0, 16, ..., 112
-  const int blk_n_lo = blk_lo << 4;
-  const int blk_n_hi = min(N, blk_hi << 4);
+  const int blk_n_lo = blk_lo << 5;
+  const int blk_n_hi = min(N, blk_hi << 5);
 
   auto fetch_k = [&](int ti, u4v& out_raw, float& out_sc) {
-    const int n0 = ti << 4;
+    const int n0 = ti << 5;
     const int gn = n0 + kr;
     if (gn >= blk_n_lo && gn < blk_n_hi) {
       out_raw = *reinterpret_cast<const u4va*>(k_fp8 + (int64_t)gn * k_s0 + kc16);
     } else {
       out_raw = (u4v){0u, 0u, 0u, 0u};
     }
-    if (tid < 16) {
+    if (tid < 32) {
       const int gns = n0 + tid;
       out_sc = (gns >= blk_n_lo && gns < blk_n_hi) ? k_scale[gns] : 0.0f;
     } else {
@@ -995,12 +1026,18 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_mqa_logits_prefill_h8(
     }
   };
 
+  auto load_k16 = [](const _Float16* row_ptr, int d) -> f16x16 {
+    const u4v k0 = *reinterpret_cast<const u4va*>(row_ptr + d);
+    const u4v k1 = *reinterpret_cast<const u4va*>(row_ptr + d + 8);
+    return __builtin_bit_cast(f16x16, (u8v){k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w});
+  };
+
   u4v raw_cur = {0u, 0u, 0u, 0u};
   float sc_cur = 0.0f;
   fetch_k(blk_lo, raw_cur, sc_cur);
 
   for (int ti = blk_lo; ti < blk_hi; ++ti) {
-    const int n0 = ti << 4;
+    const int n0 = ti << 5;
     const int gn = n0 + kr;
     if (gn >= blk_n_lo && gn < blk_n_hi) {
       const uint32_t ws[4] = {raw_cur.x, raw_cur.y, raw_cur.z, raw_cur.w};
@@ -1022,7 +1059,7 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_mqa_logits_prefill_h8(
       *reinterpret_cast<u4va*>(&K_lds[kr][kc16]) = z;
       *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 8]) = z;
     }
-    if (tid < 16) s_kscale[tid] = sc_cur;
+    if (tid < 32) s_kscale[tid] = sc_cur;
     __syncthreads();
 
     u4v raw_nxt = {0u, 0u, 0u, 0u};
@@ -1030,31 +1067,44 @@ __global__ __launch_bounds__(128) void k_ernie_fp8_mqa_logits_prefill_h8(
     if (ti + 1 < blk_hi) fetch_k(ti + 1, raw_nxt, sc_nxt);
     __builtin_amdgcn_sched_barrier(0);
 
-    f32x8 acc = {0, 0, 0, 0, 0, 0, 0, 0};
+    f32x8 acc0 = {0, 0, 0, 0, 0, 0, 0, 0};
+    f32x8 acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
+    f16x16 kf0 = load_k16(&K_lds[l16][0], 0);
 #pragma unroll
     for (int step = 0; step < 8; ++step) {
       const int d = step * 16;
-      const u4v k0 = *reinterpret_cast<const u4va*>(&K_lds[l16][d]);
-      const u4v k1 = *reinterpret_cast<const u4va*>(&K_lds[l16][d + 8]);
-      const f16x16 kf = __builtin_bit_cast(f16x16, (u8v){k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w});
-      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(q_reg[step], kf, acc);
-      __builtin_amdgcn_sched_barrier(0);
+      f16x16 kf1 = load_k16(&K_lds[16 + l16][0], d);
+      acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(q_reg[step], kf0, acc0);
+      if (step + 1 < 8) {
+        kf0 = load_k16(&K_lds[l16][0], d + 16);
+      }
+      acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(q_reg[step], kf1, acc1);
     }
 
-    if (m_valid) {
-      const float kscl = s_kscale[l16];
-      float sum_h = 0.0f;
+    const float ks0 = s_kscale[l16];
+    const float ks1 = s_kscale[16 + l16];
+    float s0a = 0.0f, s1a = 0.0f, s0b = 0.0f, s1b = 0.0f;
 #pragma unroll
-      for (int ei = 0; ei < 4; ++ei) {
-        const float sc = fmaxf(acc[ei] * kscl, 0.0f);
-        sum_h = __builtin_fmaf(sc, s_weights[wave][2 * ei + hrow], sum_h);
+    for (int ei = 0; ei < 4; ++ei) {
+      s0a = __builtin_fmaf(fmaxf(acc0[ei] * ks0, 0.0f), w0[ei], s0a);
+      s1a = __builtin_fmaf(fmaxf(acc0[ei + 4] * ks0, 0.0f), w1[ei], s1a);
+      s0b = __builtin_fmaf(fmaxf(acc1[ei] * ks1, 0.0f), w0[ei], s0b);
+      s1b = __builtin_fmaf(fmaxf(acc1[ei + 4] * ks1, 0.0f), w1[ei], s1b);
+    }
+    s0a += shx_f<16>(s0a);
+    s1a += shx_f<16>(s1a);
+    s0b += shx_f<16>(s0b);
+    s1b += shx_f<16>(s1b);
+
+    const int gn_out = n0 + lane;
+    if (gn_out < N) {
+      if (m0_valid) {
+        const float v0 = (hrow == 0) ? s0a : s0b;
+        store_out(out_row0 + gn_out, (gn_out >= ks_m0 && gn_out < ke_m0) ? v0 : -INFINITY);
       }
-      sum_h += shx_f<16>(sum_h);
-      if (hrow == 0) {
-        const int gn_out = n0 + l16;
-        if (gn_out < N) {
-          out_row[gn_out] = (gn_out >= ks_m && gn_out < ke_m) ? sum_h : -INFINITY;
-        }
+      if (m1_valid) {
+        const float v1 = (hrow == 0) ? s1a : s1b;
+        store_out(out_row1 + gn_out, (gn_out >= ks_m1 && gn_out < ke_m1) ? v1 : -INFINITY);
       }
     }
     __syncthreads();
@@ -1078,10 +1128,11 @@ torch::Tensor ernie_fp8_mqa_logits_prefill(
   auto st = c10::hip::getCurrentHIPStream().stream();
   const int n_tiles = (N + 15) / 16;
   if (H == 8) {
-    const int m_blocks = (M + 3) / 4;
-    const int n_splits = max(1, min(n_tiles, max(1, 256 / m_blocks)));
+    const int m_blocks = (M + 15) / 16;
+    const int n_tiles32 = (N + 31) / 32;
+    const int n_splits = max(1, min(n_tiles32, max(max(1, 256 / max(1, m_blocks)), (N + 16383) / 16384)));
     hipLaunchKernelGGL(
-        k_ernie_fp8_mqa_logits_prefill_h8, dim3(n_splits, m_blocks), dim3(128), 0, st,
+        (k_ernie_fp8_mqa_logits_prefill_h8<1>), dim3(m_blocks, n_splits), dim3(256), 0, st,
         reinterpret_cast<const uint8_t*>(q_fp8.data_ptr()),
         reinterpret_cast<const uint8_t*>(k_fp8.data_ptr()),
         ks_flat.data_ptr<float>(),
@@ -1591,8 +1642,8 @@ __global__ __launch_bounds__(128) void k_ernie_dsa_sparse_mla_quant(
   __shared__ float s_m[16];
   __shared__ float s_l[16];
 
-  const int t = blockIdx.x;
-  const int hg = blockIdx.y;
+  const int hg = blockIdx.x;
+  const int t = blockIdx.y;
   const int sp = blockIdx.z;
   const int tid = threadIdx.x;
   const int wave = tid >> 5;
@@ -1620,6 +1671,15 @@ __global__ __launch_bounds__(128) void k_ernie_dsa_sparse_mla_quant(
 
   const int32_t* idx_row = idx_ptr + (int64_t)t * idx_s0;
   const uint16_t* q_base = q_ptr + (int64_t)t * q_s0 + (int64_t)(h0 + l16) * q_s1;
+  bf16x16 q_reg[9];
+  const int d_start_q = wave * 144;
+#pragma unroll
+  for (int step = 0; step < 9; ++step) {
+    const int d = d_start_q + step * 16;
+    const u4v q0 = *reinterpret_cast<const u4va*>(q_base + d);
+    const u4v q1 = *reinterpret_cast<const u4va*>(q_base + d + 8);
+    q_reg[step] = __builtin_bit_cast(bf16x16, (u8v){q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w});
+  }
   const int total_slots = num_blocks * block_size;
   const int kr = tid >> 3;   // 0..15
   const int sub = tid & 7;   // 0..7
@@ -1714,19 +1774,16 @@ __global__ __launch_bounds__(128) void k_ernie_dsa_sparse_mla_quant(
     }
     __syncthreads();
 
-    // 2. Q @ K^T
+    // 2. Q @ K^T (Q resident in q_reg[9]!)
     f32x8 s_acc = {0, 0, 0, 0, 0, 0, 0, 0};
     const int d_start = wave * 144;
-#pragma unroll 1
+#pragma unroll
     for (int step = 0; step < 9; ++step) {
       const int d = d_start + step * 16;
-      const u4v q0 = *reinterpret_cast<const u4va*>(q_base + d);
-      const u4v q1 = *reinterpret_cast<const u4va*>(q_base + d + 8);
-      const bf16x16 qf = __builtin_bit_cast(bf16x16, (u8v){q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w});
       const u4v k0 = *reinterpret_cast<const u4va*>(&KV_lds[l16][d]);
       const u4v k1 = *reinterpret_cast<const u4va*>(&KV_lds[l16][d + 8]);
       const bf16x16 kf = __builtin_bit_cast(bf16x16, (u8v){k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w});
-      s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qf, kf, s_acc);
+      s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(q_reg[step], kf, s_acc);
     }
 #pragma unroll
     for (int ei = 0; ei < 8; ++ei) {
@@ -1734,12 +1791,12 @@ __global__ __launch_bounds__(128) void k_ernie_dsa_sparse_mla_quant(
     }
     __syncthreads();
 
-    // 3. Wave 0 reduces S_part + online softmax
-    if (wave == 0) {
+    // 3. 4-way parallel S_part reduction + online softmax across all 4 waves (4 heads/wave!)
+    {
       const bool vld = (s_valid[l16] != 0);
 #pragma unroll
-      for (int ei = 0; ei < 8; ++ei) {
-        const int hm = 2 * ei + hrow;
+      for (int ei = 0; ei < 2; ++ei) {
+        const int hm = wave * 4 + 2 * ei + hrow;
         float sc = S_part[0][hm][l16] + S_part[1][hm][l16] + S_part[2][hm][l16] + S_part[3][hm][l16];
         sc = vld ? (sc * scale) : NEG_INF;
         const float bmax = halfwave_max16(sc);
@@ -2439,13 +2496,13 @@ torch::Tensor ernie_dsa_sparse_mla_quant(
                            num_blocks, block_size, W, (float)scale);
       }
     } else if (kv_fmt == 1) {
-      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<1, 1, 0>), dim3(T, 4, 1), dim3(128), 0, st,
+      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<1, 1, 0>), dim3(4, T, 1), dim3(128), 0, st,
                          qp, kvp, ip, sp, op, nullptr, nullptr, nullptr,
                          q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
                          indices.stride(0), out.stride(0), out.stride(1),
                          num_blocks, block_size, W, (float)scale);
     } else {
-      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<2, 1, 0>), dim3(T, 4, 1), dim3(128), 0, st,
+      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<2, 1, 0>), dim3(4, T, 1), dim3(128), 0, st,
                          qp, kvp, ip, sp, op, nullptr, nullptr, nullptr,
                          q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
                          indices.stride(0), out.stride(0), out.stride(1),
@@ -2457,13 +2514,13 @@ torch::Tensor ernie_dsa_sparse_mla_quant(
     torch::Tensor pm = part_m_opt.has_value() ? *part_m_opt : torch::empty({T, 64, S}, q.options().dtype(torch::kFloat32));
     torch::Tensor pl = part_l_opt.has_value() ? *part_l_opt : torch::empty({T, 64, S}, q.options().dtype(torch::kFloat32));
     if (kv_fmt == 1) {
-      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<1, S, 1>), dim3(T, 4, S), dim3(128), 0, st,
+      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<1, S, 1>), dim3(4, T, S), dim3(128), 0, st,
                          qp, kvp, ip, sp, op, po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
                          q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
                          indices.stride(0), out.stride(0), out.stride(1),
                          num_blocks, block_size, W, (float)scale);
     } else {
-      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<2, S, 1>), dim3(T, 4, S), dim3(128), 0, st,
+      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<2, S, 1>), dim3(4, T, S), dim3(128), 0, st,
                          qp, kvp, ip, sp, op, po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
                          q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
                          indices.stride(0), out.stride(0), out.stride(1),
