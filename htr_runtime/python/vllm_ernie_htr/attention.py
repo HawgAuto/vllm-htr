@@ -500,6 +500,42 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
         )
         # o_padded is already inverse-RoPE'd by DeepseekV4ROCMAiterMLAAttention.forward_mqa;
         # VHA operates on the head axis so it commutes with inverse RoPE.
+        # Wave 10A fused VHA + wo_a prologue fast path for prefill (T > 16):
+        # eliminates 134.2 MiB intermediate BF16 tensor (268.4 MiB/layer DRAM R+W x 37L = -9.93 GB)!
+        if (
+            self._woa_packed is not None
+            and num_tokens > 16
+            and o_padded.dtype == torch.bfloat16
+            and o_padded.is_cuda
+            and self.vha.tp_size == 1
+            and self.vha._m_bf16 is not None
+            and self.n_local_heads == 64
+            and self.n_local_groups == 8
+            and o_padded.shape[2] == 512
+            and o_padded.stride(2) == 1
+        ):
+            ext = _woa_ext()
+            if hasattr(ext, "wo_a_vha_k5_prefill_wmma"):
+                qw, sc, su, sv = self._woa_packed
+                gl = gate_logits.contiguous()
+                z_gated = torch.empty(
+                    (num_tokens, self.n_local_groups * self.o_lora_rank),
+                    dtype=o_padded.dtype,
+                    device=o_padded.device,
+                )
+                _woa_chunk_env = _os.environ.get("ERNIE_WOA_PREFILL_CHUNK")
+                _woa_chunk = int(_woa_chunk_env) if _woa_chunk_env else 2048
+                for i in range(0, num_tokens, _woa_chunk):
+                    j = min(i + _woa_chunk, num_tokens)
+                    xt_b, tok_b = _woa_prefill_scratch(o_padded.device, j - i)
+                    ext.wo_a_vha_k5_prefill_wmma(
+                        qw, sc, su, sv, self.vha._m_bf16, o_padded[i:j], gl[i:j],
+                        xt_b, tok_b, z_gated[i:j],
+                        float(htr_ops.CB), 0, self._woa_sp16,
+                    )
+                del o_padded
+                return self.wo_b(z_gated)
+
         o = self.vha(o_padded[:, : self.n_local_heads, :])
         del o_padded
         o_groups = o.reshape(num_tokens, self.n_local_groups, -1)
@@ -525,7 +561,6 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
                     _WOA_NS, float(htr_ops.CB), 0, self._woa_sp16,
                 )
             elif hasattr(ext, "wo_a_k5_prefill_wmma"):
-                # Batched 8-group K=5 WMMA + SAD_HI + fused sigmoid(gate) for ALL T > 16 (chunk=2048 -> 1.27x faster)!
                 _woa_chunk_env = _os.environ.get("ERNIE_WOA_PREFILL_CHUNK")
                 _woa_chunk = int(_woa_chunk_env) if _woa_chunk_env else 2048
                 for i in range(0, num_tokens, _woa_chunk):
