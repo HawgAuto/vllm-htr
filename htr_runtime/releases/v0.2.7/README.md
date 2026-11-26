@@ -64,3 +64,10 @@ v0.2.7 is a unified release for AMD Strix Halo (`gfx1151`) combining **major Qwe
 | **`/v1/chat/completions` prose (128 tok, greedy)** | **`31.04 tok/s`** (`4.12 s`) |
 
 > **Host tuning note (128 GB Strix Halo):** On Ubuntu kernels with default CMA (~6 GiB reserved as `free_cma`, unusable by `amdgpu` TTM) and systemd `user-1000.slice` `MemoryMin=3G`, usable pinned GTT caps near ~110 GiB; `htr_runtime/serve_ernie55.sh` uses `--kv-cache-memory 1395864371` (1.30 GiB) by default so ERNIE-5.5 DSpark-5 boots out of the box. Adding `cma=64M` to `GRUB_CMDLINE_LINUX_DEFAULT` unlocks ~6 GiB of additional GPU-usable RAM for larger KV pools.
+
+### ERNIE-5.5-Flash-Preview Quantized KV & Long Context (128 GB Strix Halo)
+- **Native Wave32 HIP quantized KV kernels** (`472` total kernels, `0` spills, `0` divOps):
+  - `fp8_ds_mla` (`656 B/tok` DSA, `cos=0.99966` vs BF16), `nvfp4_ds_mla` (`352 B/tok` DSA, `cos=0.99550`), and MXFP4 Indexer K cache (`68 B/tok` vs `132 B/tok`, `cos=0.99946`, `1.66x` faster decode).
+- **1M Pure FP8 live-verified (`--kv-cache-dtype fp8`, `5.40 GiB` KV):** `1,058,592` GPU KV tokens (`1.01x` @ 1M), `57.62 tok/s` primes, `31.72 tok/s` code, 8K Needle-in-a-Haystack PASS (`30.33s`), DSpark-5 `3.74` mean accept, `2.1 GiB` host RAM free.
+- **2M NVFP4 Pool live-verified (`--kv-cache-dtype nvfp4_ds_mla`, `6.55 GiB` KV, `--max-num-seqs 2`):** `2,118,842` GPU KV tokens (`2.02x` @ 1M), `37.6-39.5 tok/s` 2-way parallel, 8K Needle-in-a-Haystack PASS (`27.45s`), DSpark-5 `3.63` mean accept.
+- **Allocator & Workspace fixes:** fixed `_max_decode_logits_rows` `4.0 GiB` workspace blowup (`4,096 MiB -> 132 MiB`), fixed `SlidingWindowSpec` anchor inflation (`293 -> 158 KiB/block`), added `empty_cache()` after `profile_run()` in `kv_cache_memory_bytes` path, and bitwise-exact `cos_sin_cache` sharing.

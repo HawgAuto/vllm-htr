@@ -831,9 +831,562 @@ void ernie_fp8_paged_mqa_logits_decode(
   }
 }
 
+
+// ================================================================== 4: Quantized DSA Sparse MLA (FP8 656B & NVFP4 352B)
+__device__ __forceinline__ float dsa_fp8_ocp_to_f32(uint32_t b) {
+  const uint32_t sign = (b & 0x80u) << 24;
+  const uint32_t exp = (b >> 3) & 0xFu;
+  const uint32_t man = b & 0x7u;
+  if (exp == 0u) {
+    float v = (float)man * (1.0f / 512.0f);
+    return sign ? -v : v;
+  }
+  if (exp == 15u && man == 7u) return NAN;
+  return __uint_as_float(sign | ((exp + 120u) << 23) | (man << 20));
+}
+
+// KV_FMT: 1 = fp8_ds_mla (656 B/tok), 2 = nvfp4_ds_mla (352 B/tok)
+template <int KV_FMT, int NUM_SPLITS, int NT_KV>
+__global__ __launch_bounds__(128) void k_ernie_dsa_sparse_mla_quant(
+    const uint16_t* __restrict__ q_ptr,      // [T, 64, 576] bf16
+    const uint8_t* __restrict__ kv_ptr,      // [num_blocks, block_size, ROW_BYTES] uint8
+    const int32_t* __restrict__ idx_ptr,     // [T, W] int32 (phys_blk * block_size + in_blk, -1=invalid)
+    const float* __restrict__ sink_ptr,      // [64] fp32 (or nullptr)
+    uint16_t* __restrict__ out_ptr,          // [T, 64, 512] bf16 (NUM_SPLITS == 1)
+    float* __restrict__ part_o,              // [T, 64, NUM_SPLITS, 512] fp32
+    float* __restrict__ part_m,              // [T, 64, NUM_SPLITS] fp32
+    float* __restrict__ part_l,              // [T, 64, NUM_SPLITS] fp32
+    int64_t q_s0, int64_t q_s1, int64_t kv_blk_stride, int64_t kv_row_stride,
+    int64_t idx_s0, int64_t out_s0, int64_t out_s1,
+    int num_blocks, int block_size, int W, float scale) {
+  __shared__ __attribute__((aligned(16))) uint16_t KV_lds[16][DSA_STRIDE]; // 18.25 KiB
+  __shared__ float S_part[4][16][16];                                       // 4.00 KiB
+  __shared__ uint16_t P_lds[16][16];                                        // 0.50 KiB
+  __shared__ float fp8_lut[256];                                            // 1.00 KiB
+  __shared__ float e2m1_lut[16];                                            // 0.06 KiB
+  __shared__ int32_t s_slots[16];
+  __shared__ uint8_t s_valid[16];
+  __shared__ float s_alpha[16];
+  __shared__ float s_m[16];
+  __shared__ float s_l[16];
+
+  const int t = blockIdx.x;
+  const int hg = blockIdx.y;
+  const int sp = blockIdx.z;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+  const int h0 = hg * 16;
+
+  fp8_lut[tid] = dsa_fp8_ocp_to_f32((uint32_t)tid);
+  fp8_lut[tid + 128] = dsa_fp8_ocp_to_f32((uint32_t)(tid + 128));
+  if (tid < 16) {
+    static constexpr float E2M1_C[16] = {
+      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    e2m1_lut[tid] = E2M1_C[tid];
+    s_m[tid] = NEG_INF;
+    s_l[tid] = 0.0f;
+  }
+  __syncthreads();
+
+  f32x8 o_acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) o_acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+
+  const int32_t* idx_row = idx_ptr + (int64_t)t * idx_s0;
+  const uint16_t* q_base = q_ptr + (int64_t)t * q_s0 + (int64_t)(h0 + l16) * q_s1;
+  const int total_slots = num_blocks * block_size;
+  const int kr = tid >> 3;   // 0..15
+  const int sub = tid & 7;   // 0..7
+
+  const int total_blks = (W + 15) / 16;
+  const int blks_per_sp = (total_blks + NUM_SPLITS - 1) / NUM_SPLITS;
+  const int blk_start = sp * blks_per_sp;
+  const int blk_end = min(total_blks, blk_start + blks_per_sp);
+
+  for (int blk = blk_start; blk < blk_end; ++blk) {
+    const int k_base = blk * 16;
+    if (tid < 16) {
+      const int c = k_base + tid;
+      int32_t sl = (c < W) ? idx_row[c] : -1;
+      if (sl < 0 || sl >= total_slots) sl = -1;
+      s_slots[tid] = sl;
+      s_valid[tid] = (sl >= 0) ? 1 : 0;
+    }
+    __syncthreads();
+
+    unsigned any_v = 0;
+#pragma unroll
+    for (int i = 0; i < 16; ++i) any_v |= s_valid[i];
+    if (!any_v) continue;
+
+    // 1. Cooperatively dequant 16 quantized KV rows -> BF16 KV_lds[16][584]
+    const int32_t sl = s_slots[kr];
+    if (sl >= 0) {
+      const int phys_blk = (block_size == 64) ? (sl >> 6) : (sl / block_size);
+      const int in_blk   = (block_size == 64) ? (sl & 63) : (sl % block_size);
+      const uint8_t* row_p = kv_ptr + (int64_t)phys_blk * kv_blk_stride + (int64_t)in_blk * kv_row_stride;
+
+      if constexpr (KV_FMT == 1) {
+        const float sc = *reinterpret_cast<const float*>(row_p + 512 + (sub >> 1) * 4);
+        const uint8_t* nope_p = row_p + sub * 64;
+#pragma unroll 1
+        for (int c4 = 0; c4 < 4; ++c4) {
+          const u4va* src = reinterpret_cast<const u4va*>(nope_p + c4 * 16);
+          const u4v raw = NT_KV ? __builtin_nontemporal_load(src) : *src;
+          const uint32_t ws[4] = {raw.x, raw.y, raw.z, raw.w};
+          uint32_t p0[4], p1[4];
+#pragma unroll
+          for (int w = 0; w < 2; ++w) {
+            const uint32_t x = ws[w];
+            p0[w * 2 + 0] = f32_to_bf16x2_rne(fp8_lut[x & 0xFFu] * sc, fp8_lut[(x >> 8) & 0xFFu] * sc);
+            p0[w * 2 + 1] = f32_to_bf16x2_rne(fp8_lut[(x >> 16) & 0xFFu] * sc, fp8_lut[(x >> 24) & 0xFFu] * sc);
+          }
+#pragma unroll
+          for (int w = 0; w < 2; ++w) {
+            const uint32_t x = ws[w + 2];
+            p1[w * 2 + 0] = f32_to_bf16x2_rne(fp8_lut[x & 0xFFu] * sc, fp8_lut[(x >> 8) & 0xFFu] * sc);
+            p1[w * 2 + 1] = f32_to_bf16x2_rne(fp8_lut[(x >> 16) & 0xFFu] * sc, fp8_lut[(x >> 24) & 0xFFu] * sc);
+          }
+          *reinterpret_cast<u4va*>(&KV_lds[kr][sub * 64 + c4 * 16 + 0]) = (u4v){p0[0], p0[1], p0[2], p0[3]};
+          *reinterpret_cast<u4va*>(&KV_lds[kr][sub * 64 + c4 * 16 + 8]) = (u4v){p1[0], p1[1], p1[2], p1[3]};
+        }
+        const u4va* rsrc = reinterpret_cast<const u4va*>(row_p + 528 + sub * 16);
+        *reinterpret_cast<u4va*>(&KV_lds[kr][512 + sub * 8]) = NT_KV ? __builtin_nontemporal_load(rsrc) : *rsrc;
+      } else {
+        const uint32_t sc4 = *reinterpret_cast<const uint32_t*>(row_p + 320 + sub * 4);
+        const uint8_t* fp4_p = row_p + sub * 32;
+#pragma unroll 1
+        for (int mb = 0; mb < 4; ++mb) {
+          const float sc = fp8_lut[(sc4 >> (mb * 8)) & 0xFFu];
+          const uint2 raw = *reinterpret_cast<const uint2*>(fp4_p + mb * 8);
+          uint32_t p0[4], p1[4];
+#pragma unroll
+          for (int b = 0; b < 4; ++b) {
+            const uint32_t byte0 = (raw.x >> (b * 8)) & 0xFFu;
+            const uint32_t byte1 = (raw.y >> (b * 8)) & 0xFFu;
+            p0[b] = f32_to_bf16x2_rne(e2m1_lut[byte0 & 0xFu] * sc, e2m1_lut[byte0 >> 4] * sc);
+            p1[b] = f32_to_bf16x2_rne(e2m1_lut[byte1 & 0xFu] * sc, e2m1_lut[byte1 >> 4] * sc);
+          }
+          *reinterpret_cast<u4va*>(&KV_lds[kr][sub * 64 + mb * 16 + 0]) = (u4v){p0[0], p0[1], p0[2], p0[3]};
+          *reinterpret_cast<u4va*>(&KV_lds[kr][sub * 64 + mb * 16 + 8]) = (u4v){p1[0], p1[1], p1[2], p1[3]};
+        }
+        const uint2 rraw = *reinterpret_cast<const uint2*>(row_p + 256 + sub * 8);
+        u4v rp;
+        rp.x = f32_to_bf16x2_rne(fp8_lut[rraw.x & 0xFFu], fp8_lut[(rraw.x >> 8) & 0xFFu]);
+        rp.y = f32_to_bf16x2_rne(fp8_lut[(rraw.x >> 16) & 0xFFu], fp8_lut[(rraw.x >> 24) & 0xFFu]);
+        rp.z = f32_to_bf16x2_rne(fp8_lut[rraw.y & 0xFFu], fp8_lut[(rraw.y >> 8) & 0xFFu]);
+        rp.w = f32_to_bf16x2_rne(fp8_lut[(rraw.y >> 16) & 0xFFu], fp8_lut[(rraw.y >> 24) & 0xFFu]);
+        *reinterpret_cast<u4va*>(&KV_lds[kr][512 + sub * 8]) = rp;
+      }
+    } else {
+      const u4v z = {0u, 0u, 0u, 0u};
+#pragma unroll
+      for (int c8 = 0; c8 < 8; ++c8) {
+        *reinterpret_cast<u4va*>(&KV_lds[kr][sub * 64 + c8 * 8]) = z;
+      }
+      *reinterpret_cast<u4va*>(&KV_lds[kr][512 + sub * 8]) = z;
+    }
+    __syncthreads();
+
+    // 2. Q @ K^T
+    f32x8 s_acc = {0, 0, 0, 0, 0, 0, 0, 0};
+    const int d_start = wave * 144;
+#pragma unroll 1
+    for (int step = 0; step < 9; ++step) {
+      const int d = d_start + step * 16;
+      const u4v q0 = *reinterpret_cast<const u4va*>(q_base + d);
+      const u4v q1 = *reinterpret_cast<const u4va*>(q_base + d + 8);
+      const bf16x16 qf = __builtin_bit_cast(bf16x16, (u8v){q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w});
+      const u4v k0 = *reinterpret_cast<const u4va*>(&KV_lds[l16][d]);
+      const u4v k1 = *reinterpret_cast<const u4va*>(&KV_lds[l16][d + 8]);
+      const bf16x16 kf = __builtin_bit_cast(bf16x16, (u8v){k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w});
+      s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qf, kf, s_acc);
+    }
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      S_part[wave][2 * ei + hrow][l16] = s_acc[ei];
+    }
+    __syncthreads();
+
+    // 3. Wave 0 reduces S_part + online softmax
+    if (wave == 0) {
+      const bool vld = (s_valid[l16] != 0);
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) {
+        const int hm = 2 * ei + hrow;
+        float sc = S_part[0][hm][l16] + S_part[1][hm][l16] + S_part[2][hm][l16] + S_part[3][hm][l16];
+        sc = vld ? (sc * scale) : NEG_INF;
+        const float bmax = halfwave_max16(sc);
+        const float mold = s_m[hm];
+        const float mnew = fmaxf(mold, bmax);
+        const float alpha = (mold > -1e30f) ? exp2f((mold - mnew) * LOG2E) : 0.0f;
+        const float pv = (vld && mnew > -1e30f) ? exp2f((sc - mnew) * LOG2E) : 0.0f;
+        const float bsum = halfwave_sum16(pv);
+        P_lds[hm][l16] = f32_to_bf16_rne(pv);
+        if (l16 == 0) {
+          s_alpha[hm] = alpha;
+          s_m[hm] = mnew;
+          s_l[hm] = s_l[hm] * alpha + bsum;
+        }
+      }
+    }
+    __syncthreads();
+
+    // 4. Rescale o_acc & P @ V
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      const float a_ei = s_alpha[2 * ei + hrow];
+#pragma unroll
+      for (int j = 0; j < 8; ++j) o_acc[j][ei] *= a_ei;
+    }
+
+    const u4v p0 = *reinterpret_cast<const u4va*>(&P_lds[l16][0]);
+    const u4v p1 = *reinterpret_cast<const u4va*>(&P_lds[l16][8]);
+    const bf16x16 pf = __builtin_bit_cast(bf16x16, (u8v){p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w});
+    const int v_col0 = wave * 128;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+      const int vc = v_col0 + j * 16 + l16;
+      bf16x16 vf;
+#pragma unroll
+      for (int kr_i = 0; kr_i < 16; ++kr_i) vf[kr_i] = (short)KV_lds[kr_i][vc];
+      o_acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pf, vf, o_acc[j]);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+    __syncthreads();
+  }
+
+  // 5. Epilogue
+  const int v_col0 = wave * 128;
+  if constexpr (NUM_SPLITS == 1) {
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      const int hm = 2 * ei + hrow;
+      float m = s_m[hm];
+      float l = s_l[hm];
+      float inv_l = 0.0f;
+      if (sink_ptr != nullptr) {
+        const float sk = sink_ptr[h0 + hm];
+        const float mf = fmaxf(m, sk);
+        const float lf = (l > 0.0f ? l * exp2f((m - mf) * LOG2E) : 0.0f) + exp2f((sk - mf) * LOG2E);
+        const float w_acc = (l > 0.0f) ? exp2f((m - mf) * LOG2E) : 0.0f;
+        inv_l = (lf > 0.0f) ? (w_acc * __builtin_amdgcn_rcpf(lf)) : 0.0f;
+      } else {
+        inv_l = (l > 0.0f) ? __builtin_amdgcn_rcpf(l) : 0.0f;
+      }
+      uint16_t* dst = out_ptr + (int64_t)t * out_s0 + (int64_t)(h0 + hm) * out_s1 + v_col0 + l16;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        dst[j * 16] = f32_to_bf16_rne(o_acc[j][ei] * inv_l);
+      }
+    }
+  } else {
+    if (wave == 0 && l16 == 0) {
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) {
+        const int hm = 2 * ei + hrow;
+        const int64_t off = ((int64_t)t * 64 + (h0 + hm)) * NUM_SPLITS + sp;
+        part_m[off] = s_m[hm];
+        part_l[off] = s_l[hm];
+      }
+    }
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      const int hm = 2 * ei + hrow;
+      float* dst = part_o + (((int64_t)t * 64 + (h0 + hm)) * NUM_SPLITS + sp) * DSA_NOPE + v_col0 + l16;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        dst[j * 16] = o_acc[j][ei];
+      }
+    }
+  }
+}
+
+torch::Tensor ernie_dsa_sparse_mla_quant(
+    torch::Tensor q, torch::Tensor kv_cache, torch::Tensor indices,
+    c10::optional<torch::Tensor> attn_sink, double scale,
+    c10::optional<torch::Tensor> part_o_opt,
+    c10::optional<torch::Tensor> part_m_opt,
+    c10::optional<torch::Tensor> part_l_opt,
+    int64_t num_splits, int64_t kv_fmt) {
+  TORCH_CHECK(q.is_cuda() && q.dim() == 3 && q.size(1) == 64 && q.size(2) == DSA_DIM && q.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(kv_cache.is_cuda() && kv_cache.dim() == 3 && kv_cache.scalar_type() == torch::kUInt8);
+  TORCH_CHECK(kv_fmt == 1 || kv_fmt == 2);
+  TORCH_CHECK(kv_cache.size(2) == (kv_fmt == 1 ? 656 : 352));
+  TORCH_CHECK(indices.is_cuda() && indices.dim() == 2 && indices.scalar_type() == torch::kInt32);
+  const int T = (int)q.size(0);
+  const int W = (int)indices.size(1);
+  auto out = torch::empty({T, 64, DSA_NOPE}, q.options());
+  if (T == 0) return out;
+  auto st = c10::hip::getCurrentHIPStream().stream();
+  const uint16_t* qp = reinterpret_cast<const uint16_t*>(q.data_ptr());
+  const uint8_t* kvp = kv_cache.data_ptr<uint8_t>();
+  const int32_t* ip = indices.data_ptr<int32_t>();
+  const float* sp = attn_sink.has_value() ? attn_sink->data_ptr<float>() : nullptr;
+  uint16_t* op = reinterpret_cast<uint16_t*>(out.data_ptr());
+  const int num_blocks = (int)kv_cache.size(0);
+  const int block_size = (int)kv_cache.size(1);
+
+  if (num_splits <= 1 || W <= 32) {
+    if (kv_fmt == 1) {
+      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<1, 1, 0>), dim3(T, 4, 1), dim3(128), 0, st,
+                         qp, kvp, ip, sp, op, nullptr, nullptr, nullptr,
+                         q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+                         indices.stride(0), out.stride(0), out.stride(1),
+                         num_blocks, block_size, W, (float)scale);
+    } else {
+      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<2, 1, 0>), dim3(T, 4, 1), dim3(128), 0, st,
+                         qp, kvp, ip, sp, op, nullptr, nullptr, nullptr,
+                         q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+                         indices.stride(0), out.stride(0), out.stride(1),
+                         num_blocks, block_size, W, (float)scale);
+    }
+  } else {
+    constexpr int S = 8;
+    torch::Tensor po = part_o_opt.has_value() ? *part_o_opt : torch::empty({T, 64, S, DSA_NOPE}, q.options().dtype(torch::kFloat32));
+    torch::Tensor pm = part_m_opt.has_value() ? *part_m_opt : torch::empty({T, 64, S}, q.options().dtype(torch::kFloat32));
+    torch::Tensor pl = part_l_opt.has_value() ? *part_l_opt : torch::empty({T, 64, S}, q.options().dtype(torch::kFloat32));
+    if (kv_fmt == 1) {
+      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<1, S, 1>), dim3(T, 4, S), dim3(128), 0, st,
+                         qp, kvp, ip, sp, op, po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
+                         q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+                         indices.stride(0), out.stride(0), out.stride(1),
+                         num_blocks, block_size, W, (float)scale);
+    } else {
+      hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant<2, S, 1>), dim3(T, 4, S), dim3(128), 0, st,
+                         qp, kvp, ip, sp, op, po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
+                         q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+                         indices.stride(0), out.stride(0), out.stride(1),
+                         num_blocks, block_size, W, (float)scale);
+    }
+    hipLaunchKernelGGL((k_ernie_dsa_split_reduce<S>), dim3(T, 64), dim3(128), 0, st,
+                       po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(), sp, op,
+                       out.stride(0), out.stride(1));
+  }
+  return out;
+}
+
+// ================================================================== 5: FP8-Q x MXFP4-K Paged MQA Logits Decode (68 B/tok!)
+__global__ __launch_bounds__(128) void k_ernie_fp8_mxfp4_paged_mqa_logits_decode(
+    const uint8_t* __restrict__ q_fp8,       // [B, NEXT_N, 64, 128]
+    const uint8_t* __restrict__ kv_ptr,      // [num_blocks, block_size, 68] uint8
+    const float* __restrict__ weights,       // [B*NEXT_N, 64] fp32
+    const int32_t* __restrict__ ctx_lens,    // [B*NEXT_N] or [B] int32
+    const int32_t* __restrict__ block_tables,// [B, max_blocks] int32
+    float* __restrict__ out_logits,          // [B*NEXT_N, max_model_len] fp32
+    int64_t q_sb, int64_t q_sn, int64_t q_sh,
+    int64_t kv_s0, int64_t kv_s1, int64_t w_s0, int64_t bt_s0, int64_t out_s0,
+    int block_size, int max_blocks, int max_model_len,
+    int next_n, int n_splits, int ctx_per_row, int is_fnuz) {
+  __shared__ _Float16 fp8_lut[256];
+  __shared__ float e2m1_lut[16];
+  __shared__ __attribute__((aligned(16))) _Float16 K_lds[16][136]; // 4.25 KiB
+  __shared__ float s_wsum[4][16];
+  __shared__ float s_weights[64];
+
+  const int row = blockIdx.x;
+  const int split = blockIdx.y;
+  const int b = row / next_n;
+  const int n = row % next_n;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+
+  int seq_len = ctx_per_row ? ctx_lens[row] : (ctx_lens[b] - next_n + n + 1);
+  if (seq_len < 0) seq_len = 0;
+  if (seq_len > max_model_len) seq_len = max_model_len;
+  if (split * 16 >= seq_len) return;
+
+  fp8_lut[tid] = fp8_byte_to_f16((uint32_t)tid, is_fnuz);
+  fp8_lut[tid + 128] = fp8_byte_to_f16((uint32_t)(tid + 128), is_fnuz);
+  if (tid < 16) {
+    static constexpr float E2M1_C[16] = {
+      0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+      -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+    };
+    e2m1_lut[tid] = E2M1_C[tid];
+  }
+  __syncthreads();
+
+  const int h0 = wave * 16;
+  const uint8_t* qp = q_fp8 + (int64_t)b * q_sb + (int64_t)n * q_sn + (int64_t)(h0 + l16) * q_sh;
+  f16x16 q_reg[8];
+#pragma unroll
+  for (int pair = 0; pair < 4; ++pair) {
+    const u4v raw0 = *reinterpret_cast<const u4va*>(qp + (pair * 2 + 0) * 16);
+    const u4v raw1 = *reinterpret_cast<const u4va*>(qp + (pair * 2 + 1) * 16);
+    const u4v raws[2] = {raw0, raw1};
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+      const uint32_t ws[4] = {raws[s].x, raws[s].y, raws[s].z, raws[s].w};
+      f16x16 qf;
+#pragma unroll
+      for (int w4 = 0; w4 < 4; ++w4) {
+        const uint32_t x = ws[w4];
+        qf[w4 * 4 + 0] = fp8_lut[x & 0xFFu];
+        qf[w4 * 4 + 1] = fp8_lut[(x >> 8) & 0xFFu];
+        qf[w4 * 4 + 2] = fp8_lut[(x >> 16) & 0xFFu];
+        qf[w4 * 4 + 3] = fp8_lut[(x >> 24) & 0xFFu];
+      }
+      q_reg[pair * 2 + s] = qf;
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  }
+
+  if (tid < 64) s_weights[tid] = weights[(int64_t)row * w_s0 + tid];
+  const int kr = tid >> 3;         // 0..15
+  const int ht = tid & 7;          // 0..7
+  const int grp = ht >> 1;         // 0..3
+  const int kc16 = ht * 16;
+  const int stride_kv = n_splits * 16;
+
+  auto fetch_mxfp4_tile = [&](int kv_st, uint2& out_raw, uint32_t& out_sc4, float& out_tok_sc) {
+    const int logical_blk = kv_st / block_size;
+    const int64_t page = (int64_t)block_tables[(int64_t)b * bt_s0 + logical_blk];
+    const int base_in_blk = kv_st - logical_blk * block_size;
+    const uint8_t* blk_ptr = kv_ptr + page * kv_s0;
+    if (kv_st + kr < seq_len) {
+      const uint8_t* rp = blk_ptr + (int64_t)(base_in_blk + kr) * kv_s1;
+      out_raw = *reinterpret_cast<const uint2*>(rp + ht * 8);
+      out_sc4 = *reinterpret_cast<const uint32_t*>(rp + 64);
+    } else {
+      out_raw = make_uint2(0u, 0u);
+      out_sc4 = 0x7F7F7F7Fu;
+    }
+    if (tid < 16 && (kv_st + tid) < seq_len) {
+      const uint32_t s4 = *reinterpret_cast<const uint32_t*>(blk_ptr + (int64_t)(base_in_blk + tid) * kv_s1 + 64);
+      const int e0 = (int)(s4 & 0xFFu), e1 = (int)((s4 >> 8) & 0xFFu);
+      const int e2 = (int)((s4 >> 16) & 0xFFu), e3 = (int)((s4 >> 24) & 0xFFu);
+      const int me = max(max(e0, e1), max(e2, e3));
+      out_tok_sc = __uint_as_float((uint32_t)me << 23);
+    } else {
+      out_tok_sc = 0.0f;
+    }
+  };
+
+  int kv_start = split * 16;
+  if ((kv_start / block_size) >= max_blocks) return;
+  uint2 raw_cur = make_uint2(0u, 0u);
+  uint32_t sc4_cur = 0x7F7F7F7Fu;
+  float tsc_cur = 0.0f;
+  fetch_mxfp4_tile(kv_start, raw_cur, sc4_cur, tsc_cur);
+
+  for (; kv_start < seq_len && (kv_start / block_size) < max_blocks; kv_start += stride_kv) {
+    if (kv_start + kr < seq_len) {
+      const int e0 = (int)(sc4_cur & 0xFFu), e1 = (int)((sc4_cur >> 8) & 0xFFu);
+      const int e2 = (int)((sc4_cur >> 16) & 0xFFu), e3 = (int)((sc4_cur >> 24) & 0xFFu);
+      const int me = max(max(e0, e1), max(e2, e3));
+      const int eg = (int)((sc4_cur >> (grp * 8)) & 0xFFu);
+      const int re = 127 + eg - me;
+      const float rsc = (re > 0) ? __uint_as_float((uint32_t)re << 23) : 0.0f;
+      uint32_t pk[8];
+#pragma unroll
+      for (int bi = 0; bi < 4; ++bi) {
+        const uint32_t b0 = (raw_cur.x >> (bi * 8)) & 0xFFu;
+        const uint32_t b1 = (raw_cur.y >> (bi * 8)) & 0xFFu;
+        const uint32_t h0a = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)(e2m1_lut[b0 & 0xFu] * rsc));
+        const uint32_t h1a = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)(e2m1_lut[b0 >> 4] * rsc));
+        const uint32_t h0b = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)(e2m1_lut[b1 & 0xFu] * rsc));
+        const uint32_t h1b = (uint32_t)__builtin_bit_cast(uint16_t, (_Float16)(e2m1_lut[b1 >> 4] * rsc));
+        pk[bi] = h0a | (h1a << 16);
+        pk[bi + 4] = h0b | (h1b << 16);
+      }
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 0]) = (u4v){pk[0], pk[1], pk[2], pk[3]};
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 8]) = (u4v){pk[4], pk[5], pk[6], pk[7]};
+    } else {
+      const u4v z = {0u, 0u, 0u, 0u};
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16]) = z;
+      *reinterpret_cast<u4va*>(&K_lds[kr][kc16 + 8]) = z;
+    }
+    __syncthreads();
+
+    const int kv_next = kv_start + stride_kv;
+    uint2 raw_nxt = make_uint2(0u, 0u);
+    uint32_t sc4_nxt = 0x7F7F7F7Fu;
+    float tsc_nxt = 0.0f;
+    if (kv_next < seq_len && (kv_next / block_size) < max_blocks) {
+      fetch_mxfp4_tile(kv_next, raw_nxt, sc4_nxt, tsc_nxt);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    f32x8 acc = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+    for (int step = 0; step < 8; ++step) {
+      const int d = step * 16;
+      const u4v k0 = *reinterpret_cast<const u4va*>(&K_lds[l16][d]);
+      const u4v k1 = *reinterpret_cast<const u4va*>(&K_lds[l16][d + 8]);
+      const f16x16 kf = __builtin_bit_cast(f16x16, (u8v){k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w});
+      acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(q_reg[step], kf, acc);
+      __builtin_amdgcn_sched_barrier(0);
+    }
+
+    float sum_h = 0.0f;
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      sum_h = __builtin_fmaf(fmaxf(acc[ei], 0.0f), s_weights[h0 + 2 * ei + hrow], sum_h);
+    }
+    sum_h += shx_f<16>(sum_h);
+    if (hrow == 0) s_wsum[wave][l16] = sum_h;
+    __syncthreads();
+
+    if (tid < 16) {
+      const int pos = kv_start + tid;
+      if (pos < seq_len) {
+        const float tot = (s_wsum[0][tid] + s_wsum[1][tid] + s_wsum[2][tid] + s_wsum[3][tid]) * tsc_cur;
+        out_logits[(int64_t)row * out_s0 + pos] = tot;
+      }
+    }
+    __syncthreads();
+    raw_cur = raw_nxt;
+    sc4_cur = sc4_nxt;
+    tsc_cur = tsc_nxt;
+  }
+}
+
+void ernie_fp8_mxfp4_paged_mqa_logits_decode(
+    torch::Tensor q_fp8, torch::Tensor kv_cache_mxfp4, torch::Tensor weights,
+    torch::Tensor context_lens, torch::Tensor block_tables,
+    torch::Tensor out_logits, int64_t max_model_len) {
+  TORCH_CHECK(q_fp8.is_cuda() && q_fp8.dim() == 4 && q_fp8.size(2) == 64 && q_fp8.size(3) == 128);
+  auto kv3 = (kv_cache_mxfp4.dim() == 4 && kv_cache_mxfp4.size(2) == 1)
+      ? kv_cache_mxfp4.squeeze(2) : kv_cache_mxfp4;
+  TORCH_CHECK(kv3.is_cuda() && kv3.dim() == 3 && kv3.scalar_type() == torch::kUInt8 && kv3.size(2) == 68);
+  const int B = (int)q_fp8.size(0);
+  const int next_n = (int)q_fp8.size(1);
+  const int rows = B * next_n;
+  if (rows == 0 || max_model_len == 0) return;
+  const int block_size = (int)kv3.size(1);
+  TORCH_CHECK(block_size % 16 == 0);
+  auto cl = context_lens.reshape({-1}).contiguous();
+  const int ctx_per_row = !(next_n > 1 && cl.numel() == B) ? 1 : 0;
+  const int is_fnuz = (q_fp8.scalar_type() == torch::kFloat8_e4m3fnuz) ? 1 : 0;
+  const int tiles_cap = ((int)max_model_len + 15) / 16;
+  const int n_splits = max(1, min(40, min(tiles_cap, max(1, 512 / rows))));
+  auto st = c10::hip::getCurrentHIPStream().stream();
+  hipLaunchKernelGGL(
+      k_ernie_fp8_mxfp4_paged_mqa_logits_decode, dim3(rows, n_splits), dim3(128), 0, st,
+      reinterpret_cast<const uint8_t*>(q_fp8.data_ptr()),
+      kv3.data_ptr<uint8_t>(), weights.data_ptr<float>(),
+      cl.data_ptr<int32_t>(), block_tables.data_ptr<int32_t>(),
+      out_logits.data_ptr<float>(),
+      q_fp8.stride(0), q_fp8.stride(1), q_fp8.stride(2),
+      kv3.stride(0), kv3.stride(1), weights.stride(0), block_tables.stride(0), out_logits.stride(0),
+      block_size, (int)block_tables.size(1), (int)max_model_len,
+      next_n, n_splits, ctx_per_row, is_fnuz);
+}
+
 PYBIND11_MODULE(ernie_dsa_attn, m) {
   m.def("dsa_sparse_mla", &ernie_dsa_sparse_mla);
   m.def("fp8_mqa_logits_prefill", &ernie_fp8_mqa_logits_prefill);
   m.def("fp8_paged_mqa_logits_decode", &ernie_fp8_paged_mqa_logits_decode);
+  m.def("dsa_sparse_mla_quant", &ernie_dsa_sparse_mla_quant);
+  m.def("fp8_mxfp4_paged_mqa_logits_decode", &ernie_fp8_mxfp4_paged_mqa_logits_decode);
 }
 

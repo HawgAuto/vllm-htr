@@ -198,6 +198,18 @@ class Ernie5_5DSparkModel(nn.Module):
                 max_position_embeddings=target_config.max_position_embeddings,
                 compress_ratio=1,
             )
+            try:
+                from . import attention as _ernie_att
+                _t_cs = getattr(_ernie_att, "_ERNIE5_TARGET_HCA_COS_SIN", None)
+                _d_cs = getattr(shared_rope, "cos_sin_cache", None)
+                if (
+                    _t_cs is not None and _d_cs is not None and _t_cs is not _d_cs
+                    and _t_cs.shape == _d_cs.shape and _t_cs.dtype == _d_cs.dtype and _t_cs.device == _d_cs.device
+                    and torch.equal(_t_cs[:64], _d_cs[:64]) and torch.equal(_t_cs[-64:], _d_cs[-64:])
+                ):
+                    shared_rope.cos_sin_cache = _t_cs
+            except Exception:
+                pass
             for layer in self.layers:
                 layer.attn.rotary_emb = layer.attn.indexer_rotary_emb = shared_rope
 

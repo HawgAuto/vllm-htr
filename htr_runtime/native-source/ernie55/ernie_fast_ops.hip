@@ -2336,6 +2336,312 @@ void ernie_dsa_uv_proj(torch::Tensor attn_latent, torch::Tensor w_uv_rm, torch::
   }
 }
 
+
+// ------------------------------------------------------------------ 23: FP8/FP4 DSA KV Scatter + MXFP4 Indexer K Cache
+__device__ __forceinline__ float fp8_e4m3fn_ocp_to_f32(uint32_t b) {
+  const uint32_t sign = (b & 0x80u) << 24;
+  const uint32_t exp = (b >> 3) & 0xFu;
+  const uint32_t man = b & 0x7u;
+  if (exp == 0u) {
+    float v = (float)man * (1.0f / 512.0f);
+    return sign ? -v : v;
+  }
+  if (exp == 15u && man == 7u) return NAN;
+  return __uint_as_float(sign | ((exp + 120u) << 23) | (man << 20));
+}
+
+__device__ __forceinline__ uint32_t f32_to_fp4_e2m1(float x) {
+  const uint32_t sign = (__float_as_uint(x) >> 28) & 8u;
+  const float ax = fabsf(x);
+  const uint32_t code = (uint32_t)(ax > 0.25f) + (uint32_t)(ax >= 0.75f)
+                      + (uint32_t)(ax > 1.25f) + (uint32_t)(ax >= 1.75f)
+                      + (uint32_t)(ax > 2.50f) + (uint32_t)(ax >= 3.50f)
+                      + (uint32_t)(ax > 5.00f);
+  return sign | code;
+}
+
+__device__ __forceinline__ float fp4_e2m1_to_f32(uint32_t nib) {
+  static constexpr float LUT[16] = {
+    0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+  };
+  return LUT[nib & 0xFu];
+}
+
+// 23a: scatter_dsa_kv_fp8 -> official fp8_ds_mla 656 B/tok layout:
+//   [0..511]:   512 FP8 E4M3FN NoPE (4 tiles x 128)
+//   [512..527]: 4 FP32 scales (1 per 128 NoPE tile)
+//   [528..655]: 64 BF16 RoPE (128 B, lossless)
+__global__ __launch_bounds__(128) void k_scatter_dsa_kv_fp8(
+    const uint16_t* __restrict__ kvc, const uint16_t* __restrict__ kpe,
+    uint8_t* __restrict__ cache, const int64_t* __restrict__ slot_mapping,
+    int64_t kvc_s0, int64_t kpe_s0, int64_t c_s0, int64_t c_s1,
+    int block_size) {
+  const int t = blockIdx.x;
+  const int64_t slot = slot_mapping[t];
+  if (slot < 0) return;
+  const int64_t blk = slot / block_size;
+  const int64_t off = slot % block_size;
+  uint8_t* dst = cache + blk * c_s0 + off * c_s1;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;   // 0..3 (4 tiles of 128)
+  const int lane = tid & 31;   // 0..31 (4 elems/lane = 128 elems/wave)
+
+  const uint2 raw = *reinterpret_cast<const uint2*>(kvc + (int64_t)t * kvc_s0 + wave * 128 + lane * 4);
+  float v[4];
+  v[0] = __uint_as_float((raw.x & 0xFFFFu) << 16);
+  v[1] = __uint_as_float(raw.x & 0xFFFF0000u);
+  v[2] = __uint_as_float((raw.y & 0xFFFFu) << 16);
+  v[3] = __uint_as_float(raw.y & 0xFFFF0000u);
+  float am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+  am = fmaxf(am, shx_f<16>(am));
+  am = fmaxf(am, shx_f<8>(am));
+  am = fmaxf(am, shx_f<4>(am));
+  am = fmaxf(am, shx_f<2>(am));
+  am = fmaxf(am, shx_f<1>(am));
+  const float scale = fmaxf(am, 1e-6f) * (1.0f / 448.0f);
+  const float inv_sc = __builtin_amdgcn_rcpf(scale);
+  uint8_t ob[4];
+#pragma unroll
+  for (int e = 0; e < 4; ++e) ob[e] = f32_to_fp8_e4m3fn_ocp(v[e] * inv_sc);
+  *reinterpret_cast<uint32_t*>(dst + wave * 128 + lane * 4) = *reinterpret_cast<const uint32_t*>(ob);
+  if (lane == 0) {
+    *reinterpret_cast<float*>(dst + 512 + wave * 4) = scale;
+  }
+  if (tid < 8) {
+    const u4v rv = *reinterpret_cast<const u4va*>(kpe + (int64_t)t * kpe_s0 + tid * 8);
+    __builtin_nontemporal_store(rv, reinterpret_cast<u4va*>(dst + 528 + tid * 16));
+  }
+}
+
+void ernie_scatter_dsa_kv_fp8(
+    torch::Tensor kv_c, torch::Tensor k_pe_2d, torch::Tensor kv_cache,
+    torch::Tensor slot_mapping, int64_t block_size) {
+  const int T = (int)min(kv_c.size(0), slot_mapping.size(0));
+  if (T == 0 || kv_cache.numel() == 0) return;
+  TORCH_CHECK(kv_c.size(1) == 512 && k_pe_2d.size(1) == 64 && kv_c.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(kv_cache.scalar_type() == torch::kUInt8 && kv_cache.size(2) == 656);
+  hipLaunchKernelGGL(k_scatter_dsa_kv_fp8, dim3(T), dim3(128), 0, c10::hip::getCurrentHIPStream().stream(),
+                     reinterpret_cast<const uint16_t*>(kv_c.data_ptr()),
+                     reinterpret_cast<const uint16_t*>(k_pe_2d.data_ptr()),
+                     kv_cache.data_ptr<uint8_t>(),
+                     slot_mapping.data_ptr<int64_t>(),
+                     kv_c.stride(0), k_pe_2d.stride(0), kv_cache.stride(0), kv_cache.stride(1),
+                     (int)block_size);
+}
+
+// 23b: scatter_dsa_kv_fp4 -> official nvfp4_ds_mla 352 B/tok layout:
+//   [0..255]:   512 FP4 E2M1 NoPE packed 2/byte (low nibble=even, high=odd; 32 micro-blocks x 16)
+//   [256..319]: 64 FP8 E4M3FN RoPE (unscaled)
+//   [320..351]: 32 FP8 E4M3FN scales (1 per 16-elem NoPE micro-block)
+__global__ __launch_bounds__(128) void k_scatter_dsa_kv_fp4(
+    const uint16_t* __restrict__ kvc, const uint16_t* __restrict__ kpe,
+    uint8_t* __restrict__ cache, const int64_t* __restrict__ slot_mapping,
+    int64_t kvc_s0, int64_t kpe_s0, int64_t c_s0, int64_t c_s1,
+    int block_size) {
+  const int t = blockIdx.x;
+  const int64_t slot = slot_mapping[t];
+  if (slot < 0) return;
+  const int64_t blk = slot / block_size;
+  const int64_t off = slot % block_size;
+  uint8_t* dst = cache + blk * c_s0 + off * c_s1;
+  const int tid = threadIdx.x;
+  const int grp = tid >> 2;   // 0..31 (32 micro-blocks of 16 elems)
+  const int sub = tid & 3;    // 0..3  (4 elems/thread -> 2 packed bytes)
+
+  const uint2 raw = *reinterpret_cast<const uint2*>(kvc + (int64_t)t * kvc_s0 + tid * 4);
+  float v[4];
+  v[0] = __uint_as_float((raw.x & 0xFFFFu) << 16);
+  v[1] = __uint_as_float(raw.x & 0xFFFF0000u);
+  v[2] = __uint_as_float((raw.y & 0xFFFFu) << 16);
+  v[3] = __uint_as_float(raw.y & 0xFFFF0000u);
+  float am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+  am = fmaxf(am, shx_f<2>(am));
+  am = fmaxf(am, shx_f<1>(am));
+  const float raw_sc = am * (1.0f / 6.0f);
+  uint8_t sc_u8 = f32_to_fp8_e4m3fn_ocp(raw_sc);
+  if (am > 0.0f && (sc_u8 & 0x7Fu) == 0u) sc_u8 = 1u;
+  const float sc_f = fp8_e4m3fn_ocp_to_f32(sc_u8);
+  const float inv_sc = (sc_f > 0.0f) ? __builtin_amdgcn_rcpf(sc_f) : 0.0f;
+  const uint32_t n0 = f32_to_fp4_e2m1(v[0] * inv_sc);
+  const uint32_t n1 = f32_to_fp4_e2m1(v[1] * inv_sc);
+  const uint32_t n2 = f32_to_fp4_e2m1(v[2] * inv_sc);
+  const uint32_t n3 = f32_to_fp4_e2m1(v[3] * inv_sc);
+  const uint16_t packed = (uint16_t)(n0 | (n1 << 4) | (n2 << 8) | (n3 << 12));
+  *reinterpret_cast<uint16_t*>(dst + tid * 2) = packed;
+  if (sub == 0) {
+    dst[320 + grp] = sc_u8;
+  }
+  if (tid < 16) {
+    const uint2 rraw = *reinterpret_cast<const uint2*>(kpe + (int64_t)t * kpe_s0 + tid * 4);
+    float rv[4];
+    rv[0] = __uint_as_float((rraw.x & 0xFFFFu) << 16);
+    rv[1] = __uint_as_float(rraw.x & 0xFFFF0000u);
+    rv[2] = __uint_as_float((rraw.y & 0xFFFFu) << 16);
+    rv[3] = __uint_as_float(rraw.y & 0xFFFF0000u);
+    uint8_t rb[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e) rb[e] = f32_to_fp8_e4m3fn_ocp(rv[e]);
+    *reinterpret_cast<uint32_t*>(dst + 256 + tid * 4) = *reinterpret_cast<const uint32_t*>(rb);
+  }
+}
+
+void ernie_scatter_dsa_kv_fp4(
+    torch::Tensor kv_c, torch::Tensor k_pe_2d, torch::Tensor kv_cache,
+    torch::Tensor slot_mapping, int64_t block_size) {
+  const int T = (int)min(kv_c.size(0), slot_mapping.size(0));
+  if (T == 0 || kv_cache.numel() == 0) return;
+  TORCH_CHECK(kv_c.size(1) == 512 && k_pe_2d.size(1) == 64 && kv_c.scalar_type() == torch::kBFloat16);
+  TORCH_CHECK(kv_cache.scalar_type() == torch::kUInt8 && kv_cache.size(2) == 352);
+  hipLaunchKernelGGL(k_scatter_dsa_kv_fp4, dim3(T), dim3(128), 0, c10::hip::getCurrentHIPStream().stream(),
+                     reinterpret_cast<const uint16_t*>(kv_c.data_ptr()),
+                     reinterpret_cast<const uint16_t*>(k_pe_2d.data_ptr()),
+                     kv_cache.data_ptr<uint8_t>(),
+                     slot_mapping.data_ptr<int64_t>(),
+                     kv_c.stride(0), k_pe_2d.stride(0), kv_cache.stride(0), kv_cache.stride(1),
+                     (int)block_size);
+}
+
+// 23c: indexer_k_quant_and_cache_mxfp4 -> 68 B/tok flat per-token layout:
+//   [0..63]:  128 FP4 E2M1 packed 2/byte (4 groups of 32 elems)
+//   [64..67]: 4 UE8M0 exponent bytes (1 per 32 elems, scale = 2^(e - 127))
+__global__ __launch_bounds__(32) void k_indexer_k_quant_and_cache_mxfp4_128(
+    const uint16_t* __restrict__ k_in,       // [T, 128] bf16
+    uint8_t* __restrict__ kv_cache,          // [num_blocks, block_size, 68] uint8
+    const int64_t* __restrict__ slot_map,    // [T] int64
+    int64_t k_s0, int64_t c_s0, int64_t c_s1, int block_size) {
+  const int t = blockIdx.x;
+  const int64_t slot = slot_map[t];
+  if (slot < 0) return;
+  const int lane = threadIdx.x; // 0..31 -> 4 elems/lane = 128 elems
+  const int grp = lane >> 3;    // 0..3  (4 groups of 32 elems = 8 lanes/group)
+  const int sub = lane & 7;     // 0..7
+  const uint2 raw = *reinterpret_cast<const uint2*>(k_in + (int64_t)t * k_s0 + lane * 4);
+  float v[4];
+  v[0] = __uint_as_float((raw.x & 0xFFFFu) << 16);
+  v[1] = __uint_as_float(raw.x & 0xFFFF0000u);
+  v[2] = __uint_as_float((raw.y & 0xFFFFu) << 16);
+  v[3] = __uint_as_float(raw.y & 0xFFFF0000u);
+  float am = fmaxf(fmaxf(fabsf(v[0]), fabsf(v[1])), fmaxf(fabsf(v[2]), fabsf(v[3])));
+  am = fmaxf(am, shx_f<4>(am));
+  am = fmaxf(am, shx_f<2>(am));
+  am = fmaxf(am, shx_f<1>(am));
+  const float exp_f = ceilf(log2f(fmaxf(am, 1e-6f) * (1.0f / 6.0f)));
+  int e_i = (int)exp_f + 127;
+  if (e_i < 1) e_i = 1;
+  if (e_i > 254) e_i = 254;
+  const float inv_sc = __uint_as_float((uint32_t)(254 - e_i) << 23);
+  const uint32_t n0 = f32_to_fp4_e2m1(v[0] * inv_sc);
+  const uint32_t n1 = f32_to_fp4_e2m1(v[1] * inv_sc);
+  const uint32_t n2 = f32_to_fp4_e2m1(v[2] * inv_sc);
+  const uint32_t n3 = f32_to_fp4_e2m1(v[3] * inv_sc);
+  const uint16_t packed = (uint16_t)(n0 | (n1 << 4) | (n2 << 8) | (n3 << 12));
+
+  const int64_t blk = slot / block_size;
+  const int64_t off = slot % block_size;
+  uint8_t* dst = kv_cache + blk * c_s0 + off * c_s1;
+  *reinterpret_cast<uint16_t*>(dst + lane * 2) = packed;
+  if (sub == 0) {
+    dst[64 + grp] = (uint8_t)e_i;
+  }
+}
+
+void ernie_indexer_k_quant_and_cache_mxfp4(
+    torch::Tensor k, torch::Tensor kv_cache, torch::Tensor slot_mapping, int64_t block_size) {
+  const int T = (int)slot_mapping.size(0);
+  if (T == 0) return;
+  TORCH_CHECK(k.is_cuda() && k.dim() == 2 && k.size(1) == 128 && k.scalar_type() == torch::kBFloat16 && k.stride(1) == 1);
+  TORCH_CHECK(kv_cache.is_cuda() && kv_cache.scalar_type() == torch::kUInt8 && kv_cache.size(-1) == 68);
+  auto sm_i64 = slot_mapping.scalar_type() == torch::kInt64 ? slot_mapping.contiguous() : slot_mapping.to(torch::kInt64).contiguous();
+  hipLaunchKernelGGL(
+      k_indexer_k_quant_and_cache_mxfp4_128, dim3(T), dim3(32), 0, c10::hip::getCurrentHIPStream().stream(),
+      reinterpret_cast<const uint16_t*>(k.data_ptr()),
+      kv_cache.data_ptr<uint8_t>(), sm_i64.data_ptr<int64_t>(),
+      k.stride(0), kv_cache.stride(0), kv_cache.stride(1), (int)block_size);
+}
+
+// 23d: cp_gather_indexer_k_mxfp4_to_fp8 (for prefill MQA logits!)
+__global__ __launch_bounds__(32) void k_cp_gather_indexer_k_mxfp4_to_fp8_128(
+    const uint8_t* __restrict__ kv_cache,    // [num_blocks, block_size, 68] uint8
+    uint8_t* __restrict__ k_fp8_out,         // [num_tokens, 128] uint8
+    float* __restrict__ k_scale_out,         // [num_tokens] fp32
+    const int32_t* __restrict__ block_table, // [num_batches, bt_s0] int32
+    const int32_t* __restrict__ cu_seqlen,   // [num_batches + 1] int32
+    const int32_t* __restrict__ token_to_seq,// [num_tokens] int32
+    int64_t c_s0, int64_t c_s1, int64_t bt_s0,
+    int num_tokens, int num_batches, int bt_width, int num_blocks, int block_size) {
+  const int t = blockIdx.x;
+  if (t >= num_tokens) return;
+  const int lane = threadIdx.x; // 0..31 -> 4 elems/lane
+  const int grp = lane >> 3;    // 0..3
+
+  const int batch_id = token_to_seq[t];
+  if (batch_id < 0 || batch_id >= num_batches) return;
+  const int batch_start = cu_seqlen[batch_id];
+  const int batch_end = cu_seqlen[batch_id + 1];
+  if (t < batch_start || t >= batch_end) return;
+
+  const int batch_off = t - batch_start;
+  const int bt_id = batch_off / block_size;
+  const int blk_off = batch_off % block_size;
+  bool valid_blk = (bt_id >= 0 && bt_id < bt_width && blk_off >= 0 && blk_off < block_size);
+  int phys_blk = -1;
+  if (valid_blk) {
+    phys_blk = block_table[(int64_t)batch_id * bt_s0 + bt_id];
+    valid_blk = (phys_blk >= 0 && phys_blk < num_blocks);
+  }
+  if (!valid_blk) {
+    *reinterpret_cast<uint32_t*>(k_fp8_out + (int64_t)t * 128 + lane * 4) = 0u;
+    if (lane == 0) k_scale_out[t] = 0.0f;
+    return;
+  }
+
+  const uint8_t* src = kv_cache + (int64_t)phys_blk * c_s0 + (int64_t)blk_off * c_s1;
+  const uint32_t sc4 = *reinterpret_cast<const uint32_t*>(src + 64);
+  const int e0 = (int)(sc4 & 0xFFu);
+  const int e1 = (int)((sc4 >> 8) & 0xFFu);
+  const int e2 = (int)((sc4 >> 16) & 0xFFu);
+  const int e3 = (int)((sc4 >> 24) & 0xFFu);
+  const int max_e = max(max(e0, e1), max(e2, e3));
+  const int e_g = (int)((sc4 >> (grp * 8)) & 0xFFu);
+  const int rel_exp = 127 + 6 + e_g - max_e;
+  const float rel_sc = (rel_exp > 0) ? __uint_as_float((uint32_t)rel_exp << 23) : 0.0f;
+
+  const uint16_t packed = *reinterpret_cast<const uint16_t*>(src + lane * 2);
+  uint8_t ob[4];
+  ob[0] = f32_to_fp8_e4m3fn_ocp(fp4_e2m1_to_f32(packed & 0xFu) * rel_sc);
+  ob[1] = f32_to_fp8_e4m3fn_ocp(fp4_e2m1_to_f32((packed >> 4) & 0xFu) * rel_sc);
+  ob[2] = f32_to_fp8_e4m3fn_ocp(fp4_e2m1_to_f32((packed >> 8) & 0xFu) * rel_sc);
+  ob[3] = f32_to_fp8_e4m3fn_ocp(fp4_e2m1_to_f32((packed >> 12) & 0xFu) * rel_sc);
+  *reinterpret_cast<uint32_t*>(k_fp8_out + (int64_t)t * 128 + lane * 4) = *reinterpret_cast<const uint32_t*>(ob);
+  if (lane == 0) {
+    const int tok_exp = max_e - 6;
+    k_scale_out[t] = (tok_exp > 0) ? __uint_as_float((uint32_t)tok_exp << 23) : (exp2f((float)(max_e - 127)) * (1.0f / 64.0f));
+  }
+}
+
+void ernie_cp_gather_indexer_k_mxfp4_to_fp8(
+    torch::Tensor k_cache, torch::Tensor k_fp8, torch::Tensor k_fp8_scale,
+    torch::Tensor block_table, torch::Tensor cu_seqlen, torch::Tensor token_to_seq,
+    int64_t block_size) {
+  const int num_tokens = (int)k_fp8.size(0);
+  if (num_tokens == 0) return;
+  TORCH_CHECK(k_cache.is_cuda() && k_cache.scalar_type() == torch::kUInt8 && k_cache.size(-1) == 68);
+  TORCH_CHECK(k_fp8.is_cuda() && k_fp8.dim() == 2 && k_fp8.size(1) == 128 && k_fp8.is_contiguous());
+  auto bt = block_table.scalar_type() == torch::kInt32 ? block_table : block_table.to(torch::kInt32);
+  auto cu = cu_seqlen.scalar_type() == torch::kInt32 ? cu_seqlen.contiguous() : cu_seqlen.to(torch::kInt32).contiguous();
+  auto t2s = token_to_seq.scalar_type() == torch::kInt32 ? token_to_seq.contiguous() : token_to_seq.to(torch::kInt32).contiguous();
+  auto sc_f32 = k_fp8_scale.view(torch::kFloat32).reshape({-1});
+  const int num_batches = (int)cu.size(0) - 1;
+  const int num_blocks = (int)k_cache.size(0);
+  hipLaunchKernelGGL(
+      k_cp_gather_indexer_k_mxfp4_to_fp8_128, dim3(num_tokens), dim3(32), 0, c10::hip::getCurrentHIPStream().stream(),
+      k_cache.data_ptr<uint8_t>(), reinterpret_cast<uint8_t*>(k_fp8.data_ptr()),
+      sc_f32.data_ptr<float>(), bt.data_ptr<int32_t>(), cu.data_ptr<int32_t>(), t2s.data_ptr<int32_t>(),
+      k_cache.stride(0), k_cache.stride(1), bt.stride(0),
+      num_tokens, num_batches, (int)bt.size(1), num_blocks, (int)block_size);
+}
+
 PYBIND11_MODULE(ernie_fast_ops, m) {
   m.def("fused_route", &ernie_fused_route);
   m.def("fwht128", &ernie_fwht128);
@@ -2363,5 +2669,9 @@ PYBIND11_MODULE(ernie_fast_ops, m) {
         py::arg("x"), py::arg("w"), py::arg("out_bf16") = false);
   m.def("dsa_q_absorb_cat", &ernie_dsa_q_absorb_cat);
   m.def("dsa_uv_proj", &ernie_dsa_uv_proj);
+  m.def("scatter_dsa_kv_fp8", &ernie_scatter_dsa_kv_fp8);
+  m.def("scatter_dsa_kv_fp4", &ernie_scatter_dsa_kv_fp4);
+  m.def("indexer_k_quant_and_cache_mxfp4", &ernie_indexer_k_quant_and_cache_mxfp4);
+  m.def("cp_gather_indexer_k_mxfp4_to_fp8", &ernie_cp_gather_indexer_k_mxfp4_to_fp8);
 }
 

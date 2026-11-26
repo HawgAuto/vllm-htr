@@ -1,24 +1,24 @@
 {
   "package": "vllm-ernie-htr",
-  "target_image": "vllm-htr:v0.2.6-ernie55",
+  "target_image": "ghcr.io/hawgauto/vllm-htr:v0.2.7",
   "base_image": "ghcr.io/hawgauto/vllm-htr:v0.2.5",
   "arch": "gfx1151",
-  "wave": "wave24+adaptive_verification_ready",
-  "total_kernels": 463,
+  "wave": "wave25+fp8_nvfp4_mxfp4_kv_1m_2m",
+  "total_kernels": 472,
   "native_bins": {
     "ernie_dsa_attn.so": {
-      "sha256": "89eb8a0964bf9d27acabc50a9d137439ba9c2d52a6075f2a64ecae24fb1f29c0",
-      "bytes": 367032,
-      "kernels": 6,
+      "sha256": "32dfca45ebd85580f6603c5ce0a3260a2bbe895d192c787cb77d303d20625480",
+      "bytes": 503416,
+      "kernels": 11,
       "max_vgpr": 118,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
       "div_ops": 0
     },
     "ernie_fast_ops.so": {
-      "sha256": "cb56d86d310b63c8ef6fff4e046a643045d8e7b5409395bca45ff8aa387d47d6",
-      "bytes": 1091248,
-      "kernels": 97,
+      "sha256": "762f1965b5aad719f6d27608c21298106476542cf72ff43319661c2b8ce321d1",
+      "bytes": 1147904,
+      "kernels": 101,
       "max_vgpr": 89,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
@@ -95,17 +95,17 @@
   },
   "python_files": {
     "__init__.py": "9690aa0b8abb3765e192be8900a22e7d654402b5b17f6674ae91d26cd727a555",
-    "attention.py": "733143417fdda2cdf33e2ff8067d87d4841fe75a3d1fd45459c133540acafd1e",
+    "attention.py": "ca6cb0715515521ba7aae46b2c7a86db37b8b4af98ee5713cddf4b9a5c745b79",
     "config.py": "f16d057b11bd8b8e920259657b41651d003908f99ff8aff4a94118a4912c343d",
-    "dspark.py": "f9640355ac8c4aa9bf4a9df42df40fed45a7e41b2eb77933e3d3364a3c55df3a",
+    "dspark.py": "b7f7c58e653025d0d01d937a9e8dbe1fa223e9fcc010b7c72ef978f99e4922f5",
     "fast_ops.py": "16f8123c0c864f4d7fd3f2c455e32e141a6f66f2651b11031be22c8669c28c38",
     "mhc.py": "d1b2f26b5b49e5c08f23b05136f41e85ed36f600427d9d449dd6a25a9cf3e442",
     "model.py": "6a84f7a00d3836bec18d62c66312d8ec820222d47115a9a16fed1436262b83b0",
     "moe_ops.py": "9e918951d227eb66e6e72ba19e268c41f5bd4970fa4fef217d130774e30a8ed6",
     "parser.py": "7b10a59d750d1f7108adad6b8a1ce6717b30ba3bdc6ddadf85df6e7587f5000b",
-    "patches.py": "dbcaf4fc3e61e23149dfdd1e6ec1d088f4e041601140d316c1904fa67e9a7daf",
+    "patches.py": "4a0615620bdf6d0fa587315cc3efb3e6c7ffaea738dc5b4c72416bb50920b44c",
     "reasoning_parser.py": "617d4ec8cbebffa0f6b228d80b4020a749c09be11cdc7fe3a760761b7268d4f7",
-    "renderer.py": "3ac0b61858806c7575892b679f7d66b4fa2f0fa86aebc14c888ac93cd3abc163",
+    "renderer.py": "af79e42b0159b88cd98795f1ce85955ff40bdfeedb97b63aa40121b561e0434e",
     "tool_parser.py": "d1cd59f828a917875b2fb485fe1d7f2730558e4ff302da94542148637dd22b5f"
   },
   "verified_benchmarks_43l": {
@@ -119,5 +119,21 @@
     "dspark_k7_primes_tok_s": 69.61,
     "spad3_default": 0,
     "memory_cgroup_cap": "117g"
+  },
+  "verified_benchmarks_kv_v027": {
+    "fp8_1m_kv_gib": 5.4,
+    "fp8_1m_kv_tokens": 1058592,
+    "fp8_1m_concurrency_at_1m": 1.01,
+    "fp8_1m_primes_tok_s": 57.62,
+    "fp8_1m_code_tok_s": 31.72,
+    "fp8_1m_needle_8k_pass": true,
+    "fp8_1m_dspark5_mean_acc_len": 3.74,
+    "nvfp4_2m_kv_gib": 6.55,
+    "nvfp4_2m_kv_tokens": 2118842,
+    "nvfp4_2m_concurrency_at_1m": 2.02,
+    "nvfp4_2m_concurrent_2x_agg_tok_s": 39.5,
+    "nvfp4_2m_needle_8k_pass": true,
+    "nvfp4_2m_needle_8k_s": 27.45,
+    "nvfp4_2m_dspark5_mean_acc_len": 3.63
   }
 }

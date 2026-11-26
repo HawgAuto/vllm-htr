@@ -90,6 +90,12 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                     (out_logits,) = current_workspace_manager().get_simultaneous(
                         ((rows, max_model_len), torch.float32),
                     )
+                    if kv_cache_fp8.shape[-1] == 68 and hasattr(ext, "fp8_mxfp4_paged_mqa_logits_decode"):
+                        ext.fp8_mxfp4_paged_mqa_logits_decode(
+                            q_fp8, kv_cache_fp8, weights, context_lens, block_tables,
+                            out_logits, int(max_model_len),
+                        )
+                        return out_logits
                     is_shuffle = (kv_cache_fp8.shape[1] > 1) and (compress_ratio != 4)
                     ext.fp8_paged_mqa_logits_decode(
                         q_fp8, kv_cache_fp8, weights, context_lens, block_tables,
@@ -113,6 +119,18 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
 
     _rocm_fp8_paged_mqa_logits_fast._ernie5_gfx1151_triton = True  # type: ignore[attr-defined]
     rmod.rocm_fp8_paged_mqa_logits = _rocm_fp8_paged_mqa_logits_fast
+
+    _orig_max_dec = getattr(rmod, "_max_decode_logits_rows", None)
+    if _orig_max_dec is not None and not getattr(_orig_max_dec, "_ernie5_max_decode_rows_patched", False):
+        @functools.wraps(_orig_max_dec)
+        def _max_decode_logits_rows_fixed(num_batched_tokens: int) -> int:
+            res = _orig_max_dec(num_batched_tokens)
+            cached = getattr(rmod, "_ernie5_max_decode_rows", None)
+            if cached and cached > 0:
+                return min(int(res), int(cached))
+            return res
+        _max_decode_logits_rows_fixed._ernie5_max_decode_rows_patched = True  # type: ignore[attr-defined]
+        rmod._max_decode_logits_rows = _max_decode_logits_rows_fixed
 
     # Also replace slow fp8_mqa_logits_torch prefill fallback on gfx1151 with native WMMA HIP kernel
     orig_pref = getattr(rmod, "rocm_fp8_mqa_logits", None)
@@ -160,6 +178,11 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                 from .fast_ops import get_fast_ops
                 fops = get_fast_ops()
                 if fops is not None and hasattr(fops, "indexer_k_quant_and_cache"):
+                    if kv_cache.shape[-1] == 68 and hasattr(fops, "indexer_k_quant_and_cache_mxfp4"):
+                        fops.indexer_k_quant_and_cache_mxfp4(
+                            k, kv_cache, slot_mapping, int(kv_cache.shape[1])
+                        )
+                        return
                     fops.indexer_k_quant_and_cache(
                         k, kv_cache, slot_mapping, int(kv_cache.shape[1]), scale_fmt == "ue8m0"
                     )
@@ -193,6 +216,11 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                 fops = get_fast_ops()
                 if fops is not None and hasattr(fops, "cp_gather_indexer_k_quant_cache"):
                     bs = int(k_cache.shape[1])
+                    if k_cache.shape[-1] == 68 and hasattr(fops, "cp_gather_indexer_k_mxfp4_to_fp8"):
+                        fops.cp_gather_indexer_k_mxfp4_to_fp8(
+                            k_cache, k_fp8, k_fp8_scale, block_table, cu_seqlen, token_to_seq, bs,
+                        )
+                        return
                     layout = ("NORMAL" if bs == 1 else "SHUFFLE") if cache_layout is None else cache_layout
                     fops.cp_gather_indexer_k_quant_cache(
                         k_cache, k_fp8, k_fp8_scale, block_table, cu_seqlen, token_to_seq,

@@ -101,7 +101,7 @@ def main() -> None:
             '                    yield name, param\n'
         )
         new_wu = old_wu + (
-            '        if total_bytes > 32 * 1024**3 and hasattr(os, "posix_fadvise"):\n'
+            '        if total_bytes > 2 * 1024**3 and hasattr(os, "posix_fadvise"):\n'
             '            try:\n'
             '                _fd = os.open(st_file, os.O_RDONLY)\n'
             '                try:\n'
@@ -114,7 +114,7 @@ def main() -> None:
         if 'POSIX_FADV_DONTNEED' not in wu_src:
             assert wu_src.count(old_wu) == 1, f'Expected 1 safe_open block in weight_utils.py, got {wu_src.count(old_wu)}'
             wt_utils_p.write_text(wu_src.replace(old_wu, new_wu, 1))
-            print('Patched weight_utils.py: per-shard POSIX_FADV_DONTNEED for checkpoints > 32 GiB')
+            print('Patched weight_utils.py: per-shard POSIX_FADV_DONTNEED for checkpoints > 2 GiB')
 
     #   (c) deepseek_scaling_rope.py: keep YaRN inv_freq bit-identical (using full
     #       max_position_embeddings * scaling_factor), but only materialize cos_sin_cache rows up to
@@ -148,6 +148,91 @@ def main() -> None:
             assert dr_src.count(old_dr) >= 1, 'Expected torch.arange block in deepseek_scaling_rope.py'
             ds_rope_p.write_text(dr_src.replace(old_dr, new_dr))
             print(f'Patched deepseek_scaling_rope.py: cap cos_sin_cache rows to max_model_len+256 ({dr_src.count(old_dr)} sites)')
+
+    #   (d) kv_cache_utils.py (_get_packed_kv_cache_groups): pack single-page-size buckets to fill
+    #       anchor_bytes instead of over-splitting by repeats_per_group. Cuts ERNIE-5.5 from 16 -> 9
+    #       KV groups (HCA C128 5->1, state 5->3, SWA 5->4), boosting KV capacity ~1.7x (64K ctx in 1.30 GiB!).
+    kcu_p = Path('/opt/venv/lib/python3.14/site-packages/vllm/v1/core/kv_cache_utils.py')
+    if kcu_p.is_file():
+        ku_src = kcu_p.read_text()
+        old_ku = (
+            '    groups = []\n'
+            '    for spec, page_size_layers, balanced in bucketed:\n'
+            '        num_groups = num_groups_for(spec, balanced)\n'
+            '        # Cap a state group at the states a block already fits rather than let\n'
+        )
+        new_ku = (
+            '    groups = []\n'
+            '    for spec, page_size_layers, balanced in bucketed:\n'
+            '        num_groups = num_groups_for(spec, balanced)\n'
+            '        if anchor_bytes and len(page_size_layers) == 1:\n'
+            '            _page_sz = next(iter(page_size_layers))\n'
+            '            if _page_sz > 0:\n'
+            '                _layers_per_blk = max(anchor_bytes // _page_sz, 1)\n'
+            '                num_groups = cdiv(len(spec.kv_cache_specs), _layers_per_blk)\n'
+            '        # Cap a state group at the states a block already fits rather than let\n'
+        )
+        old_sb = (
+            '    def is_state_bucket(spec: UniformTypeKVCacheSpecs) -> bool:\n'
+            '        if isinstance(spec.first_spec, (MambaSpec, CircularBufferSpec)):\n'
+            '            return True\n'
+            '        return repeats_per_group is None and isinstance(\n'
+            '            spec.first_spec, SlidingWindowSpec\n'
+            '        )\n'
+        )
+        new_sb = (
+            '    def is_state_bucket(spec: UniformTypeKVCacheSpecs) -> bool:\n'
+            '        return isinstance(\n'
+            '            spec.first_spec, (MambaSpec, CircularBufferSpec, SlidingWindowSpec)\n'
+            '        )\n'
+        )
+        if old_sb in ku_src:
+            ku_src = ku_src.replace(old_sb, new_sb, 1)
+        if '_layers_per_blk = max(anchor_bytes // _page_sz, 1)' not in ku_src:
+            assert ku_src.count(old_ku) == 1, f'Expected 1 occurrence in kv_cache_utils.py, got {ku_src.count(old_ku)}'
+            ku_src = ku_src.replace(old_ku, new_ku, 1)
+            kcu_p.write_text(ku_src)
+            print('Patched kv_cache_utils.py: optimal anchor-bytes packing + SlidingWindowSpec state-bucket cap')
+
+    #   (e) gpu_worker.py: when kv_cache_memory_bytes skips memory_profiling(), flush idle
+    #       PyTorch caching-allocator segments right after profile_run() (~1.0 GiB saved on 128GB).
+    gw_p = Path('/opt/venv/lib/python3.14/site-packages/vllm/v1/worker/gpu_worker.py')
+    if gw_p.is_file():
+        gw_src = gw_p.read_text()
+        old_gw = (
+            '        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:\n'
+            '            # still need a profile run which compiles the model for\n'
+            '            # max_num_batched_tokens\n'
+            '            self.model_runner.profile_run()\n'
+        )
+        new_gw = (
+            '        if kv_cache_memory_bytes := self.cache_config.kv_cache_memory_bytes:\n'
+            '            # still need a profile run which compiles the model for\n'
+            '            # max_num_batched_tokens\n'
+            '            self.model_runner.profile_run()\n'
+            '            import gc as _gc; _gc.collect(); torch.cuda.empty_cache()\n'
+        )
+        if old_gw in gw_src and 'torch.cuda.empty_cache()' not in gw_src.split('kv_cache_memory_bytes')[1][:320]:
+            assert gw_src.count(old_gw) == 1, f'Expected 1 occurrence in gpu_worker.py, got {gw_src.count(old_gw)}'
+            gw_p.write_text(gw_src.replace(old_gw, new_gw, 1))
+            print('Patched gpu_worker.py: empty_cache after profile_run in kv_cache_memory_bytes path')
+
+    #   (f) indexer.py: align DeepseekV32IndexerMetadataBuilder.max_prefill_buffer_size with
+    #       ERNIE-5.5 1x max_model_len workspace cap (keeps WorkspaceManager at 132 MiB for any max_num_seqs).
+    idx_p = Path('/opt/venv/lib/python3.14/site-packages/vllm/v1/attention/backends/mla/indexer.py')
+    if idx_p.is_file():
+        idx_src = idx_p.read_text()
+        old_idx = '        self.max_prefill_buffer_size = get_max_prefill_buffer_size(self.vllm_config)\n'
+        new_idx = (
+            '        self.max_prefill_buffer_size = min(\n'
+            '            get_max_prefill_buffer_size(self.vllm_config),\n'
+            '            self.vllm_config.model_config.max_model_len,\n'
+            '        )\n'
+        )
+        if old_idx in idx_src:
+            assert idx_src.count(old_idx) == 1, f'Expected 1 occurrence in indexer.py, got {idx_src.count(old_idx)}'
+            idx_p.write_text(idx_src.replace(old_idx, new_idx, 1))
+            print('Patched indexer.py: cap DeepseekV32IndexerMetadataBuilder.max_prefill_buffer_size to max_model_len')
 
     # 3. Install ERNIE-5.5 native sources, 8 gfx1151 Wave32 .so binaries, plugin, and manifest
     ernie_src = PAYLOAD / 'ernie'
