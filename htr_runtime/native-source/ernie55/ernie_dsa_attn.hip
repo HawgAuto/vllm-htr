@@ -2124,15 +2124,15 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_qreg_v28(
     __attribute__((aligned(16))) uint16_t KV_lds[16][DSA_STRIDE];               // 18,688 B
     __attribute__((aligned(16))) uint16_t VT_lds_g[16][32 * DSA_VT_STRIDE + 2]; // 18,496 B
   } u_kv;
-  __shared__ float S_part[2][3][16][16];                                        //  6,144 B
+  __shared__ float S_part[2][4][16][16];                                        //  8,192 B (4-way parallel softmax!)
   __shared__ __attribute__((aligned(16))) uint16_t P_lds[2][16][16];            //  1,024 B
   __shared__ float fp8_lut[256];                                                //  1,024 B
   __shared__ float s_alpha[32];
   __shared__ float s_m[32];
   __shared__ float s_l[32];
 
-  const int t = blockIdx.x;
-  const int hg32 = blockIdx.y;
+  const int hg32 = blockIdx.x;
+  const int t = blockIdx.y;
   const int tid = threadIdx.x;
   const int wave = tid >> 5;
   const int wh = wave >> 2;     // 0..1
@@ -2287,22 +2287,35 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_qreg_v28(
       k0_c = k0_n; k1_c = k1_n;
     }
 
-    if (wd > 0) {
 #pragma unroll
-      for (int ei = 0; ei < 8; ++ei) S_part[wh][wd - 1][2 * ei + hrow][l16] = s_acc[ei];
-    }
+    for (int ei = 0; ei < 8; ++ei) S_part[wh][wd][2 * ei + hrow][l16] = s_acc[ei];
     __syncthreads();
 
-    // 3. Online softmax (wd == 0) + write bank-conflict-free u_kv.VT_lds_g (KV_lds is dead!)
-    if (wd == 0) {
+    // 3a. Write u_kv.VT_lds_g FIRST (KV_lds is dead!) + hoist NEXT raw KV prefetch BEFORE softmax!
+    {
+      uint16_t* vt_dst = &u_kv.VT_lds_g[sub16][kr_ld];
+#pragma unroll
+      for (int p = 0; p < 16; ++p) {
+        vt_dst[(p * 2 + 0) * DSA_VT_STRIDE] = (uint16_t)(pk_hold[p] & 0xFFFFu);
+        vt_dst[(p * 2 + 1) * DSA_VT_STRIDE] = (uint16_t)(pk_hold[p] >> 16);
+      }
+    }
+    if (blk + 1 < total_blks) {
+      prefetch_raw(blk + 1, cur_raw);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    // 3b. 4-way parallel online softmax across ALL 4 wd waves (2 ei/wave instead of 8 on wd==0!)
+    {
       const int c = blk * 16 + l16;
       const int32_t sl_v = (c < W) ? idx_row[c] : -1;
       const bool vld = (sl_v >= 0 && sl_v < total_slots);
 #pragma unroll
-      for (int ei = 0; ei < 8; ++ei) {
+      for (int e_sub = 0; e_sub < 2; ++e_sub) {
+        const int ei = wd * 2 + e_sub;
         const int hm = 2 * ei + hrow;
         const int h_loc = wh * 16 + hm;
-        float sc = s_acc[ei] + S_part[wh][0][hm][l16] + S_part[wh][1][hm][l16] + S_part[wh][2][hm][l16];
+        float sc = S_part[wh][0][hm][l16] + S_part[wh][1][hm][l16] + S_part[wh][2][hm][l16] + S_part[wh][3][hm][l16];
         sc = vld ? (sc * scale) : NEG_INF;
         const float bmax = halfwave_max16(sc);
         const float mold = s_m[h_loc];
@@ -2318,20 +2331,7 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_qreg_v28(
         }
       }
     }
-    {
-      uint16_t* vt_dst = &u_kv.VT_lds_g[sub16][kr_ld];
-#pragma unroll
-      for (int p = 0; p < 16; ++p) {
-        vt_dst[(p * 2 + 0) * DSA_VT_STRIDE] = (uint16_t)(pk_hold[p] & 0xFFFFu);
-        vt_dst[(p * 2 + 1) * DSA_VT_STRIDE] = (uint16_t)(pk_hold[p] >> 16);
-      }
-    }
     __syncthreads();
-
-    // 4. Prefetch NEXT tile's raw quantized KV BEFORE P@V WMMAs (overlaps DRAM/L2 with 8 WMMAs!)
-    if (blk + 1 < total_blks) {
-      prefetch_raw(blk + 1, cur_raw);
-    }
 
     float al[8];
 #pragma unroll
@@ -2408,7 +2408,7 @@ torch::Tensor ernie_dsa_sparse_mla_quant(
   if (num_splits <= 1 || W <= 32) {
     if (T >= 32) {
       if (kv_fmt == 1) {
-        hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_qreg_v28<1>), dim3(T, 2, 1), dim3(256), 0, st,
+        hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_qreg_v28<1>), dim3(2, T, 1), dim3(256), 0, st,
             reinterpret_cast<const uint16_t*>(q.data_ptr<at::BFloat16>()),
             kv_cache.data_ptr<uint8_t>(), indices.data_ptr<int32_t>(),
             reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>()),
@@ -2416,7 +2416,7 @@ torch::Tensor ernie_dsa_sparse_mla_quant(
             indices.stride(0), out.stride(0), out.stride(1),
             (int)kv_cache.size(0), (int)kv_cache.size(1), W, (float)scale);
       } else {
-        hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_qreg_v28<2>), dim3(T, 2, 1), dim3(256), 0, st,
+        hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_qreg_v28<2>), dim3(2, T, 1), dim3(256), 0, st,
             reinterpret_cast<const uint16_t*>(q.data_ptr<at::BFloat16>()),
             kv_cache.data_ptr<uint8_t>(), indices.data_ptr<int32_t>(),
             reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>()),
