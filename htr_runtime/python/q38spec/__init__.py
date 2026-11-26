@@ -22,6 +22,7 @@ import os
 import sys
 
 _PATCHED = False
+_MRV2_PATCHED = False
 KC = 64
 _STATE = {"sampling_states": None, "draft_sparse": {}}
 _Q38_FILTER_NATIVE_EXT = None
@@ -115,14 +116,33 @@ def q38_filter_logits(logits, idx_mapping, temperature, top_k, top_p, kc=KC, in_
     rm[:, 0] = False                                          # keep at least the top-1
     keep = keep & ~rm
     neg = torch.full_like(vals, float("-inf"))
-    out = torch.full_like(logits, float("-inf"))
-    out.scatter_(1, ids, torch.where(keep, vals, neg))
-    filt = (k <= kc) & (idx_mapping >= 0)
-    return torch.where(filt[:, None], out, logits)
+    out_tk = torch.full_like(logits, float("-inf"))
+    out_tk.scatter_(1, ids, torch.where(keep, vals, neg))
+    has_topk = (k >= 1) & (k <= kc) & (idx_mapping >= 0)
+
+    # v0.2.8: exact full-vocab logsumexp top_p-only filtering (top_k disabled / > kc, 0 < top_p < 1, T > 0)
+    raw_t = temperature[safe].float()
+    has_topp_only = (~has_topk) & (idx_mapping >= 0) & (p > 0.0) & (p < 1.0) & (raw_t > 0.0)
+    if bool(has_topp_only.any()):
+        lse = torch.logsumexp(logits.float() / t[:, None], dim=-1, keepdim=True)
+        pr_full = torch.exp(v - lse)
+        mass_kc = pr_full.sum(dim=-1)
+        exact_ok = has_topp_only & (mass_kc >= p)
+        cum_before = pr_full.cumsum(dim=-1) - pr_full
+        keep_tp = cum_before < p[:, None]
+        keep_tp[:, 0] = True
+        out_tp = torch.full_like(logits, float("-inf"))
+        out_tp.scatter_(1, ids, torch.where(keep_tp, vals, neg))
+        res = torch.where(has_topk[:, None], out_tk, logits)
+        return torch.where(exact_ok[:, None], out_tp, res)
+    return torch.where(has_topk[:, None], out_tk, logits)
 
 
 # ---------------------------------------------------------------- (a) model runner V2
 def _patch_mrv2():
+    global _MRV2_PATCHED
+    if _MRV2_PATCHED:
+        return
     import torch
     from vllm.v1.worker.gpu.sample import states as st_mod
     from vllm.v1.worker.gpu.spec_decode import speculator as sp_mod
@@ -218,6 +238,7 @@ def _patch_mrv2():
 
     Spec._copy_request_inputs = _copy_request_inputs
     Spec.sample_draft = sample_draft
+    _MRV2_PATCHED = True
     _log("Q38SPEC draft_filter PATCHED mrv2 DraftModelSpeculator.sample_draft/_copy_request_inputs + SamplingStates")
 
 
