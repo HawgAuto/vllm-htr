@@ -223,8 +223,8 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched(
         w5_nxt = __builtin_nontemporal_load(p4_grp + tidn * 8 + q);
       } else {
         const uint32_t* tpn = qm + (size_t)il * pitch + (size_t)jn * 40;
-        wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn + q * 5));
-        w5_nxt = __builtin_nontemporal_load(tpn + q * 5 + 4);
+        wa_nxt = *reinterpret_cast<const u4va*>(tpn + q * 5);
+        w5_nxt = tpn[q * 5 + 4];
       }
     }
     __builtin_amdgcn_sched_barrier(0);
@@ -922,8 +922,8 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma(
     w5_cur = __builtin_nontemporal_load(p4_grp + tid0 * 8 + q);
   } else {
     const uint32_t* tp0 = qm + (size_t)g * 40;
-    wa_cur = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tp0 + q * 5));
-    w5_cur = __builtin_nontemporal_load(tp0 + q * 5 + 4);
+    wa_cur = *reinterpret_cast<const u4va*>(tp0 + q * 5);
+    w5_cur = tp0[q * 5 + 4];
   }
 
   for (int j = 0; j < NT; j += 4) {
@@ -952,7 +952,8 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma(
         const int half_k = idx & 1;
         const int t_ld = (idx >> 1) & 3;
         const int row_l = idx >> 3;
-        *reinterpret_cast<uint4*>(&smem.stage.x_lds[t_ld][row_l][half_k * 4]) = x_tmp[s];
+        const int hk_swz = half_k ^ ((row_l >> 2) & 1);
+        *reinterpret_cast<uint4*>(&smem.stage.x_lds[t_ld][row_l][hk_swz * 4]) = x_tmp[s];
       }
     }
 
@@ -995,8 +996,10 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma(
       const h16v a = __builtin_bit_cast(h16v, au);
 #pragma unroll
       for (int c = 0; c < NB; ++c) {
-        const uint4* bp = reinterpret_cast<const uint4*>(smem.stage.x_lds[t][c * 16 + l16]);
-        u2_128 bu{bp[0], bp[1]};
+        const int rl = c * 16 + l16;
+        const int h0 = (rl >> 2) & 1;
+        const uint4* bp = reinterpret_cast<const uint4*>(smem.stage.x_lds[t][rl]);
+        u2_128 bu{bp[h0], bp[h0 ^ 1]};
         acc[c] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a, __builtin_bit_cast(h16v, bu), acc[c]);
       }
       __builtin_amdgcn_sched_barrier(0);

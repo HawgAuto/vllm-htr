@@ -180,7 +180,7 @@ __global__ __launch_bounds__(256) void k_mhc_post_dot_4096(
 //     and completely eliminates the 134 MB xf FP32 DRAM round-trip (saves 23.1 GB per 2048-tok prefill!)
 // Grid: (32, ceil(T / BT)), Block: 256 (8 Wave32s)
 // ---------------------------------------------------------------------------
-template <int DO_POST, int BT, int NT_FN>
+template <int DO_POST, int BT, int NT_FN, int NT_IN = 0>
 __global__ __launch_bounds__(256) void k_mhc_post_dot_4096_tiled(
     const uint16_t* __restrict__ x,          // [T, 4096] bf16 (only used if DO_POST)
     const uint16_t* __restrict__ res_in,     // [T, 4, 4096] bf16
@@ -212,10 +212,18 @@ __global__ __launch_bounds__(256) void k_mhc_post_dot_4096_tiled(
     const int t = t0 + bt;
     if (t < T) {
       const uint16_t* r_base = res_in + (size_t)t * (HC * H) + h;
-      const uint2 raw0 = *reinterpret_cast<const uint2*>(r_base + 0 * H);
-      const uint2 raw1 = *reinterpret_cast<const uint2*>(r_base + 1 * H);
-      const uint2 raw2 = *reinterpret_cast<const uint2*>(r_base + 2 * H);
-      const uint2 raw3 = *reinterpret_cast<const uint2*>(r_base + 3 * H);
+      auto ld64 = [](const uint16_t* p) -> uint2 {
+        if constexpr (NT_IN) {
+          uint64_t q = __builtin_nontemporal_load(reinterpret_cast<const uint64_t*>(p));
+          return make_uint2((uint32_t)q, (uint32_t)(q >> 32));
+        } else {
+          return *reinterpret_cast<const uint2*>(p);
+        }
+      };
+      const uint2 raw0 = ld64(r_base + 0 * H);
+      const uint2 raw1 = ld64(r_base + 1 * H);
+      const uint2 raw2 = ld64(r_base + 2 * H);
+      const uint2 raw3 = ld64(r_base + 3 * H);
       float ss0 = 0.f, ss1 = 0.f;
       if constexpr (DO_POST) {
         const float r0[4] = {__uint_as_float((raw0.x & 0xFFFFu) << 16), __uint_as_float(raw0.x & 0xFFFF0000u),
@@ -226,7 +234,7 @@ __global__ __launch_bounds__(256) void k_mhc_post_dot_4096_tiled(
                              __uint_as_float((raw2.y & 0xFFFFu) << 16), __uint_as_float(raw2.y & 0xFFFF0000u)};
         const float r3[4] = {__uint_as_float((raw3.x & 0xFFFFu) << 16), __uint_as_float(raw3.x & 0xFFFF0000u),
                              __uint_as_float((raw3.y & 0xFFFFu) << 16), __uint_as_float(raw3.y & 0xFFFF0000u)};
-        const uint2 xraw = *reinterpret_cast<const uint2*>(x + (size_t)t * H + h);
+        const uint2 xraw = ld64(x + (size_t)t * H + h);
         const float xv[4] = {__uint_as_float((xraw.x & 0xFFFFu) << 16), __uint_as_float(xraw.x & 0xFFFF0000u),
                              __uint_as_float((xraw.y & 0xFFFFu) << 16), __uint_as_float(xraw.y & 0xFFFF0000u)};
         const f4v pmv = *reinterpret_cast<const f4v*>(post_mix + (size_t)t * 4);
@@ -743,7 +751,7 @@ static void dispatch_mhc_post_dot(
   } else {
     // Prefill T >= 17: NT_FN=0 keeps fn (1.5 MiB) resident in 32 MiB Infinity Cache across all token-tiles!
     hipLaunchKernelGGL(
-        (k_mhc_post_dot_4096_tiled<DO_POST, 16, 0>), dim3(32, (T + 15) / 16), dim3(256), 0, stream,
+        (k_mhc_post_dot_4096_tiled<DO_POST, 16, 0, 1>), dim3(32, (T + 15) / 16), dim3(256), 0, stream,
         xp, rp, pmp, cmp, fnp, rop, partp, T);
   }
 }
@@ -760,46 +768,56 @@ void launch_mhc_fused_post_pre_decode(
   const int T = (int)res_in.size(0);
   if (T == 0) return;
   auto stream = c10::hip::getCurrentHIPStream().stream();
-  if (do_post) {
-    dispatch_mhc_post_dot<1>(
-        T, stream,
-        reinterpret_cast<const uint16_t*>(x.data_ptr()),
-        reinterpret_cast<const uint16_t*>(res_in.data_ptr()),
-        post_mix.data_ptr<float>(),
-        comb_mix.data_ptr<float>(),
-        fn.data_ptr<float>(),
-        reinterpret_cast<uint16_t*>(res_out.data_ptr()),
-        part_buf.data_ptr<float>());
-  } else {
-    dispatch_mhc_post_dot<0>(
-        T, stream,
-        nullptr,
-        reinterpret_cast<const uint16_t*>(res_in.data_ptr()),
-        nullptr, nullptr,
-        fn.data_ptr<float>(),
-        nullptr,
-        part_buf.data_ptr<float>());
-  }
-  const uint16_t* rcur = reinterpret_cast<const uint16_t*>((do_post ? res_out : res_in).data_ptr());
-  if (norm_w.has_value()) {
-    hipLaunchKernelGGL(
-        (k_mhc_sinkhorn_norm_4096<1, 1>), dim3(T), dim3(256), 0, stream,
-        part_buf.data_ptr<float>(), nullptr, rcur,
-        hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(),
-        reinterpret_cast<const uint16_t*>(norm_w->data_ptr()),
-        post_out.data_ptr<float>(), comb_out.data_ptr<float>(),
-        reinterpret_cast<uint16_t*>(layer_in.data_ptr()),
-        (float)rms_eps, (float)hc_pre_eps, (float)hc_sinkhorn_eps,
-        (float)hc_post_mult_value, (int)sinkhorn_repeat, (float)norm_eps);
-  } else {
-    hipLaunchKernelGGL(
-        (k_mhc_sinkhorn_norm_4096<1, 0>), dim3(T), dim3(256), 0, stream,
-        part_buf.data_ptr<float>(), nullptr, rcur,
-        hc_scale.data_ptr<float>(), hc_base.data_ptr<float>(), nullptr,
-        post_out.data_ptr<float>(), comb_out.data_ptr<float>(),
-        reinterpret_cast<uint16_t*>(layer_in.data_ptr()),
-        (float)rms_eps, (float)hc_pre_eps, (float)hc_sinkhorn_eps,
-        (float)hc_post_mult_value, (int)sinkhorn_repeat, (float)norm_eps);
+  // MALL-tiled CHUNK=512: with NT_IN=1 on res_in/x, res_out (16 MiB) + fn (1.5 MiB) + part (1.6 MiB)
+  // stays 100% resident in 32 MiB Infinity Cache between Kernel 1 and Kernel 2 (1.28-1.36x faster!).
+  const int part_cap = (int)part_buf.size(0);
+  const int chunk = (T <= 512) ? T : (part_cap < 512 ? part_cap : 512);
+  const uint16_t* xp_base = do_post ? reinterpret_cast<const uint16_t*>(x.data_ptr()) : nullptr;
+  const uint16_t* rp_base = reinterpret_cast<const uint16_t*>(res_in.data_ptr());
+  const float* pm_base = do_post ? post_mix.data_ptr<float>() : nullptr;
+  const float* cm_base = do_post ? comb_mix.data_ptr<float>() : nullptr;
+  const float* fn_p = fn.data_ptr<float>();
+  const float* sc_p = hc_scale.data_ptr<float>();
+  const float* bs_p = hc_base.data_ptr<float>();
+  const uint16_t* nw_p = norm_w.has_value() ? reinterpret_cast<const uint16_t*>(norm_w->data_ptr()) : nullptr;
+  uint16_t* ro_base = do_post ? reinterpret_cast<uint16_t*>(res_out.data_ptr()) : nullptr;
+  float* po_base = post_out.data_ptr<float>();
+  float* co_base = comb_out.data_ptr<float>();
+  uint16_t* li_base = reinterpret_cast<uint16_t*>(layer_in.data_ptr());
+  float* part_p = part_buf.data_ptr<float>();
+
+  for (int t0 = 0; t0 < T; t0 += chunk) {
+    const int tc = (T - t0 < chunk) ? (T - t0) : chunk;
+    const uint16_t* rp = rp_base + (size_t)t0 * 16384;
+    uint16_t* ro = do_post ? (ro_base + (size_t)t0 * 16384) : nullptr;
+    if (do_post) {
+      dispatch_mhc_post_dot<1>(
+          tc, stream,
+          xp_base + (size_t)t0 * 4096, rp,
+          pm_base + (size_t)t0 * 4, cm_base + (size_t)t0 * 16,
+          fn_p, ro, part_p);
+    } else {
+      dispatch_mhc_post_dot<0>(
+          tc, stream, nullptr, rp, nullptr, nullptr, fn_p, nullptr, part_p);
+    }
+    const uint16_t* rcur = do_post ? ro : rp;
+    if (nw_p) {
+      hipLaunchKernelGGL(
+          (k_mhc_sinkhorn_norm_4096<1, 1>), dim3(tc), dim3(256), 0, stream,
+          part_p, nullptr, rcur, sc_p, bs_p, nw_p,
+          po_base + (size_t)t0 * 4, co_base + (size_t)t0 * 16,
+          li_base + (size_t)t0 * 4096,
+          (float)rms_eps, (float)hc_pre_eps, (float)hc_sinkhorn_eps,
+          (float)hc_post_mult_value, (int)sinkhorn_repeat, (float)norm_eps);
+    } else {
+      hipLaunchKernelGGL(
+          (k_mhc_sinkhorn_norm_4096<1, 0>), dim3(tc), dim3(256), 0, stream,
+          part_p, nullptr, rcur, sc_p, bs_p, nullptr,
+          po_base + (size_t)t0 * 4, co_base + (size_t)t0 * 16,
+          li_base + (size_t)t0 * 4096,
+          (float)rms_eps, (float)hc_pre_eps, (float)hc_sinkhorn_eps,
+          (float)hc_post_mult_value, (int)sinkhorn_repeat, (float)norm_eps);
+    }
   }
 }
 

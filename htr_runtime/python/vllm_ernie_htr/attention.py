@@ -527,7 +527,7 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
             elif hasattr(ext, "wo_a_k5_prefill_wmma"):
                 # Batched 8-group K=5 WMMA + SAD_HI + fused sigmoid(gate) for ALL T > 16 (chunk=2048 -> 1.27x faster)!
                 _woa_chunk_env = _os.environ.get("ERNIE_WOA_PREFILL_CHUNK")
-                _woa_chunk = int(_woa_chunk_env) if _woa_chunk_env else (256 if num_tokens <= 1024 else 512)
+                _woa_chunk = int(_woa_chunk_env) if _woa_chunk_env else 2048
                 for i in range(0, num_tokens, _woa_chunk):
                     j = min(i + _woa_chunk, num_tokens)
                     xt_b, tok_b = _woa_prefill_scratch(o_groups.device, j - i)

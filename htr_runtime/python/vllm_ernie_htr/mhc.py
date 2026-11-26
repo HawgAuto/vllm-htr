@@ -56,11 +56,12 @@ def _ext():
 
 def _part_buf(dev: torch.device, T: int) -> torch.Tensor:
     key = str(dev)
+    need = min(T, 512)
     buf = _PART_BUF.get(key)
-    if buf is None or buf.shape[0] < T:
-        buf = torch.empty((max(16, T), 32, 25), dtype=torch.float32, device=dev)
+    if buf is None or buf.shape[0] < need:
+        buf = torch.empty((max(16, need), 32, 25), dtype=torch.float32, device=dev)
         _PART_BUF[key] = buf
-    return buf[:T]
+    return buf[:need]
 
 
 def _can_use_native(res: torch.Tensor, norm_weight: torch.Tensor | None) -> bool:

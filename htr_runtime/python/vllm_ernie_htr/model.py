@@ -239,7 +239,7 @@ class Ernie5_5MLP(nn.Module):
             and gate_up.dtype == torch.bfloat16
             and gate_up.dim() == 2
             and gate_up.stride(1) == 1
-            and (gate_up.shape[1] // 2) <= 12288
+            and (gate_up.shape[1] // 2) <= 14336
             and ((gate_up.shape[1] // 2) % 128 == 0)
             and os.environ.get("ERNIE_FUSED_PROLOGUE", "1") == "1"
         ):

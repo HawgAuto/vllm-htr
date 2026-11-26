@@ -1127,7 +1127,7 @@ std::vector<torch::Tensor> situ_and_mul_htr_prologue(
   TORCH_CHECK(gate_up.is_cuda() && gate_up.dim() == 2 && gate_up.scalar_type() == torch::kBFloat16 && gate_up.stride(1) == 1);
   const int T = (int)gate_up.size(0);
   const int D = (int)(gate_up.size(1) / 2);
-  TORCH_CHECK((gate_up.size(1) == 2 * D) && (D % 128 == 0) && D <= 12288);
+  TORCH_CHECK((gate_up.size(1) == 2 * D) && (D % 128 == 0) && D <= 14336);
   auto xt = torch::empty({T, D}, gate_up.options().dtype(torch::kHalf));
   auto xs = torch::empty({T}, gate_up.options().dtype(torch::kFloat32));
   auto tok = torch::empty({T}, gate_up.options().dtype(torch::kFloat32));
@@ -1148,8 +1148,10 @@ std::vector<torch::Tensor> situ_and_mul_htr_prologue(
     hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<4>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
   } else if (nb <= 8) {
     hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<8>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
-  } else {
+  } else if (nb <= 12) {
     hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<12>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+  } else {
+    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<14>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
   }
   return {xt, xs, tok};
 }
