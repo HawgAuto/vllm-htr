@@ -773,11 +773,16 @@ struct u2_128 { uint4 a, b; };
 
 // Prologue: x [T, 8, 4096] bf16 -> xt [T, 8, 4096] fp16, tok [T, 8] fp32
 // Grid: (T, 8), Block: 256 (8 waves x 4 blocks of 128 = 4096 exact!)
+__device__ __forceinline__ void woa_lds_barrier() {
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
 __global__ __launch_bounds__(256) void k_wo_a_prologue(
     const uint16_t* __restrict__ x,
     const uint8_t* __restrict__ su,
     _Float16* __restrict__ xt,
-    float* __restrict__ tok) {
+    float* __restrict__ tok,
+    int T) {
   __shared__ float s_wmax[8];
   const int r = blockIdx.x;
   const int grp = blockIdx.y;
@@ -818,13 +823,16 @@ __global__ __launch_bounds__(256) void k_wo_a_prologue(
   const float inv = __builtin_amdgcn_rcpf(tscale);
   if (threadIdx.x == 0) tok[(size_t)r * 8 + grp] = tscale;
 
-  _Float16* dst = xt + ((size_t)r * 8 + grp) * 4096;
+  // Store xt in [G=8, K/64=64, T, 64]: each half-wave (16 lanes x 8B) writes 1 full 128B cache line!
+  const int sub_blk = lane >> 4;
+  const int col64 = (lane & 15) * 4;
+  _Float16* dst_g = xt + (size_t)grp * 64 * (size_t)T * 64 + (size_t)r * 64 + col64;
 #pragma unroll
   for (int bl = 0; bl < 4; ++bl) {
-    const int base = (w * 4 + bl) * 128 + lane * 4;
+    const int jblk = (w * 4 + bl) * 2 + sub_blk;
     h4v h4 = {(_Float16)(vals[bl][0] * inv), (_Float16)(vals[bl][1] * inv),
               (_Float16)(vals[bl][2] * inv), (_Float16)(vals[bl][3] * inv)};
-    *reinterpret_cast<h4v*>(dst + base) = h4;
+    *reinterpret_cast<h4v*>(dst_g + (size_t)jblk * (size_t)T * 64) = h4;
   }
 }
 
@@ -941,7 +949,7 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma(
         const int row_l = idx >> 3;
         const int rr = m0 + row_l;
         if (rr < T) {
-          x_tmp[s] = *reinterpret_cast<const uint4*>(xt + ((size_t)rr * G + grp) * N_IN + (j + t_ld) * 16 + half_k * 8);
+          x_tmp[s] = *reinterpret_cast<const uint4*>(xt + (((size_t)grp * 64 + (size_t)(j >> 2)) * (size_t)T + (size_t)rr) * 64 + t_ld * 16 + half_k * 8);
         }
       }
     }
@@ -1076,6 +1084,255 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma(
   }
 }
 
+
+// ============================================================================
+// Wave 9C: 4x4 Outer-Product WMMA + PAD=12 + Single-Reg v_alignbit + lds_barrier()
+//   + [G=8, K/64=64, T, 64] xt layout (128B sequential token stride -> 32 KiB/jblk
+//     fits 100% in GL0/GL2 across all 8 sb WGs, killing 64 KiB channel collision!)
+// Grid: dim3(8 /*sb*/, (T + 255) / 256, 8 /*grp*/), Block: 256 (8 waves)
+// ============================================================================
+template <int HAS_GATE, int SP16>
+__global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma_4x4(
+    const uint32_t* __restrict__ qw,       // [8, 64, 256, 40] (or per-group sp16)
+    const _Float16* __restrict__ xt,       // [8, 64, T, 64]
+    const float* __restrict__ tok,         // [T, 8]
+    const __half* __restrict__ scales,     // [8, 1024]
+    const uint8_t* __restrict__ sv,        // [8, 128]
+    const uint16_t* __restrict__ gate,     // [T, 8192] or nullptr
+    uint16_t* __restrict__ out,            // [T, 8192]
+    int T, float cb, int spad) {
+  constexpr int G = 8;
+  constexpr int M_OUT = 1024;
+  constexpr int K_DIM = 4096;
+  constexpr int MT = M_OUT / 16;           // 64
+  constexpr int NT = K_DIM / 16;           // 256
+  constexpr int STR = 12;                  // 48 B row stride -> conflict-free ds_load_b128!
+
+  union SharedMem {
+    struct {
+      uint32_t w_lds[2][128][STR];         // 12,288 B
+      uint32_t x_lds[2][256][STR];         // 24,576 B
+    } stage;                               // 36,864 B total (double-buffered)
+    float o_lds[32][128];                  // 16,384 B (reused in epilogue)
+  };
+  __shared__ __attribute__((aligned(16))) SharedMem smem;
+
+  const int tid = threadIdx.x;             // 0..255
+  const int w = tid >> 5;                  // 0..7
+  const int wn = w & 1;                    // 0..1 (4 N-tiles = 64 cols)
+  const int wm = w >> 1;                   // 0..3 (4 M-tiles = 64 rows)
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hb = lane >> 4;
+
+  const int q = lane & 7;
+  const int g = lane >> 3;                 // 0..3
+  const uint32_t sh_e = (uint32_t)((g * 12 + 11) & 31);
+  const uint32_t sh_o = (uint32_t)((g * 12 + 27) & 31);
+
+  const int sb = blockIdx.x;               // 0..7 (128-row output block)
+  const int m0 = blockIdx.y * 256;         // token block start
+  const int grp = blockIdx.z;              // 0..7 group
+  const int i_dec = sb * 8 + w;
+
+  const size_t pitch = (size_t)NT * 40 + (size_t)spad;
+  const size_t grp_words = (size_t)MT * pitch;
+  const uint32_t* qm = qw + (size_t)grp * grp_words + (size_t)i_dec * pitch;
+  const uint32_t* p16_grp = qw + (size_t)grp * ((size_t)MT * NT * 40);
+  const uint32_t* p4_grp  = p16_grp + (size_t)MT * NT * 32;
+
+  f8v acc[4][4];
+#pragma unroll
+  for (int ni = 0; ni < 4; ++ni)
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi)
+      acc[ni][mi] = f8v{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+  // Precompute branchless clamped token offsets into [8, 64, T, 64] (128B token stride!)
+  const int rr_0 = m0 + (tid >> 1);
+  const int rr_1 = m0 + ((256 + tid) >> 1);
+  const int c_rr0 = (rr_0 < T) ? rr_0 : (T - 1);
+  const int c_rr1 = (rr_1 < T) ? rr_1 : (T - 1);
+  const int hk_0 = tid & 1;
+  const int hk_1 = (256 + tid) & 1;
+  const bool v_rr0 = (rr_0 < T);
+  const bool v_rr1 = (rr_1 < T);
+  const size_t jblk_stride = (size_t)T * 64;
+  const _Float16* xt_g0 = xt + (size_t)grp * 64 * jblk_stride;
+  const size_t x_off0 = (size_t)c_rr0 * 64 + hk_0 * 8;
+  const size_t x_off1 = (size_t)c_rr1 * 64 + hk_1 * 8;
+
+  auto load_w = [&](int j_idx, u4v& w4, uint32_t& wl) {
+    if constexpr (SP16) {
+      const size_t tid0 = (size_t)i_dec * NT + j_idx;
+      w4 = *reinterpret_cast<const u4v*>(p16_grp + tid0 * 32 + q * 4);
+      wl = p4_grp[tid0 * 8 + q];
+    } else {
+      const uint32_t* tp0 = qm + (size_t)j_idx * 40 + q * 5;
+      w4 = *reinterpret_cast<const u4va*>(tp0);
+      wl = tp0[4];
+    }
+  };
+  auto load_x = [&](int j_idx, uint4 x_reg[2]) {
+    const _Float16* jb_ptr = xt_g0 + (size_t)(j_idx >> 2) * jblk_stride + (j_idx & 3) * 16;
+    uint4 r0 = *reinterpret_cast<const uint4*>(jb_ptr + x_off0);
+    uint4 r1 = *reinterpret_cast<const uint4*>(jb_ptr + x_off1);
+    x_reg[0] = v_rr0 ? r0 : make_uint4(0u, 0u, 0u, 0u);
+    x_reg[1] = v_rr1 ? r1 : make_uint4(0u, 0u, 0u, 0u);
+  };
+  auto decode_store = [&](int buf, const u4v& w4, uint32_t wl, const uint4 x_reg[2]) {
+    *reinterpret_cast<uint4*>(&smem.stage.x_lds[buf][tid >> 1][hk_0 * 4]) = x_reg[0];
+    *reinterpret_cast<uint4*>(&smem.stage.x_lds[buf][(256 + tid) >> 1][hk_1 * 4]) = x_reg[1];
+    const uint32_t v0 = __builtin_amdgcn_permlane16(wl, wl, 0x65432107u, 0xedcba98fu, false, false);
+    const uint32_t v1 = w4.x, v2 = w4.y, v3 = w4.z, v4 = w4.w, v5 = wl;
+    const uint32_t ea = (g == 0) ? v0 : ((g == 3) ? v2 : v1);
+    const uint32_t eb = (g == 0) ? v1 : ((g == 3) ? v3 : v2);
+    const uint32_t oa = (g < 2)  ? v3 : ((g == 2) ? v4 : v5);
+    const uint32_t ob = (g < 2)  ? v4 : ((g == 2) ? v5 : 0u);
+    const uint32_t ehi = __builtin_amdgcn_alignbit(ea, eb, sh_e);
+    const uint32_t ohi = __builtin_amdgcn_alignbit(oa, ob, sh_o);
+    const h2v bias2 = h2v{(_Float16)1534.0f, (_Float16)1534.0f};
+    h2v e0 = as_h2(val_f16bits2((ehi >> 16) & 0xFFFFu, (ehi >> 11) & 0xFFFFu)) - bias2;
+    h2v e1 = as_h2(val_f16bits2((ehi >>  6) & 0xFFFFu, (ehi >>  1) & 0xFFFFu)) - bias2;
+    h2v o0 = as_h2(val_f16bits2((ohi >> 16) & 0xFFFFu, (ohi >> 11) & 0xFFFFu)) - bias2;
+    h2v o1 = as_h2(val_f16bits2((ohi >>  6) & 0xFFFFu, (ohi >>  1) & 0xFFFFu)) - bias2;
+    const int r_even = w * 16 + 2 * q;
+    const int col2 = g * 2;
+    smem.stage.w_lds[buf][r_even][col2 + 0]     = __builtin_bit_cast(uint32_t, e0);
+    smem.stage.w_lds[buf][r_even][col2 + 1]     = __builtin_bit_cast(uint32_t, e1);
+    smem.stage.w_lds[buf][r_even + 1][col2 + 0] = __builtin_bit_cast(uint32_t, o0);
+    smem.stage.w_lds[buf][r_even + 1][col2 + 1] = __builtin_bit_cast(uint32_t, o1);
+  };
+
+  u4v w4_cur; uint32_t wl_cur;
+  uint4 x_cur[2];
+  load_w(0, w4_cur, wl_cur);
+  load_x(0, x_cur);
+  decode_store(0, w4_cur, wl_cur, x_cur);
+  woa_lds_barrier();
+
+  const int n_base = wn * 64 + l16;
+  const int m_base = wm * 64 + l16;
+
+  auto run_wmma = [&](int buf) {
+    h16v a[4];
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+      const uint4* ap = reinterpret_cast<const uint4*>(&smem.stage.w_lds[buf][n_base + ni * 16][0]);
+      a[ni] = __builtin_bit_cast(h16v, u2_128{ap[0], ap[1]});
+    }
+    h16v b_tile[4];
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi) {
+      const uint4* bp = reinterpret_cast<const uint4*>(&smem.stage.x_lds[buf][m_base + mi * 16][0]);
+      b_tile[mi] = __builtin_bit_cast(h16v, u2_128{bp[0], bp[1]});
+    }
+#pragma unroll
+    for (int mi = 0; mi < 4; ++mi) {
+#pragma unroll
+      for (int ni = 0; ni < 4; ++ni) {
+        acc[ni][mi] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[ni], b_tile[mi], acc[ni][mi]);
+      }
+    }
+  };
+
+#pragma unroll 1
+  for (int j = 0; j < NT - 1; ++j) {
+    const int buf = j & 1;
+    u4v w4_nxt; uint32_t wl_nxt;
+    uint4 x_nxt[2];
+    load_w(j + 1, w4_nxt, wl_nxt);
+    load_x(j + 1, x_nxt);
+    run_wmma(buf);
+    decode_store(buf ^ 1, w4_nxt, wl_nxt, x_nxt);
+    woa_lds_barrier();
+  }
+  run_wmma((NT - 1) & 1);
+
+  // Epilogue: 32 rows at a time in o_lds[32][128], bit-exact FWHT-128 + fused sigmoid(gate)
+  const __half* scl = scales + (size_t)grp * M_OUT;
+  const uint8_t* svp = sv + (size_t)grp * (M_OUT / 8);
+  const int base_col = sb * 128 + lane * 4;
+  float sc[4];
+#pragma unroll
+  for (int e2 = 0; e2 < 4; ++e2) sc[e2] = __half2float(scl[base_col + e2]) * cb;
+  const unsigned sg4 = (unsigned)svp[sb * 16 + (lane >> 1)] >> ((lane & 1) * 4);
+  const int c_base = wn * 64;
+
+#pragma unroll 1
+  for (int wm_pair = 0; wm_pair < 2; ++wm_pair) {
+    const int wm_lo = wm_pair * 2;
+#pragma unroll 1
+    for (int mi = 0; mi < 4; ++mi) {
+      woa_lds_barrier();
+      if (wm == wm_lo || wm == wm_lo + 1) {
+        const int o_row = (wm - wm_lo) * 16 + l16;
+#pragma unroll
+        for (int ni = 0; ni < 4; ++ni) {
+          const int col_n = c_base + ni * 16;
+          const f8v cur = (mi == 0) ? acc[ni][0]
+                        : (mi == 1) ? acc[ni][1]
+                        : (mi == 2) ? acc[ni][2]
+                                    : acc[ni][3];
+#pragma unroll
+          for (int v = 0; v < 8; ++v) {
+            smem.o_lds[o_row][col_n + 2 * v + hb] = cur[v];
+          }
+        }
+      }
+      woa_lds_barrier();
+
+#pragma unroll
+      for (int sub = 0; sub < 4; ++sub) {
+        const int rt = w + sub * 8;
+        const int r = m0 + (wm_lo + (rt >= 16 ? 1 : 0)) * 64 + mi * 16 + (rt & 15);
+        if (r < T) {
+          const float tt = tok[(size_t)r * G + grp];
+          float v[4];
+#pragma unroll
+          for (int e2 = 0; e2 < 4; ++e2) v[e2] = smem.o_lds[rt][lane * 4 + e2] * sc[e2] * tt;
+          fwht128_wave(v, lane);
+          float o[4] = {
+            v[0] * (1.0f / 11.313708498984761f),
+            v[1] * (1.0f / 11.313708498984761f),
+            v[2] * (1.0f / 11.313708498984761f),
+            v[3] * (1.0f / 11.313708498984761f)
+          };
+          if (sg4 & 1) o[0] = -o[0];
+          if (sg4 & 2) o[1] = -o[1];
+          if (sg4 & 4) o[2] = -o[2];
+          if (sg4 & 8) o[3] = -o[3];
+          const size_t out_off = (size_t)r * (G * M_OUT) + (size_t)grp * M_OUT + base_col;
+          uint2 out_p;
+          if constexpr (HAS_GATE) {
+            const uint2 graw = *reinterpret_cast<const uint2*>(gate + out_off);
+            const float gfv[4] = {
+              __uint_as_float((graw.x & 0xFFFFu) << 16),
+              __uint_as_float(graw.x & 0xFFFF0000u),
+              __uint_as_float((graw.y & 0xFFFFu) << 16),
+              __uint_as_float(graw.y & 0xFFFF0000u),
+            };
+            float prod[4];
+#pragma unroll
+            for (int e2 = 0; e2 < 4; ++e2) {
+              const float sig = __builtin_amdgcn_rcpf(1.0f + exp2f(-1.4426950408889634f * gfv[e2]));
+              const float zb = bf2f(f2bf(o[e2]));
+              const float gb = bf2f(f2bf(sig));
+              prod[e2] = zb * gb;
+            }
+            out_p.x = f32_to_bf16x2_rne(prod[0], prod[1]);
+            out_p.y = f32_to_bf16x2_rne(prod[2], prod[3]);
+          } else {
+            out_p.x = f32_to_bf16x2_rne(o[0], o[1]);
+            out_p.y = f32_to_bf16x2_rne(o[2], o[3]);
+          }
+          *reinterpret_cast<uint2*>(out + out_off) = out_p;
+        }
+      }
+    }
+  }
+}
+
 template <int NB, int SP16>
 static void dispatch_prefill_nb(
     dim3 grid, hipStream_t stream,
@@ -1105,11 +1362,16 @@ void launch_wo_a_k5_prefill_wmma(
   float* tok_p = tok_buf.data_ptr<float>();
   uint16_t* out_p = reinterpret_cast<uint16_t*>(out.data_ptr());
 
-  hipLaunchKernelGGL(k_wo_a_prologue, dim3(T, 8), dim3(256), 0, stream, x_p, su_p, xt_p, tok_p);
+  hipLaunchKernelGGL(k_wo_a_prologue, dim3(T, 8), dim3(256), 0, stream, x_p, su_p, xt_p, tok_p, T);
   if (T >= 256) {
-    dim3 grid(8, (T + 127) / 128, 8);
-    if (sp16) dispatch_prefill_nb<8, 1>(grid, stream, qw_p, xt_p, tok_p, scl_p, sv_p, g_p, out_p, T, (float)cb, 0);
-    else      dispatch_prefill_nb<8, 0>(grid, stream, qw_p, xt_p, tok_p, scl_p, sv_p, g_p, out_p, T, (float)cb, (int)spad);
+    dim3 grid(8, (T + 255) / 256, 8);
+    if (sp16) {
+      if (g_p) hipLaunchKernelGGL((k_wo_a_k5_prefill_wmma_4x4<1, 1>), grid, dim3(256), 0, stream, qw_p, xt_p, tok_p, scl_p, sv_p, g_p, out_p, T, (float)cb, 0);
+      else     hipLaunchKernelGGL((k_wo_a_k5_prefill_wmma_4x4<0, 1>), grid, dim3(256), 0, stream, qw_p, xt_p, tok_p, scl_p, sv_p, nullptr, out_p, T, (float)cb, 0);
+    } else {
+      if (g_p) hipLaunchKernelGGL((k_wo_a_k5_prefill_wmma_4x4<1, 0>), grid, dim3(256), 0, stream, qw_p, xt_p, tok_p, scl_p, sv_p, g_p, out_p, T, (float)cb, (int)spad);
+      else     hipLaunchKernelGGL((k_wo_a_k5_prefill_wmma_4x4<0, 0>), grid, dim3(256), 0, stream, qw_p, xt_p, tok_p, scl_p, sv_p, nullptr, out_p, T, (float)cb, (int)spad);
+    }
   } else if (T <= 32) {
     dim3 grid(8, (T + 31) / 32, 8);
     if (sp16) dispatch_prefill_nb<2, 1>(grid, stream, qw_p, xt_p, tok_p, scl_p, sv_p, g_p, out_p, T, (float)cb, 0);
