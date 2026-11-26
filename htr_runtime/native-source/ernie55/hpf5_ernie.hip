@@ -731,7 +731,7 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
       __syncthreads();
       if (m_act[m] && s_tok[rl] < a.num_valid) {
         const float pv[4] = {p4.x, p4.y, p4.z, p4.w};
-        uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[1][0]); // 10,240 B holds all 32x128 BF16 (8,192 B)!
+        uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[0][0]) + 2048; // byte +4096..20480 = 16,384 B (holds 64x128 BF16!)
         uint16_t* dst_lds = eb + (wm * 16 + 2 * ei + hrow) * 128 + n_base + l16;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
@@ -744,7 +744,7 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
     __syncthreads();
     // ONE single coalesced u32x4 (16B x 16 threads = 256B = 4 full 64B lines) pass for all 32 rows!
     {
-      uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[1][0]);
+      uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[0][0]) + 2048;
       const int sr_base = tid >> 4;
       const int sc_off  = (tid & 15) * 8;
 #pragma unroll
@@ -771,8 +771,8 @@ static void dispatch_gemm(int bmw, int nt_load, int max_g, hipStream_t st, Ernie
     if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 2, 1, 1>), dim3(N / BN, max_g), dim3(128), 0, st, a);
     else         hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 2, 1, 0>), dim3(N / BN, max_g), dim3(128), 0, st, a);
   } else if (bmw == 64) {
-    if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 4, 1>), dim3(N / BN, max_g), dim3(128), 0, st, a);
-    else         hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 4, 0>), dim3(N / BN, max_g), dim3(128), 0, st, a);
+    if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 4, 1, 1>), dim3(N / BN, max_g), dim3(256), 0, st, a);
+    else         hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 4, 1, 0>), dim3(N / BN, max_g), dim3(256), 0, st, a);
   } else {
     if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 8, 1>), dim3(N / BN, max_g), dim3(256), 0, st, a);
     else         hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 8, 0>), dim3(N / BN, max_g), dim3(256), 0, st, a);
