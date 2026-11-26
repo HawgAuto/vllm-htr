@@ -299,7 +299,8 @@ void k_dense_prefill_wmma_k5sp(
         uint2 out_p;
         out_p.x = f32_to_bf16x2_rne(ob[0], ob[1]);
         out_p.y = f32_to_bf16x2_rne(ob[2], ob[3]);
-        *reinterpret_cast<uint2*>(y + (size_t)r * m_out + base_col) = out_p;
+        const uint64_t out64 = (uint64_t)out_p.x | ((uint64_t)out_p.y << 32);
+          __builtin_nontemporal_store(out64, reinterpret_cast<uint64_t*>(y + (size_t)r * m_out + base_col));
       }
     }
   }
@@ -360,12 +361,12 @@ void k_dense_prefill_wmma_k5sp_v28_128x128(
     if (j_base + t_dec < nt) {
       const size_t tid0 = (size_t)i_dec * nt + (j_base + t_dec);
       if constexpr (SP16) {
-        w4 = __builtin_nontemporal_load(reinterpret_cast<const u4v*>(p16 + tid0 * 32 + q * 4));
-        wl = __builtin_nontemporal_load(p4 + tid0 * 8 + q);
+        w4 = *reinterpret_cast<const u4v*>(p16 + tid0 * 32 + q * 4);
+        wl = p4[tid0 * 8 + q];
       } else {
         const uint32_t* tp0 = p16 + tid0 * 40 + q * 5;
-        w4 = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tp0));
-        wl = __builtin_nontemporal_load(tp0 + 4);
+        w4 = *reinterpret_cast<const u4va*>(tp0);
+        wl = tp0[4];
       }
     }
   };
@@ -515,7 +516,8 @@ void k_dense_prefill_wmma_k5sp_v28_128x128(
         uint2 out_p;
         out_p.x = f32_to_bf16x2_rne(ob[0], ob[1]);
         out_p.y = f32_to_bf16x2_rne(ob[2], ob[3]);
-        *reinterpret_cast<uint2*>(y + (size_t)r * m_out + base_col) = out_p;
+        const uint64_t out64 = (uint64_t)out_p.x | ((uint64_t)out_p.y << 32);
+          __builtin_nontemporal_store(out64, reinterpret_cast<uint64_t*>(y + (size_t)r * m_out + base_col));
       }
     }
   }
@@ -584,12 +586,12 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
   auto load_w = [&](int j_idx, u4v& w4, uint32_t& wl) {
     const size_t tid0 = (size_t)i_dec * nt + j_idx;
     if constexpr (SP16) {
-      w4 = __builtin_nontemporal_load(reinterpret_cast<const u4v*>(p16 + tid0 * 32 + q * 4));
-      wl = __builtin_nontemporal_load(p4 + tid0 * 8 + q);
+      w4 = *reinterpret_cast<const u4v*>(p16 + tid0 * 32 + q * 4);
+      wl = p4[tid0 * 8 + q];
     } else {
       const uint32_t* tp0 = p16 + tid0 * 40 + q * 5;
-      w4 = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tp0));
-      wl = __builtin_nontemporal_load(tp0 + 4);
+      w4 = *reinterpret_cast<const u4va*>(tp0);
+      wl = tp0[4];
     }
   };
   auto load_x = [&](int j_idx, uint4 x_reg[2]) {
@@ -742,7 +744,8 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
           uint2 out_p;
           out_p.x = f32_to_bf16x2_rne(ob[0], ob[1]);
           out_p.y = f32_to_bf16x2_rne(ob[2], ob[3]);
-          *reinterpret_cast<uint2*>(y + (size_t)r * m_out + base_col) = out_p;
+          const uint64_t out64 = (uint64_t)out_p.x | ((uint64_t)out_p.y << 32);
+          __builtin_nontemporal_store(out64, reinterpret_cast<uint64_t*>(y + (size_t)r * m_out + base_col));
         }
       }
     }
@@ -786,7 +789,7 @@ torch::Tensor dense_prefill_wmma_sp16(
   const uint16_t* bp = (bias.has_value() && bias->defined())
       ? reinterpret_cast<const uint16_t*>(bias->data_ptr<at::BFloat16>()) : nullptr;
   auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
-  if (bm <= 0) bm = (M >= 256) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
+  if (bm <= 0) bm = (M >= 256 && mt > 64) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
   if (bm == 256) {
     hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<1>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
                        p16p, p4p, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
@@ -826,7 +829,7 @@ torch::Tensor dense_prefill_wmma_unsplit(
   const uint16_t* bp = (bias.has_value() && bias->defined())
       ? reinterpret_cast<const uint16_t*>(bias->data_ptr<at::BFloat16>()) : nullptr;
   auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
-  if (bm <= 0) bm = (M >= 256) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
+  if (bm <= 0) bm = (M >= 256 && mt > 64) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
   if (bm == 256) {
     hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
                        qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
