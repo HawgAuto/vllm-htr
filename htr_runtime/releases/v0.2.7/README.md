@@ -1,6 +1,6 @@
 # vLLM HTR — v0.2.7 Release Notes
 
-- **Image (staged locally, not yet pushed):** `ghcr.io/hawgauto/vllm-htr:v0.2.7` (`vllm-htr:v0.2.7`)
+- **Image (published on GHCR):** `ghcr.io/hawgauto/vllm-htr:v0.2.7` (`vllm-htr:v0.2.7`)
 - **Base:** `ghcr.io/hawgauto/vllm-htr:v0.2.6`
 - **Zero-overlay verification:** Build-time `verify_ernie55_cpu.py` (`8` ERNIE `.so`, `463` Wave32 kernels, `0` spills, `0` divOps, Qwen isolation `_serving_ernie5=False`) + `htr_native_policy.verify_installation()` (`17` upgraded Python files + `12` upgraded Qwen3.8 native binaries) + all 4 live zero-overlay hardware gates on AMD Strix Halo (`gfx1151`).
 
@@ -63,7 +63,7 @@ v0.2.7 is a unified release for AMD Strix Halo (`gfx1151`) combining **major Qwe
 | **`/v1/chat/completions` code (128 tok, greedy)** | **`39.16 tok/s`** (`3.27 s`) |
 | **`/v1/chat/completions` prose (128 tok, greedy)** | **`31.04 tok/s`** (`4.12 s`) |
 
-> **Host tuning note (128 GB Strix Halo):** On Ubuntu kernels with default CMA (~6 GiB reserved as `free_cma`, unusable by `amdgpu` TTM) and systemd `user-1000.slice` `MemoryMin=3G`, usable pinned GTT caps near ~110 GiB; `htr_runtime/serve_ernie55.sh` uses `--kv-cache-memory 1395864371` (1.30 GiB) by default so ERNIE-5.5 DSpark-5 boots out of the box. Adding `cma=64M` to `GRUB_CMDLINE_LINUX_DEFAULT` unlocks ~6 GiB of additional GPU-usable RAM for larger KV pools.
+> **Host tuning note (128 GB Strix Halo):** On Ubuntu kernels with default CMA (~6 GiB reserved as `free_cma`, unusable by `amdgpu` TTM) and systemd `user-1000.slice` `MemoryMin=3G`, usable pinned GTT caps near ~110 GiB; `htr_runtime/serve_ernie55.sh` uses `--kv-cache-memory 1395864371` (1.30 GiB) by default so ERNIE-5.5 DSpark-5 boots out of the box. On Ubuntu HWE kernel 7.0+ (`CONFIG_KEXEC_HANDOVER_ENABLE_DEFAULT=y`), adding `kho=off` to `GRUB_CMDLINE_LINUX_DEFAULT` (and lowering `user.slice` `MemoryMin` to `512M`) unlocks ~9–11 GiB of GPU-usable RAM up to ~118 GiB active GTT, enabling full 1M pure FP8 and 2M+ NVFP4 KV pools.
 
 ### ERNIE-5.5-Flash-Preview Quantized KV & Long Context (128 GB Strix Halo)
 - **Native Wave32 HIP quantized KV kernels** (`472` total kernels, `0` spills, `0` divOps):
