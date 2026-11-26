@@ -854,6 +854,9 @@ class Ernie5_5ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
         super().__init__()
         config = vllm_config.model_config.hf_config
         self.config = config
+        self._model_path = getattr(vllm_config.model_config, "model", None) or getattr(
+            config, "_name_or_path", ""
+        )
         self.model = Ernie5_5Model(
             vllm_config=vllm_config, prefix=maybe_prefix(prefix, "model")
         )
@@ -925,6 +928,9 @@ class Ernie5_5ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
 
         loader = AutoWeightsLoader(self)
         loaded = loader.load_weights(_filtered_weights(), mapper=self.hf_to_vllm_mapper)
+        from .flashindexer import is_flashindexer_enabled, load_flashindexer_weights
+        if is_flashindexer_enabled(self.config):
+            loaded_bufs |= load_flashindexer_weights(self, self._model_path)
         return loaded | loaded_bufs
 
     def process_weights_after_loading(self) -> None:
