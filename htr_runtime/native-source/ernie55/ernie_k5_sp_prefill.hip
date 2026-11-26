@@ -7,6 +7,10 @@
 #include <torch/extension.h>
 #include <c10/hip/HIPStream.h>
 #include <hip/hip_runtime.h>
+__device__ __forceinline__ void lds_barrier() {
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
 #include <hip/hip_fp16.h>
 #include <hip/hip_bf16.h>
 #include <stdint.h>
@@ -594,17 +598,20 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
       wl = tp0[4];
     }
   };
+  const int rr_0 = m0 + (tid >> 1);
+  const int rr_1 = m0 + ((256 + tid) >> 1);
+  const int c_rr0 = (rr_0 < M) ? rr_0 : (M - 1);
+  const int c_rr1 = (rr_1 < M) ? rr_1 : (M - 1);
+  const int hk_0 = tid & 1;
+  const int hk_1 = (256 + tid) & 1;
+  const bool v_rr0 = (rr_0 < M);
+  const bool v_rr1 = (rr_1 < M);
   auto load_x = [&](int j_idx, uint4 x_reg[2]) {
-#pragma unroll
-    for (int s = 0; s < 2; ++s) {
-      const int idx = s * 256 + tid;
-      const int hk = idx & 1;
-      const int rl = idx >> 1;
-      const int rr = m0 + rl;
-      x_reg[s] = (rr < M)
-          ? *reinterpret_cast<const uint4*>(xt + (size_t)rr * n + j_idx * 16 + hk * 8)
-          : make_uint4(0u, 0u, 0u, 0u);
-    }
+    // Branchless clamped load -> ZERO s_cbranch_execz -> lets LLVM coalesce global_load_b128 into s_clause!
+    uint4 r0 = *reinterpret_cast<const uint4*>(xt + (size_t)c_rr0 * n + j_idx * 16 + hk_0 * 8);
+    uint4 r1 = *reinterpret_cast<const uint4*>(xt + (size_t)c_rr1 * n + j_idx * 16 + hk_1 * 8);
+    x_reg[0] = v_rr0 ? r0 : make_uint4(0u, 0u, 0u, 0u);
+    x_reg[1] = v_rr1 ? r1 : make_uint4(0u, 0u, 0u, 0u);
   };
   auto decode_store = [&](int buf, const u4v& w4, uint32_t wl, const uint4 x_reg[2]) {
 #pragma unroll
@@ -642,21 +649,12 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
   load_w(0, w4_cur, wl_cur);
   load_x(0, x_cur);
   decode_store(0, w4_cur, wl_cur, x_cur);
-  __syncthreads();
+  lds_barrier();
 
   const int n_base = wn * 64 + l16;
   const int m_base = wm * 64 + l16;
 
-#pragma unroll 1
-  for (int j = 0; j < nt; ++j) {
-    const int buf = j & 1;
-    u4v w4_nxt; uint32_t wl_nxt;
-    uint4 x_nxt[2];
-    if (j + 1 < nt) {
-      load_w(j + 1, w4_nxt, wl_nxt);
-      load_x(j + 1, x_nxt);
-    }
-
+  auto run_wmma = [&](int buf) {
     h16v a[4];
 #pragma unroll
     for (int ni = 0; ni < 4; ++ni) {
@@ -676,12 +674,20 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
         acc[ni][mi] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[ni], b_tile[mi], acc[ni][mi]);
       }
     }
+  };
 
-    if (j + 1 < nt) {
-      decode_store(buf ^ 1, w4_nxt, wl_nxt, x_nxt);
-    }
-    __syncthreads();
+#pragma unroll 1
+  for (int j = 0; j < nt - 1; ++j) {
+    const int buf = j & 1;
+    u4v w4_nxt; uint32_t wl_nxt;
+    uint4 x_nxt[2];
+    load_w(j + 1, w4_nxt, wl_nxt);
+    load_x(j + 1, x_nxt);
+    run_wmma(buf);
+    decode_store(buf ^ 1, w4_nxt, wl_nxt, x_nxt);
+    lds_barrier();
   }
+  run_wmma((nt - 1) & 1);
 
   // Epilogue: 32 rows at a time in o_lds[32][128] (8 waves process 4 rows each, only 8 barrier pairs for 256 rows!)
   const int base_col = b * 128 + lane * 4;
@@ -704,7 +710,7 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
     const int wm_lo = wm_pair * 2;
 #pragma unroll 1
     for (int mi = 0; mi < 4; ++mi) {
-      __syncthreads();
+      lds_barrier();
       if (wm == wm_lo || wm == wm_lo + 1) {
         const int o_row = (wm - wm_lo) * 16 + l16;
 #pragma unroll
@@ -721,7 +727,7 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
           }
         }
       }
-      __syncthreads();
+      lds_barrier();
 
 #pragma unroll
       for (int sub = 0; sub < 4; ++sub) {
