@@ -346,7 +346,7 @@ void k_dense_prefill_wmma_k5sp_v28_128x128(
   const int hb = lane >> 4;
 
   const int b = blockIdx.x;
-  const int m0 = blockIdx.y * 128;
+  const int m0 = (gridDim.y - 1 - blockIdx.y) * 128; // Reverse M-walk: hits hot tail of forward prologue in 32 MiB MALL!
   const int i_dec = b * 8 + w;               // wave w decodes N-strip w into w_lds[w][0..1]
   const int n = nt * 16;
   const int m_out = mt * 16;
@@ -575,7 +575,7 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
   const uint32_t sh_o = (uint32_t)((g * 12 + 27) & 31);
 
   const int b = blockIdx.x;
-  const int m0 = blockIdx.y * 256;
+  const int m0 = (gridDim.y - 1 - blockIdx.y) * 256; // Reverse M-walk: hits hot tail of forward prologue in 32 MiB MALL!
   const int i_dec = b * 8 + w;
   const int n = nt * 16;
   const int m_out = mt * 16;
