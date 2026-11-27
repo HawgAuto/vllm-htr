@@ -329,12 +329,176 @@ __global__ __launch_bounds__(256) void k_mhc_post_dot_4096_tiled(
 }
 
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// Wave 59A: 16B u4v g16 tiled mhc_post + dot kernel for Prefill (T >= 17)
+//   - 8 BF16/thread (16B global_load_b128 / global_store_b128) -> C=256, grid.x=16 (2x fewer WGs, 2x smaller part!)
+//   - BT=8 -> LDS=16,416 B, V<=88 -> 7 WGs/WGP = 56 waves/WGP, ZERO spills!
+//   - Keeps res_out (16 MiB/chunk=512) warm in 32 MiB MALL for Kernel 2 when NT_OUT=0 (or NT_OUT=1 via env toggle)
+// ---------------------------------------------------------------------------
+template <int DO_POST, int BT, int NT_IN, int NT_OUT>
+__global__ __launch_bounds__(256) void k_mhc_post_dot_4096_u4v_g16(
+    const uint16_t* __restrict__ x,          // [T, 4096] bf16 (only used if DO_POST)
+    const uint16_t* __restrict__ res_in,     // [T, 4, 4096] bf16
+    const float* __restrict__ post_mix,      // [T, 4] fp32 (only used if DO_POST)
+    const float* __restrict__ comb_mix,      // [T, 4, 4] fp32 (only used if DO_POST)
+    const float* __restrict__ fn,            // [24, 16384] fp32
+    uint16_t* __restrict__ res_out,          // [T, 4, 4096] bf16 (only written if DO_POST)
+    float* __restrict__ part,                // [T, 16, 25] fp32
+    int T
+) {
+  constexpr int H = 4096;
+  constexpr int HC = 4;
+  constexpr int C = 256;
+  __shared__ __attribute__((aligned(16))) uint32_t s_rb[BT][HC][128];
+  __shared__ float s_ss[BT];
+
+  const int wg = blockIdx.x; // 0..15
+  const int t0 = blockIdx.y * BT;
+  const int tid = threadIdx.x;
+  const int lane = tid & 31;
+  const int w = tid >> 5;
+  const int h = wg * C + lane * 8;
+
+  auto ld128 = [](const uint16_t* p) -> u4v {
+    if constexpr (NT_IN) return __builtin_nontemporal_load(reinterpret_cast<const u4va*>(p));
+    else return *reinterpret_cast<const u4va*>(p);
+  };
+  auto st128 = [](uint16_t* p, u4v v) {
+    if constexpr (NT_OUT) __builtin_nontemporal_store(v, reinterpret_cast<u4va*>(p));
+    else *reinterpret_cast<u4va*>(p) = v;
+  };
+
+#pragma unroll
+  for (int bt = w; bt < BT; bt += 8) {
+    const int t = t0 + bt;
+    if (t < T) {
+      const uint16_t* r_base = res_in + (size_t)t * (HC * H) + h;
+      const u4v raw0 = ld128(r_base + 0 * H);
+      const u4v raw1 = ld128(r_base + 1 * H);
+      const u4v raw2 = ld128(r_base + 2 * H);
+      const u4v raw3 = ld128(r_base + 3 * H);
+      float ss0 = 0.f, ss1 = 0.f;
+      if constexpr (DO_POST) {
+        const u4v xraw = ld128(x + (size_t)t * H + h);
+        const f4v pmv = *reinterpret_cast<const f4v*>(post_mix + (size_t)t * 4);
+        const f4v cm0 = *reinterpret_cast<const f4v*>(comb_mix + (size_t)t * 16 + 0);
+        const f4v cm1 = *reinterpret_cast<const f4v*>(comb_mix + (size_t)t * 16 + 4);
+        const f4v cm2 = *reinterpret_cast<const f4v*>(comb_mix + (size_t)t * 16 + 8);
+        const f4v cm3 = *reinterpret_cast<const f4v*>(comb_mix + (size_t)t * 16 + 12);
+        const float pm_a[4] = {pmv.x, pmv.y, pmv.z, pmv.w};
+        const float cm_a[4][4] = {
+          {cm0.x, cm0.y, cm0.z, cm0.w}, {cm1.x, cm1.y, cm1.z, cm1.w},
+          {cm2.x, cm2.y, cm2.z, cm2.w}, {cm3.x, cm3.y, cm3.z, cm3.w},
+        };
+        const uint32_t rw0[4] = {raw0.x, raw0.y, raw0.z, raw0.w};
+        const uint32_t rw1[4] = {raw1.x, raw1.y, raw1.z, raw1.w};
+        const uint32_t rw2[4] = {raw2.x, raw2.y, raw2.z, raw2.w};
+        const uint32_t rw3[4] = {raw3.x, raw3.y, raw3.z, raw3.w};
+        const uint32_t xw[4]  = {xraw.x, xraw.y, xraw.z, xraw.w};
+        uint16_t* ro = res_out + (size_t)t * (HC * H) + h;
+#pragma unroll
+        for (int j = 0; j < 4; ++j) {
+          const float c0 = cm_a[0][j], c1 = cm_a[1][j], c2 = cm_a[2][j], c3 = cm_a[3][j], p = pm_a[j];
+          uint32_t ow[4];
+#pragma unroll
+          for (int k = 0; k < 4; ++k) {
+            const float v0 = c0 * __uint_as_float((rw0[k] & 0xFFFFu) << 16)
+                           + c1 * __uint_as_float((rw1[k] & 0xFFFFu) << 16)
+                           + c2 * __uint_as_float((rw2[k] & 0xFFFFu) << 16)
+                           + c3 * __uint_as_float((rw3[k] & 0xFFFFu) << 16)
+                           + p  * __uint_as_float((xw[k]  & 0xFFFFu) << 16);
+            const float v1 = c0 * __uint_as_float(rw0[k] & 0xFFFF0000u)
+                           + c1 * __uint_as_float(rw1[k] & 0xFFFF0000u)
+                           + c2 * __uint_as_float(rw2[k] & 0xFFFF0000u)
+                           + c3 * __uint_as_float(rw3[k] & 0xFFFF0000u)
+                           + p  * __uint_as_float(xw[k]  & 0xFFFF0000u);
+            ow[k] = f32_to_bf16x2_rne(v0, v1);
+            if (k & 1) ss1 = bf16_dot2(ow[k], ow[k], ss1);
+            else       ss0 = bf16_dot2(ow[k], ow[k], ss0);
+          }
+          const u4v ob = (u4v){ow[0], ow[1], ow[2], ow[3]};
+          st128(ro + j * H, ob);
+          *reinterpret_cast<u4va*>(&s_rb[bt][j][lane * 4]) = ob;
+        }
+      } else {
+        *reinterpret_cast<u4va*>(&s_rb[bt][0][lane * 4]) = raw0;
+        *reinterpret_cast<u4va*>(&s_rb[bt][1][lane * 4]) = raw1;
+        *reinterpret_cast<u4va*>(&s_rb[bt][2][lane * 4]) = raw2;
+        *reinterpret_cast<u4va*>(&s_rb[bt][3][lane * 4]) = raw3;
+        ss0 = bf16_dot2(raw0.x, raw0.x, ss0); ss1 = bf16_dot2(raw0.y, raw0.y, ss1);
+        ss0 = bf16_dot2(raw0.z, raw0.z, ss0); ss1 = bf16_dot2(raw0.w, raw0.w, ss1);
+        ss0 = bf16_dot2(raw1.x, raw1.x, ss0); ss1 = bf16_dot2(raw1.y, raw1.y, ss1);
+        ss0 = bf16_dot2(raw1.z, raw1.z, ss0); ss1 = bf16_dot2(raw1.w, raw1.w, ss1);
+        ss0 = bf16_dot2(raw2.x, raw2.x, ss0); ss1 = bf16_dot2(raw2.y, raw2.y, ss1);
+        ss0 = bf16_dot2(raw2.z, raw2.z, ss0); ss1 = bf16_dot2(raw2.w, raw2.w, ss1);
+        ss0 = bf16_dot2(raw3.x, raw3.x, ss0); ss1 = bf16_dot2(raw3.y, raw3.y, ss1);
+        ss0 = bf16_dot2(raw3.z, raw3.z, ss0); ss1 = bf16_dot2(raw3.w, raw3.w, ss1);
+      }
+      const float ss = wave_sum(ss0 + ss1);
+      if (lane == 0) s_ss[bt] = ss;
+    }
+  }
+  __syncthreads();
+
+  const int m0 = w * 3;
+  float acc0[BT], acc1[BT], acc2[BT];
+#pragma unroll
+  for (int bt = 0; bt < BT; ++bt) { acc0[bt] = 0.f; acc1[bt] = 0.f; acc2[bt] = 0.f; }
+
+#pragma unroll 1
+  for (int j = 0; j < 4; ++j) {
+    const size_t col_off = (size_t)j * H + h;
+    const f4v w0a = *reinterpret_cast<const f4v*>(fn + (size_t)(m0 + 0) * (HC * H) + col_off + 0);
+    const f4v w0b = *reinterpret_cast<const f4v*>(fn + (size_t)(m0 + 0) * (HC * H) + col_off + 4);
+    const f4v w1a = *reinterpret_cast<const f4v*>(fn + (size_t)(m0 + 1) * (HC * H) + col_off + 0);
+    const f4v w1b = *reinterpret_cast<const f4v*>(fn + (size_t)(m0 + 1) * (HC * H) + col_off + 4);
+    const f4v w2a = *reinterpret_cast<const f4v*>(fn + (size_t)(m0 + 2) * (HC * H) + col_off + 0);
+    const f4v w2b = *reinterpret_cast<const f4v*>(fn + (size_t)(m0 + 2) * (HC * H) + col_off + 4);
+#pragma unroll
+    for (int bt = 0; bt < BT; ++bt) {
+      const u4v rb = *reinterpret_cast<const u4va*>(&s_rb[bt][j][lane * 4]);
+      const float r0 = __uint_as_float((rb.x & 0xFFFFu) << 16);
+      const float r1 = __uint_as_float(rb.x & 0xFFFF0000u);
+      const float r2 = __uint_as_float((rb.y & 0xFFFFu) << 16);
+      const float r3 = __uint_as_float(rb.y & 0xFFFF0000u);
+      const float r4 = __uint_as_float((rb.z & 0xFFFFu) << 16);
+      const float r5 = __uint_as_float(rb.z & 0xFFFF0000u);
+      const float r6 = __uint_as_float((rb.w & 0xFFFFu) << 16);
+      const float r7 = __uint_as_float(rb.w & 0xFFFF0000u);
+      acc0[bt] = fmaf(w0a.x, r0, fmaf(w0a.y, r1, fmaf(w0a.z, r2, fmaf(w0a.w, r3, acc0[bt]))));
+      acc0[bt] = fmaf(w0b.x, r4, fmaf(w0b.y, r5, fmaf(w0b.z, r6, fmaf(w0b.w, r7, acc0[bt]))));
+      acc1[bt] = fmaf(w1a.x, r0, fmaf(w1a.y, r1, fmaf(w1a.z, r2, fmaf(w1a.w, r3, acc1[bt]))));
+      acc1[bt] = fmaf(w1b.x, r4, fmaf(w1b.y, r5, fmaf(w1b.z, r6, fmaf(w1b.w, r7, acc1[bt]))));
+      acc2[bt] = fmaf(w2a.x, r0, fmaf(w2a.y, r1, fmaf(w2a.z, r2, fmaf(w2a.w, r3, acc2[bt]))));
+      acc2[bt] = fmaf(w2b.x, r4, fmaf(w2b.y, r5, fmaf(w2b.z, r6, fmaf(w2b.w, r7, acc2[bt]))));
+      if ((bt & 3) == 3) __builtin_amdgcn_sched_barrier(0);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  }
+
+#pragma unroll
+  for (int bt = 0; bt < BT; ++bt) {
+    const int t = t0 + bt;
+    if (t >= T) break;
+    const float a0 = wave_sum(acc0[bt]);
+    const float a1 = wave_sum(acc1[bt]);
+    const float a2 = wave_sum(acc2[bt]);
+    if (lane == 0) {
+      float* pout = part + ((size_t)t * 16 + wg) * 25;
+      pout[m0 + 0] = a0;
+      pout[m0 + 1] = a1;
+      pout[m0 + 2] = a2;
+      if (w == 0) pout[24] = s_ss[bt];
+    }
+  }
+}
+
 // Kernel 2 (Decode & Prefill epilogue):
 // Reduces partials (or reads precomputed dots+ss), runs exact ERNIE RMS + 20-iter Sinkhorn
 // in registers, computes weighted pre-sum (rounded to bf16) + optional RMSNorm -> layer_input.
 // Grid: (T,), Block: 256 (8 waves)
 // ---------------------------------------------------------------------------
-template <int FROM_PARTIALS, int HAS_NORM>
+template <int FROM_PARTIALS, int HAS_NORM, int N_PARTS = 32>
 __global__ __launch_bounds__(256) void k_mhc_sinkhorn_norm_4096(
     const float* __restrict__ part_or_dots,  // FROM_PARTIALS=1: [T, 32, 25]; =0: [T, 24]
     const float* __restrict__ ss_in,         // FROM_PARTIALS=0: [T]
@@ -362,16 +526,23 @@ __global__ __launch_bounds__(256) void k_mhc_sinkhorn_norm_4096(
   const int w = tid >> 5;
 
   if constexpr (FROM_PARTIALS) {
-    // Cooperatively load all 32*25=800 fp32 partials via ONE coalesced global_load_b128 burst (200 threads x f4v)!
-    const f4v* pt4 = reinterpret_cast<const f4v*>(part_or_dots + (size_t)t * (32 * 25));
-    if (tid < 200) {
+    // Cooperatively load all N_PARTS*25 fp32 partials via ONE coalesced global_load_b128 burst!
+    constexpr int N_F4 = (N_PARTS * 25) / 4; // 200 for N_PARTS=32, 100 for N_PARTS=16
+    const f4v* pt4 = reinterpret_cast<const f4v*>(part_or_dots + (size_t)t * (N_PARTS * 25));
+    if (tid < N_F4) {
       *reinterpret_cast<f4v*>(&s_part[tid * 4]) = pt4[tid];
     }
     __syncthreads();
-    // 8 waves reduce 25 slots across 32 split-WGs purely from LDS (zero uncoalesced global traffic!)
+    // 8 waves reduce 25 slots across N_PARTS split-WGs purely from LDS!
     for (int m = w; m < 25; m += 8) {
-      float v = s_part[lane * 25 + m];
-      v = wave_sum(v);
+      float v;
+      if constexpr (N_PARTS == 16) {
+        v = (lane < 16) ? s_part[lane * 25 + m] : 0.f;
+        v += shx<8>(v); v += shx<4>(v); v += shx<2>(v); v += shx<1>(v);
+      } else {
+        v = s_part[lane * 25 + m];
+        v = wave_sum(v);
+      }
       if (lane == 0) {
         if (m < 24) s_mix[m] = v;
         else s_ss_tot = v;
@@ -749,9 +920,9 @@ static void dispatch_mhc_post_dot(
         (k_mhc_post_dot_4096_tiled<DO_POST, 16, 1>), dim3(32, 1), dim3(256), 0, stream,
         xp, rp, pmp, cmp, fnp, rop, partp, T);
   } else {
-    // Prefill T >= 17: NT_FN=0 keeps fn (1.5 MiB) resident in 32 MiB Infinity Cache across all token-tiles!
+    // Wave 59A Prefill T >= 17: 16B u4v g16 BT=8 (7 WGs/WGP = 56 waves/WGP, 2x smaller part, cached res_out in 32 MiB MALL for K2)
     hipLaunchKernelGGL(
-        (k_mhc_post_dot_4096_tiled<DO_POST, 16, 0, 1>), dim3(32, (T + 15) / 16), dim3(256), 0, stream,
+        (k_mhc_post_dot_4096_u4v_g16<DO_POST, 8, 1, 0>), dim3(16, (T + 7) / 8), dim3(256), 0, stream,
         xp, rp, pmp, cmp, fnp, rop, partp, T);
   }
 }
@@ -801,9 +972,27 @@ void launch_mhc_fused_post_pre_decode(
           tc, stream, nullptr, rp, nullptr, nullptr, fn_p, nullptr, part_p);
     }
     const uint16_t* rcur = do_post ? ro : rp;
-    if (nw_p) {
+    if (tc >= 17) {
+      if (nw_p) {
+        hipLaunchKernelGGL(
+            (k_mhc_sinkhorn_norm_4096<1, 1, 16>), dim3(tc), dim3(256), 0, stream,
+            part_p, nullptr, rcur, sc_p, bs_p, nw_p,
+            po_base + (size_t)t0 * 4, co_base + (size_t)t0 * 16,
+            li_base + (size_t)t0 * 4096,
+            (float)rms_eps, (float)hc_pre_eps, (float)hc_sinkhorn_eps,
+            (float)hc_post_mult_value, (int)sinkhorn_repeat, (float)norm_eps);
+      } else {
+        hipLaunchKernelGGL(
+            (k_mhc_sinkhorn_norm_4096<1, 0, 16>), dim3(tc), dim3(256), 0, stream,
+            part_p, nullptr, rcur, sc_p, bs_p, nullptr,
+            po_base + (size_t)t0 * 4, co_base + (size_t)t0 * 16,
+            li_base + (size_t)t0 * 4096,
+            (float)rms_eps, (float)hc_pre_eps, (float)hc_sinkhorn_eps,
+            (float)hc_post_mult_value, (int)sinkhorn_repeat, (float)norm_eps);
+      }
+    } else if (nw_p) {
       hipLaunchKernelGGL(
-          (k_mhc_sinkhorn_norm_4096<1, 1>), dim3(tc), dim3(256), 0, stream,
+          (k_mhc_sinkhorn_norm_4096<1, 1, 32>), dim3(tc), dim3(256), 0, stream,
           part_p, nullptr, rcur, sc_p, bs_p, nw_p,
           po_base + (size_t)t0 * 4, co_base + (size_t)t0 * 16,
           li_base + (size_t)t0 * 4096,
@@ -811,7 +1000,7 @@ void launch_mhc_fused_post_pre_decode(
           (float)hc_post_mult_value, (int)sinkhorn_repeat, (float)norm_eps);
     } else {
       hipLaunchKernelGGL(
-          (k_mhc_sinkhorn_norm_4096<1, 0>), dim3(tc), dim3(256), 0, stream,
+          (k_mhc_sinkhorn_norm_4096<1, 0, 32>), dim3(tc), dim3(256), 0, stream,
           part_p, nullptr, rcur, sc_p, bs_p, nullptr,
           po_base + (size_t)t0 * 4, co_base + (size_t)t0 * 16,
           li_base + (size_t)t0 * 4096,
