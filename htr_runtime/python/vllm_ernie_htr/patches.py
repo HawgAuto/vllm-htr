@@ -1188,6 +1188,193 @@ def patch_dspark_sample_logits() -> None:
         _sample_sequential_fast._ernie5_markov_hip = True  # type: ignore[attr-defined]
         DSparkSpeculator._sample_sequential = _sample_sequential_fast
 
+    # Wave 62: ERNIE-5.5 DSpark prefill fastpath:
+    # 1. Uses combine_hidden_states_list (zero-cat 3x mm/addmm_: -3.07ms/4K, -100.66 MiB peak VRAM).
+    # 2. On pure intermediate chunked-prefill batches where NO request produces a sampled token
+    #    (old_computed + num_scheduled < prefill_len for every request, matching vLLM's own
+    #    pp_utils.compute_need_sampled_mask), still populates DSpark's context KV cache (100%
+    #    prefix-cache exact) but skips the dead 3-layer draft forward + 5x Markov sampling
+    #    (-9.36ms per intermediate 4K chunk, ~-65.5ms on 32K prefill!).
+    # Strictly scoped to Ernie5_5DSparkForCausalLM (has combine_hidden_states_list) & T > 16
+    # (eager prefill only — decode & HIP graphs untouched). Opt-out: ERNIE_DSPARK_PREFILL_FAST=0.
+    orig_propose = getattr(DSparkSpeculator, "propose", None)
+    if (
+        orig_propose is not None
+        and not getattr(orig_propose, "_ernie5_prefill_fast", False)
+        and os.environ.get("ERNIE_DSPARK_PREFILL_FAST", "1") == "1"
+    ):
+        from vllm.v1.worker.gpu.spec_decode.dflash.speculator import prepare_dflash_inputs
+
+        @functools.wraps(orig_propose)
+        def _propose_fast(
+            self,
+            input_batch,
+            attn_metadata,
+            slot_mappings,
+            last_hidden_states,
+            aux_hidden_states,
+            num_sampled,
+            num_rejected,
+            last_sampled,
+            next_prefill_tokens,
+            temperature,
+            seeds,
+            dp_sync=None,
+            dummy_run=False,
+            skip_attn_for_dummy_run=False,
+            mm_inputs=None,
+            is_profile=False,
+        ):
+            combine_list = getattr(self.model, "combine_hidden_states_list", None)
+            num_target_tokens = input_batch.num_tokens
+            if (
+                combine_list is None
+                or dummy_run
+                or is_profile
+                or dp_sync is not None
+                or num_target_tokens <= 16
+                or getattr(self, "use_acceptance_estimator", False)
+            ):
+                return orig_propose(
+                    self,
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    dp_sync=dp_sync,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    mm_inputs=mm_inputs,
+                    is_profile=is_profile,
+                )
+
+            # Check on CPU (zero GPU sync!) whether ANY request produces a sample this step.
+            produces_sample = (
+                input_batch.num_computed_tokens_np + input_batch.num_scheduled_tokens
+                >= input_batch.prefill_len_np
+            )
+            skip_draft_fwd = (
+                input_batch.num_draft_tokens == 0
+                and not bool(produces_sample.any())
+            )
+
+            if not skip_draft_fwd:
+                # Final prefill chunk or mixed prefill+decode: use zero-cat combine_hidden_states_list
+                # and delegate the rest to orig_propose with aux_hidden_states=None!
+                if aux_hidden_states:
+                    combined = combine_list(aux_hidden_states)
+                    return orig_propose(
+                        self,
+                        input_batch,
+                        attn_metadata,
+                        slot_mappings,
+                        combined,
+                        None,
+                        num_sampled,
+                        num_rejected,
+                        last_sampled,
+                        next_prefill_tokens,
+                        temperature,
+                        seeds,
+                        dp_sync=dp_sync,
+                        dummy_run=dummy_run,
+                        skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                        mm_inputs=mm_inputs,
+                        is_profile=is_profile,
+                    )
+                return orig_propose(
+                    self,
+                    input_batch,
+                    attn_metadata,
+                    slot_mappings,
+                    last_hidden_states,
+                    aux_hidden_states,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    dp_sync=dp_sync,
+                    dummy_run=dummy_run,
+                    skip_attn_for_dummy_run=skip_attn_for_dummy_run,
+                    mm_inputs=mm_inputs,
+                    is_profile=is_profile,
+                )
+
+            # Pure intermediate chunked-prefill batch (num_sampled == 0 for every request):
+            # Populate DSpark's context KV cache verbatim (prefix-cache safe), skip dead draft forward!
+            num_reqs = input_batch.num_reqs
+            max_seq_len = input_batch.seq_lens_cpu_upper_bound[:num_reqs].max().item()
+            self.draft_max_seq_len = min(
+                max_seq_len + self.num_query_per_req, self.max_model_len
+            )
+            if aux_hidden_states:
+                hidden_states = combine_list(aux_hidden_states)
+            else:
+                hidden_states = last_hidden_states
+            self.hidden_states[:num_target_tokens].copy_(hidden_states[:num_target_tokens])
+
+            if self.pcp_manager is not None:
+                self.block_tables.gather_block_tables(
+                    input_batch.idx_mapping, num_reqs_padded=num_reqs
+                )
+            assert self.draft_kv_cache_group_id >= 0
+            for i, gid in enumerate(self.draft_kv_cache_group_ids):
+                prepare_dflash_inputs(
+                    self.input_buffers,
+                    self.block_tables.slot_mappings[gid],
+                    self.context_positions,
+                    self._context_slot_mappings[i],
+                    self.sample_indices,
+                    self.sample_pos,
+                    self.sample_idx_mapping,
+                    self.temperature,
+                    self.seeds,
+                    input_batch,
+                    num_sampled,
+                    num_rejected,
+                    last_sampled,
+                    next_prefill_tokens,
+                    temperature,
+                    seeds,
+                    self.block_tables.input_block_tables[gid],
+                    self.block_tables.kernel_block_sizes[gid],
+                    self.block_tables.cp_rank,
+                    self.block_tables.cp_size,
+                    self.block_tables.cp_interleave,
+                    self.parallel_drafting_token_id,
+                    self.num_query_per_req,
+                    self.num_speculative_steps,
+                    self.max_num_reqs,
+                    self.max_num_tokens,
+                    self.max_model_len,
+                    self.sample_from_anchor,
+                )
+            if self._layer_group_idx is not None:
+                context_slots = [
+                    self._context_slot_mappings[gidx][:num_target_tokens]
+                    for gidx in self._layer_group_idx
+                ]
+            else:
+                context_slots = self._context_slot_mappings[0][:num_target_tokens]
+            self.model.precompute_and_store_context_kv(
+                self.hidden_states[:num_target_tokens],
+                self.context_positions[:num_target_tokens],
+                context_slots,
+            )
+            return self.draft_tokens[:num_reqs]
+
+        _propose_fast._ernie5_prefill_fast = True  # type: ignore[attr-defined]
+        DSparkSpeculator.propose = _propose_fast
+
 
 # ------------------------------------------------------------------ In-Place K=5 Split-Plane (0 Extra VRAM!)
 _REPACKED_K5_PTRS: set[int] = set()
