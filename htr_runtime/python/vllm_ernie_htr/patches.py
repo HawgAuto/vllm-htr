@@ -53,6 +53,10 @@ def _patch_config_registry() -> None:
     _CONFIG_REGISTRY.setdefault(ERNIE5_MODEL_TYPE, Ernie5_5Config)
 
 
+# Wave 45: thread-local handoff from Ernie5_5HcaAttention._fused_qnorm_rope_kv_insert (pad_to=0) -> hca_prefill FUSE_QNR
+_HCA_UNNORMED_Q_CTX: list = [None]
+
+
 def _patch_rocm_paged_mqa_logits_triton() -> None:
     """Enable graph-safe Split-KV Triton paged MQA logits on gfx1151 (Strix Halo)."""
     try:
@@ -428,11 +432,25 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                                 rope_pos = pos_all[r0 : r0 + T]
                                 rope_cs = cs_cache
                                 ctx[4] += T
+                    qnr_eps = -1.0
+                    if ctx is not None and len(ctx) >= 6 and ctx[5] is not None and rope_pos is not None:
+                        qb_ptr, q_rb, q_nr, q_eps = ctx[5]
+                        q_off = q.data_ptr() - qb_ptr
+                        if q_rb > 0 and q_off >= 0 and (q_off % q_rb) == 0:
+                            qr0 = q_off // q_rb
+                            if qr0 + T <= q_nr:
+                                qnr_eps = q_eps
                     if rope_pos is not None:
-                        ext.hca_prefill(
-                            q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale),
-                            rope_pos, rope_cs,
-                        )
+                        if qnr_eps >= 0.0:
+                            ext.hca_prefill(
+                                q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale),
+                                rope_pos, rope_cs, float(qnr_eps),
+                            )
+                        else:
+                            ext.hca_prefill(
+                                q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale),
+                                rope_pos, rope_cs,
+                            )
                     else:
                         ext.hca_prefill(
                             q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale)
@@ -482,7 +500,11 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                         output, attn_metadata, swa_metadata,
                     )
                 row_bytes = output.stride(0) * output.element_size()
-                ctx = [output.data_ptr(), row_bytes, positions, cs, 0]
+                qnr_ctx = _HCA_UNNORMED_Q_CTX[0]
+                _HCA_UNNORMED_Q_CTX[0] = None
+                if qnr_ctx is not None and q.data_ptr() != qnr_ctx[0]:
+                    qnr_ctx = None
+                ctx = [output.data_ptr(), row_bytes, positions, cs, 0, qnr_ctx]
                 _pref_rope_ctx[0] = ctx
                 try:
                     ret = _orig_fwd_pref(

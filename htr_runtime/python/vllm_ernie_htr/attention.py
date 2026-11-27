@@ -456,6 +456,69 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
             g.htr_sv.data = sv[idx]
         self._woa_packed = (qw, sc, su, sv)
 
+    def _fused_qnorm_rope_kv_insert(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        attn_metadata,
+    ) -> torch.Tensor:
+        # Wave 45: For pure prefill (T > 16, H == 64, uint8 fp8_ds_mla SWA cache), skip the
+        # 268.4 MB Q read + 268.4 MB q_padded alloc/write by passing q_head_padded=0 (KV-only!),
+        # and fuse per-head Q-RMSNorm + 64-dim GPT-J RoPE algebraically inside k_ernie_hca_prefill_512_v28!
+        if (
+            isinstance(attn_metadata, dict)
+            and q.is_cuda
+            and q.dtype == torch.bfloat16
+            and q.dim() == 3
+            and q.shape[0] > 16
+            and q.shape[1] == 64
+            and q.shape[2] == 512
+            and self.n_local_heads == 64
+            and self.padded_heads == 64
+            and self.head_dim == 512
+            and self.rope_head_dim == 64
+            and getattr(self, "_wo_a_fp8_weight", None) is None
+        ):
+            swa_metadata = attn_metadata.get(self.swa_cache_layer.prefix)
+            swa_kv_cache = self.swa_cache_layer.kv_cache
+            if (
+                swa_metadata is not None
+                and swa_kv_cache.dtype == torch.uint8
+                and getattr(swa_metadata, "num_decodes", 1) == 0
+                and getattr(swa_metadata, "num_decode_tokens", 1) == 0
+                and getattr(swa_metadata, "num_prefills", 0) > 0
+                and getattr(getattr(self, "rotary_emb", None), "cos_sin_cache", None) is not None
+            ):
+                from .fast_ops import get_hca_attn
+                ext = get_hca_attn()
+                if ext is not None and getattr(ext, "SUPPORTS_PREFILL_FUSE_QNR", False):
+                    from . import patches as _ep
+                    swa_kv_cache_2d = swa_kv_cache.view(swa_kv_cache.shape[0], -1)
+                    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+                        q,
+                        kv,
+                        swa_kv_cache_2d,
+                        swa_metadata.slot_mapping,
+                        positions,
+                        self.rotary_emb.cos_sin_cache,
+                        0,
+                        self.eps,
+                        swa_metadata.block_size,
+                        False,
+                        False,
+                        False,
+                        False,
+                    )
+                    _ep._HCA_UNNORMED_Q_CTX[0] = (
+                        q.data_ptr(),
+                        q.stride(0) * q.element_size(),
+                        int(q.shape[0]),
+                        float(self.eps),
+                    )
+                    return q
+        return super()._fused_qnorm_rope_kv_insert(q, kv, positions, attn_metadata)
+
     def _run_parallel_input_projections(self, hidden_states: torch.Tensor):
         qr_kv = self.fused_wqa_wkv(hidden_states)
         if isinstance(qr_kv, tuple):
@@ -487,17 +550,21 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
         gate_logits = self.o_gate(qr)
 
         # Runs compressor + Q norm/RoPE + SWA insert + sparse MLA + inverse RoPE
-        self._prepare_and_attn_fn(
-            hidden_states,
-            qr,
-            kv,
-            qr_scale,
-            kv_score,
-            indexer_kv_score,
-            indexer_weights,
-            positions,
-            o_padded,
-        )
+        try:
+            self._prepare_and_attn_fn(
+                hidden_states,
+                qr,
+                kv,
+                qr_scale,
+                kv_score,
+                indexer_kv_score,
+                indexer_weights,
+                positions,
+                o_padded,
+            )
+        finally:
+            from . import patches as _ep
+            _ep._HCA_UNNORMED_Q_CTX[0] = None
         # o_padded is already inverse-RoPE'd by DeepseekV4ROCMAiterMLAAttention.forward_mqa;
         # VHA operates on the head axis so it commutes with inverse RoPE.
         # Wave 10A fused VHA + wo_a prologue fast path for prefill (T > 16):
