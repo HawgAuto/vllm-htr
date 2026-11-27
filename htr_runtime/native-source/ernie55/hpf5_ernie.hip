@@ -244,7 +244,7 @@ __global__ __launch_bounds__(512) void k_moe_align_ernie(
 // ------------------------------------------------------------------ 1/3: activation prologues (1 wave per sorted row)
 // MODE 0: src = x [T, 2048] bf16 -> A1 [P, 2048] f16, S [P] f32
 // MODE 1: src = Y1 [P, 4096] bf16 (gate|up) -> SiTU-GLU -> A2 [P, 2048] f16, S [P] f32
-template <int MODE>
+template <int MODE, int BLK32 = 0, int NT_ST = 0>
 __global__ __launch_bounds__(128) void k_hpf_ernie_act(
     const __hip_bfloat16* __restrict__ src,
     const int32_t* __restrict__ sorted_ids,
@@ -304,7 +304,17 @@ __global__ __launch_bounds__(128) void k_hpf_ernie_act(
     uint2 o;
     o.x = (uint32_t)__builtin_bit_cast(uint16_t, h[0]) | ((uint32_t)__builtin_bit_cast(uint16_t, h[1]) << 16);
     o.y = (uint32_t)__builtin_bit_cast(uint16_t, h[2]) | ((uint32_t)__builtin_bit_cast(uint16_t, h[3]) << 16);
-    *reinterpret_cast<uint2*>(out + c0) = o;
+    uint64_t q64 = (uint64_t)o.x | ((uint64_t)o.y << 32);
+    if constexpr (BLK32) {
+      const int bm = p >> 4, r_in = p & 15, k32 = (blk << 2) | (lane >> 3), e32 = (lane & 7) * 4;
+      uint64_t* dst = reinterpret_cast<uint64_t*>(A + ((size_t)bm * 64 + k32) * 512 + r_in * 32 + e32);
+      if constexpr (NT_ST) __builtin_nontemporal_store(q64, dst);
+      else *dst = q64;
+    } else {
+      uint64_t* dst = reinterpret_cast<uint64_t*>(out + c0);
+      if constexpr (NT_ST) __builtin_nontemporal_store(q64, dst);
+      else *dst = q64;
+    }
   }
   // Single 5-step Wave32 DPP reduction (8x fewer wave shuffles than 8x separate reductions!)
   vsum += shx<16>(vsum);
@@ -817,7 +827,7 @@ struct ErnieFusedG0Args {
   int num_valid, pad; float cb;
 };
 
-template <int K, int NT_LOAD>
+template <int K, int NT_LOAD, int BLK32 = 1>
 __global__ __launch_bounds__(512)
 void k_hpf_ernie_gemm0_1x8_fused(ErnieFusedG0Args a) {
   constexpr int KDIM = MOE_H, NT = KDIM / 16, NS32 = KDIM / 32, NWT = 8 * K;
@@ -852,7 +862,9 @@ void k_hpf_ernie_gemm0_1x8_fused(ErnieFusedG0Args a) {
   const uint32_t* qm_thr = a.qw + a.qoff[(size_t)e * 3 + is_up_thr] + (size_t)blk * 8 * pitch + (size_t)(n2_loc >> 4) * pitch;
 
   const bool m_act = s_tok[wm * 16] < a.num_valid;
-  const _Float16* arow = a.A1 + ((size_t)y * BM + wm * 16 + l16) * KDIM;
+  const _Float16* arow = BLK32
+      ? (a.A1 + (size_t)(y + wm) * (size_t)(KDIM * 16) + (size_t)l16 * 32)
+      : (a.A1 + ((size_t)y * BM + wm * 16 + l16) * KDIM);
   const int n_base = wn * 128;
 
   auto loadB = [&](uint32_t* br, int k0) {
@@ -874,7 +886,14 @@ void k_hpf_ernie_gemm0_1x8_fused(ErnieFusedG0Args a) {
     *(u32x4*)(&bs[sw4(n256, 2 * h2i + 1)]) = (u32x4){o[4], o[5], o[6], o[7]};
   };
   auto loadA16 = [&](u32x4 dst[2], int k0) {
-    if (m_act) { dst[0] = *(const u32x4*)(arow + k0); dst[1] = *(const u32x4*)(arow + k0 + 8); }
+    if (m_act) {
+      if constexpr (BLK32) {
+        const _Float16* ap = arow + (size_t)(k0 >> 5) * 512 + (k0 & 16);
+        dst[0] = *(const u32x4*)(ap); dst[1] = *(const u32x4*)(ap + 8);
+      } else {
+        dst[0] = *(const u32x4*)(arow + k0); dst[1] = *(const u32x4*)(arow + k0 + 8);
+      }
+    }
   };
 
   f32x8 acc[8];
@@ -902,6 +921,11 @@ void k_hpf_ernie_gemm0_1x8_fused(ErnieFusedG0Args a) {
         __builtin_amdgcn_sched_barrier(0);
       }
       if (s + 1 < NS32) loadA16(a0, (s + 1) * 32);
+    }
+    // Wave 32: overlap decode_row_k + ds_store_b128 into Bs[buf^1] BEFORE the 8 af1 WMMAs (V=118<=120!)
+    if (s + 1 < NS32) storeB(buf ^ 1, b1);
+    if (m_act) {
+      const uint32_t* bs = smem.Bs[buf];
       const f16x16 af1 = __builtin_bit_cast(f16x16, (u32x8){a1[0][0], a1[0][1], a1[0][2], a1[0][3], a1[1][0], a1[1][1], a1[1][2], a1[1][3]});
 #pragma unroll
       for (int j = 0; j < 8; ++j) {
@@ -913,7 +937,6 @@ void k_hpf_ernie_gemm0_1x8_fused(ErnieFusedG0Args a) {
         __builtin_amdgcn_sched_barrier(0);
       }
     }
-    if (s + 1 < NS32) storeB(buf ^ 1, b1);
     __syncthreads();
   };
 
@@ -992,13 +1015,195 @@ void k_hpf_ernie_gemm0_1x8_fused(ErnieFusedG0Args a) {
           (uint32_t)__builtin_bit_cast(uint16_t, h[0]) | ((uint32_t)__builtin_bit_cast(uint16_t, h[1]) << 16),
           (uint32_t)__builtin_bit_cast(uint16_t, h[2]) | ((uint32_t)__builtin_bit_cast(uint16_t, h[3]) << 16),
         };
-        *reinterpret_cast<uint2*>(a.A2 + s_prow * MOE_I + row0 + lane * 4) = o;
+        if constexpr (BLK32) {
+          const int bm = (int)(s_prow >> 4), r_in = (int)(s_prow & 15);
+          const int k32 = (blk << 2) | (lane >> 3), e32 = (lane & 7) * 4;
+          *reinterpret_cast<uint2*>(a.A2 + ((size_t)bm * 64 + k32) * 512 + r_in * 32 + e32) = o;
+        } else {
+          *reinterpret_cast<uint2*>(a.A2 + s_prow * MOE_I + row0 + lane * 4) = o;
+        }
         if (lane == 0) a.S2_blk[s_prow * 16 + blk] = bs;
       }
     }
     __syncthreads();
   }
   if (sat) atomicAdd(a.nsat, sat);
+}
+
+
+// ============================================================================
+// Wave 32: 1x8 BN=256 Gemm1 (down_proj, bmw=128)
+//   - 8 M-groups (bmw=128) x 2 N-groups (256 cols) = 16 waves (512 thr, V<=120 -> 3 WGs/WGP!)
+//   - ALL 512 threads load & decode W2 in parallel (0 idle threads vs 256 idle in gemm_n2!)
+//   - Cuts A2 global reads in HALF (8 N-blocks vs 16 -> -56.3 GB/4K!)
+//   - BLK32 A2 layout [P/16, 64, 16, 32] eliminates 4,096B power-of-2 stride L1/GL2 set conflicts
+//   - Overlapped storeB(buf^1, b1) before 8 af1 WMMAs + 100% in-register fwht128_reg8 epilogue!
+// ============================================================================
+template <int K, int NT_LOAD, int BLK32 = 1>
+__global__ __launch_bounds__(512)
+void k_hpf_ernie_gemm1_1x8(ErnieGemmArgs a) {
+  constexpr int N = MOE_H, KDIM = MOE_I, NT = KDIM / 16, NS32 = KDIM / 32, NWT = 8 * K;
+  constexpr int LBMW = 128;
+  constexpr int W_PER_ROW = (K == 3) ? 2 : 1;
+
+  union SmemU {
+    uint32_t Bs[2][256 * RS];
+    uint16_t eb[64 * 256];
+  };
+  __shared__ __attribute__((aligned(16))) SmemU smem;
+  __shared__ int32_t s_tok[LBMW];
+
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
+  const int wm = wave >> 1, wn = wave & 1;
+  const int ng = a.grp_cnt[0];
+  const int g = ng - 1 - (int)blockIdx.y;
+  const int nb = blockIdx.x;
+  if (g < 0 || g >= ng) return;
+  const int y = a.grp_y[g], nblk = a.grp_nblk[g], e = a.expert_ids[y];
+  if (e < 0) return;
+
+  if (tid < LBMW) s_tok[tid] = (tid < BM * nblk) ? a.sorted_ids[y * BM + tid] : a.num_valid;
+  __syncthreads();
+
+  const size_t pitch = (size_t)NT * NWT + a.pad;
+  const int n256 = tid & 255, h2i = tid >> 8, r_loc = n256 & 15;
+  const uint32_t* qm_thr = a.qw + a.qoff[(size_t)e * 3 + 2] + (size_t)(nb * 16 + (n256 >> 4)) * pitch;
+
+  const bool m_act = s_tok[wm * 16] < a.num_valid;
+  const _Float16* arow = BLK32
+      ? (a.A + (size_t)(y + wm) * (size_t)(KDIM * 16) + (size_t)l16 * 32)
+      : (a.A + ((size_t)y * BM + wm * 16 + l16) * KDIM);
+  const int n_base = wn * 128;
+
+  auto loadB = [&](uint32_t* br, int k0) {
+    const uint32_t* tile = qm_thr + (size_t)(k0 / 16 + h2i) * NWT;
+    if constexpr (K == 3) {
+      const int kk = r_loc >> 1;
+      const u32x2a* p2 = reinterpret_cast<const u32x2a*>(tile + 3 * kk + (r_loc & 1));
+      const u32x2 pair = NT_LOAD ? __builtin_nontemporal_load(p2) : *p2;
+      br[0] = pair[0]; br[1] = pair[1];
+    } else {
+      br[0] = NT_LOAD ? __builtin_nontemporal_load(tile + r_loc) : tile[r_loc];
+    }
+  };
+  auto storeB = [&](int buf, const uint32_t* br) {
+    uint32_t* bs = smem.Bs[buf];
+    uint32_t o[8];
+    decode_row_k<K>(br, r_loc, o);
+    *(u32x4*)(&bs[sw4(n256, 2 * h2i)])     = (u32x4){o[0], o[1], o[2], o[3]};
+    *(u32x4*)(&bs[sw4(n256, 2 * h2i + 1)]) = (u32x4){o[4], o[5], o[6], o[7]};
+  };
+  auto loadA16 = [&](u32x4 dst[2], int k0) {
+    if (m_act) {
+      if constexpr (BLK32) {
+        const _Float16* ap = arow + (size_t)(k0 >> 5) * 512 + (k0 & 16);
+        dst[0] = *(const u32x4*)(ap); dst[1] = *(const u32x4*)(ap + 8);
+      } else {
+        dst[0] = *(const u32x4*)(arow + k0); dst[1] = *(const u32x4*)(arow + k0 + 8);
+      }
+    }
+  };
+
+  f32x8 acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+
+  uint32_t bX[W_PER_ROW], bY[W_PER_ROW], bZ[W_PER_ROW];
+  u32x4 a0[2], a1[2];
+  loadA16(a0, 0); loadB(bX, 0); loadB(bY, 32); storeB(0, bX);
+  __syncthreads();
+
+  auto step = [&](int s, int buf, const uint32_t* b1, uint32_t* b2) {
+    loadA16(a1, s * 32 + 16);
+    if (s + 2 < NS32) loadB(b2, (s + 2) * 32);
+    if (m_act) {
+      const uint32_t* bs = smem.Bs[buf];
+      const f16x16 af0 = __builtin_bit_cast(f16x16, (u32x8){a0[0][0], a0[0][1], a0[0][2], a0[0][3], a0[1][0], a0[1][1], a0[1][2], a0[1][3]});
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int n = n_base + 16 * j + l16;
+        const u32x4 y0 = *(const u32x4*)(&bs[sw4(n, 0)]);
+        const u32x4 y1 = *(const u32x4*)(&bs[sw4(n, 1)]);
+        const f16x16 bf = __builtin_bit_cast(f16x16, (u32x8){y0[0], y0[1], y0[2], y0[3], y1[0], y1[1], y1[2], y1[3]});
+        acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af0, bf, acc[j]);
+        __builtin_amdgcn_sched_barrier(0);
+      }
+      if (s + 1 < NS32) loadA16(a0, (s + 1) * 32);
+    }
+    if (s + 1 < NS32) storeB(buf ^ 1, b1);
+    if (m_act) {
+      const uint32_t* bs = smem.Bs[buf];
+      const f16x16 af1 = __builtin_bit_cast(f16x16, (u32x8){a1[0][0], a1[0][1], a1[0][2], a1[0][3], a1[1][0], a1[1][1], a1[1][2], a1[1][3]});
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int n = n_base + 16 * j + l16;
+        const u32x4 y0 = *(const u32x4*)(&bs[sw4(n, 2)]);
+        const u32x4 y1 = *(const u32x4*)(&bs[sw4(n, 3)]);
+        const f16x16 bf = __builtin_bit_cast(f16x16, (u32x8){y0[0], y0[1], y0[2], y0[3], y1[0], y1[1], y1[2], y1[3]});
+        acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af1, bf, acc[j]);
+        __builtin_amdgcn_sched_barrier(0);
+      }
+    }
+    __syncthreads();
+  };
+
+  for (int s = 0; s < NS32; s += 6) {
+    step(s + 0, 0, bY, bZ);
+    if (s + 1 < NS32) step(s + 1, 1, bZ, bX);
+    if (s + 2 < NS32) step(s + 2, 0, bX, bY);
+    if (s + 3 < NS32) step(s + 3, 1, bY, bZ);
+    if (s + 4 < NS32) step(s + 4, 0, bZ, bX);
+    if (s + 5 < NS32) step(s + 5, 1, bX, bY);
+  }
+
+  const int col0 = nb * 256 + wn * 128;
+  const __half* scl = a.scales + (size_t)e * SC_STRIDE + 2 * MOE_I + col0;
+  const uint8_t* svp = a.sv + (size_t)e * SV_STRIDE + (2 * MOE_I / 8) + (col0 >> 3);
+  float sc[8]; uint32_t neg = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    sc[j] = __half2float(scl[16 * j + l16]) * a.cb;
+    neg |= ((uint32_t)(svp[2 * j + (l16 >> 3)] >> (l16 & 7)) & 1u) << j;
+  }
+  const int hrow = lane >> 4;
+  const size_t prow = (size_t)y * BM + wm * 16;
+
+#pragma unroll 1
+  for (int hf = 0; hf < 2; ++hf) {
+    const int wm_lo = hf * 4;
+    if (wm >= wm_lo && wm < wm_lo + 4 && m_act) {
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) {
+        const int rl = wm * 16 + 2 * ei + hrow;
+        if (s_tok[rl] < a.num_valid) {
+          const float bias = VBIAS * a.S[prow + 2 * ei + hrow];
+          float v[8];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) v[j] = (acc[j][ei] - bias) * sc[j];
+          fwht128_reg8(v, lane);
+          uint16_t* dst_lds = smem.eb + ((wm - wm_lo) * 16 + 2 * ei + hrow) * 256 + wn * 128 + l16;
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            float yv = v[j] * INV128;
+            if ((neg >> j) & 1u) yv = -yv;
+            dst_lds[16 * j] = f32_to_bf16_rne(yv);
+          }
+        }
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int ri = 0; ri < 4; ++ri) {
+      const int r_loc = wave * 4 + ri;
+      const int s_rl = wm_lo * 16 + r_loc;
+      if (s_tok[s_rl] < a.num_valid) {
+        const size_t s_prow = (size_t)y * BM + s_rl;
+        const u32x4 v4 = *reinterpret_cast<const u32x4*>(smem.eb + r_loc * 256 + lane * 8);
+        *reinterpret_cast<u32x4*>(reinterpret_cast<uint16_t*>(a.Y) + s_prow * (size_t)N + nb * 256 + lane * 8) = v4;
+      }
+    }
+    if (hf == 0) __syncthreads();
+  }
 }
 
 __global__ __launch_bounds__(256) void k_sum_s2_16(
@@ -1063,14 +1268,12 @@ torch::Tensor hpf5_ernie_forward(
   a.Y = Yp;
   a.num_valid = nv; a.pad = (int)pad; a.cb = (float)cb;
 
-  // 1. Act0: x -> A1 [P, 2048] f16 + S
-  hipLaunchKernelGGL((k_hpf_ernie_act<0>), dim3(pg), dim3(128), 0, st,
-                     reinterpret_cast<const __hip_bfloat16*>(x.data_ptr<at::BFloat16>()),
-                     sid, eid, ntpp_p, su.data_ptr<uint8_t>(), topk, nv, Ap, Sp, ns_p);
-
   if (bmw == 128) {
-    // Wave 22: Fused 1x8 BN=256 Gemm0 + SiTU-GLU + Act1 (ZERO Y1 DRAM round-trip, ZERO act1, ZERO extra VRAM!)
-    // A2 aliases second half of Y_buf (Yp + Pmax*2048); S2_blk (Pmax*16 f32) aliases dead start of Y_buf before Gemm1!
+    // Wave 32: BLK32+NT Act0 + OVLP-storeB 1x8 BN=256 Fused Gemm0 + OVLP-storeB 1x8 BN=256 Gemm1 (V<=120 -> 3 WGs/WGP!)
+    hipLaunchKernelGGL((k_hpf_ernie_act<0, 1, 1>), dim3(pg), dim3(128), 0, st,
+                       reinterpret_cast<const __hip_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                       sid, eid, ntpp_p, su.data_ptr<uint8_t>(), topk, nv, Ap, Sp, ns_p);
+
     _Float16* A2p = reinterpret_cast<_Float16*>(Yp + (size_t)Pmax * MOE_I);
     float* S2_blkp = reinterpret_cast<float*>(Yp);
     ErnieFusedG0Args g0;
@@ -1081,16 +1284,19 @@ torch::Tensor hpf5_ernie_forward(
     g0.A2 = A2p; g0.S2_blk = S2_blkp; g0.nsat = ns_p;
     g0.num_valid = nv; g0.pad = (int)pad; g0.cb = (float)cb;
 
-    if (K == 3) hipLaunchKernelGGL((k_hpf_ernie_gemm0_1x8_fused<3, 0>), dim3(MOE_I / BN, max_g), dim3(512), 0, st, g0);
-    else        hipLaunchKernelGGL((k_hpf_ernie_gemm0_1x8_fused<2, 0>), dim3(MOE_I / BN, max_g), dim3(512), 0, st, g0);
+    if (K == 3) hipLaunchKernelGGL((k_hpf_ernie_gemm0_1x8_fused<3, 0, 1>), dim3(MOE_I / BN, max_g), dim3(512), 0, st, g0);
+    else        hipLaunchKernelGGL((k_hpf_ernie_gemm0_1x8_fused<2, 0, 1>), dim3(MOE_I / BN, max_g), dim3(512), 0, st, g0);
 
     hipLaunchKernelGGL(k_sum_s2_16, dim3((Pmax + 15) / 16), dim3(256), 0, st, S2_blkp, Sp, ntpp_p);
 
-    // 4. Gemm1: A2 @ W2 -> Y2 (first half of Y_buf; S2_blk is dead!) [P, 2048] bf16
     a.A = A2p;
-    if (K == 3) dispatch_gemm<3, 1>(128, 0, max_g, st, a);
-    else        dispatch_gemm<2, 1>(128, 0, max_g, st, a);
+    if (K == 3) hipLaunchKernelGGL((k_hpf_ernie_gemm1_1x8<3, 0, 1>), dim3(MOE_H / 256, max_g), dim3(512), 0, st, a);
+    else        hipLaunchKernelGGL((k_hpf_ernie_gemm1_1x8<2, 0, 1>), dim3(MOE_H / 256, max_g), dim3(512), 0, st, a);
   } else {
+    // 1. Act0: x -> A1 [P, 2048] f16 + S
+    hipLaunchKernelGGL((k_hpf_ernie_act<0, 0, 0>), dim3(pg), dim3(128), 0, st,
+                       reinterpret_cast<const __hip_bfloat16*>(x.data_ptr<at::BFloat16>()),
+                       sid, eid, ntpp_p, su.data_ptr<uint8_t>(), topk, nv, Ap, Sp, ns_p);
     // 2. Gemm0: A1 @ W13 -> Y1 [P, 4096] bf16
     if (K == 3) dispatch_gemm<3, 0>((int)bmw, (int)nt_load, max_g, st, a);
     else        dispatch_gemm<2, 0>((int)bmw, (int)nt_load, max_g, st, a);
