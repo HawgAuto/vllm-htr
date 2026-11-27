@@ -1244,7 +1244,7 @@ def _k5_unsplit_nsplit(mt: int, nt: int, M: int) -> int:
         return 32
     return 32 if M <= 8 else 16
 
-def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
+def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None, accum_out=None):
     """Execute an ERNIE-5.5 K=5 linear (unsplit or repacked) using pre-computed (xt, xs, tok)."""
     import torch
     import htr.ops as htr_ops
@@ -1267,9 +1267,10 @@ def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
             cnt = htr_ops.counters(xt.device)
             ns = _k5_unsplit_nsplit(mt, nt, M)
             _e8 = int(htr_ops.EPI8 and htr_ops._ns_eff(mt, nt, ns) % 8 == 0)
-            return sp_ext.gemv_k5_unsplit_epi(
+            out_g = sp_ext.gemv_k5_unsplit_epi(
                 qweight, xt, xs, tok, scales, float(htr_ops.CB), sv, bias, cnt, ns, _e8
             )
+            return out_g + accum_out if accum_out is not None else out_g
         if M < wmma_min_m and M <= htr_ops.GEMV_MAX_M:
             cnt = htr_ops.counters(xt.device)
             ns = htr_ops.nsplit_for(mt, nt, M)
@@ -1278,7 +1279,10 @@ def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
                 qweight, xt, xs, tok, scales, htr_ops.CB, sv, bias, cnt, ns, 0, _e8
             )
         if sp_ext is not None and hasattr(sp_ext, "dense_prefill_wmma_unsplit") and (mt % 8) == 0:
-            return sp_ext.dense_prefill_wmma_unsplit(qweight, xt, tok, scales, float(htr_ops.CB), sv, bias, 0)
+            if accum_out is not None and getattr(sp_ext, "SUPPORTS_UNSPLIT_ACCUM_OUT", False):
+                return sp_ext.dense_prefill_wmma_unsplit(qweight, xt, tok, scales, float(htr_ops.CB), sv, bias, 0, accum_out)
+            out_u = sp_ext.dense_prefill_wmma_unsplit(qweight, xt, tok, scales, float(htr_ops.CB), sv, bias, 0)
+            return out_u + accum_out if accum_out is not None else out_u
         xt_2d = xt.permute(0, 2, 1, 3).reshape(-1, nt * 16)[:M].contiguous() if xt.dim() == 4 else xt
         return htr_ops._dpw_ext().dense_prefill_wmma(qweight, xt_2d, tok, scales, htr_ops.CB, sv, bias)
     flat = qweight.view(-1)

@@ -503,6 +503,21 @@ class Ernie5_5MoE(nn.Module):
                     xt, xs, tok = sp_ext.rmsnorm_htr_prologue(
                         routed_out, self.latent_norm.weight.data.contiguous(), self.fc2_latent_proj.htr_su, eps
                     )
+                    # Wave 47: When M256 blocked-xt prefill is active (xt.dim()==4), compute shared_out first
+                    # and fuse (routed_out + shared_out) in-place into fc2_latent_proj WMMA epilogue
+                    # (0.0 bit-exact, eliminates 42x [T, 4096] BF16 allocs + 2.82 GB DRAM add traffic = -17ms/4K!)
+                    if xt.dim() == 4 and getattr(sp_ext, "SUPPORTS_UNSPLIT_ACCUM_OUT", False):
+                        shared_out = self.shared_experts(hidden_states)
+                        if shared_out.is_cuda and shared_out.is_contiguous() and shared_out.dtype == torch.bfloat16:
+                            return htr_k5sp_linear_pre_prologued(
+                                xt, xs, tok, qw2, self.fc2_latent_proj.htr_scales, self.fc2_latent_proj.htr_sv,
+                                getattr(self.fc2_latent_proj, "bias", None), accum_out=shared_out,
+                            )
+                        routed_out = htr_k5sp_linear_pre_prologued(
+                            xt, xs, tok, qw2, self.fc2_latent_proj.htr_scales, self.fc2_latent_proj.htr_sv,
+                            getattr(self.fc2_latent_proj, "bias", None),
+                        )
+                        return routed_out + shared_out
                     routed_out = htr_k5sp_linear_pre_prologued(
                         xt, xs, tok, qw2, self.fc2_latent_proj.htr_scales, self.fc2_latent_proj.htr_sv,
                         getattr(self.fc2_latent_proj, "bias", None),

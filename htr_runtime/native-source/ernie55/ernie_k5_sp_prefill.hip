@@ -540,7 +540,7 @@ __device__ __forceinline__ int k5_sw_col4(int row, int col4) {
 
 // Wave 25: 2 WGs/CU (16w/CU, V<=192, vSp=0!) 24 KiB XOR-swizzled STR=8 + ds_store_b64
 //          + compile-time ping-pong j+=2 + b0,b1/1-a snake reuse (11 LDS loads vs 12)!
-template <int SP16 = 1, int M256 = 0>
+template <int SP16 = 1, int M256 = 0, int ACCUM_Y = 0>
 __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8)))
 void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
     const uint32_t* __restrict__ p16,
@@ -767,8 +767,19 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
           uint2 out_p;
           out_p.x = f32_to_bf16x2_rne(ob[0], ob[1]);
           out_p.y = f32_to_bf16x2_rne(ob[2], ob[3]);
+          uint64_t* dst64 = reinterpret_cast<uint64_t*>(y + (size_t)r * m_out + base_col);
+          if constexpr (ACCUM_Y) {
+            const uint64_t prev64 = __builtin_nontemporal_load(dst64);
+            const uint32_t px = (uint32_t)prev64, py = (uint32_t)(prev64 >> 32);
+            const float s0 = __uint_as_float((out_p.x & 0xFFFFu) << 16) + __uint_as_float((px & 0xFFFFu) << 16);
+            const float s1 = __uint_as_float(out_p.x & 0xFFFF0000u)     + __uint_as_float(px & 0xFFFF0000u);
+            const float s2 = __uint_as_float((out_p.y & 0xFFFFu) << 16) + __uint_as_float((py & 0xFFFFu) << 16);
+            const float s3 = __uint_as_float(out_p.y & 0xFFFF0000u)     + __uint_as_float(py & 0xFFFF0000u);
+            out_p.x = f32_to_bf16x2_rne(s0, s1);
+            out_p.y = f32_to_bf16x2_rne(s2, s3);
+          }
           const uint64_t out64 = (uint64_t)out_p.x | ((uint64_t)out_p.y << 32);
-          __builtin_nontemporal_store(out64, reinterpret_cast<uint64_t*>(y + (size_t)r * m_out + base_col));
+          __builtin_nontemporal_store(out64, dst64);
         }
       }
     }
@@ -845,7 +856,8 @@ torch::Tensor dense_prefill_wmma_sp16(
 torch::Tensor dense_prefill_wmma_unsplit(
     torch::Tensor qw, torch::Tensor xt, torch::Tensor tok,
     torch::Tensor scales, double cb, torch::Tensor sv,
-    c10::optional<torch::Tensor> bias, int64_t bm) {
+    c10::optional<torch::Tensor> bias, int64_t bm,
+    c10::optional<torch::Tensor> accum_out = c10::nullopt) {
   TORCH_CHECK(qw.is_cuda() && qw.is_contiguous() && qw.dim() == 3 && qw.size(2) == 40);
   const bool is_m256 = (xt.dim() == 4);
   TORCH_CHECK(xt.is_cuda() && xt.is_contiguous() && (xt.dim() == 2 || is_m256) && xt.scalar_type() == torch::kHalf);
@@ -856,8 +868,12 @@ torch::Tensor dense_prefill_wmma_unsplit(
   } else {
     TORCH_CHECK((mt % 8 == 0) && xt.size(0) == M && xt.size(1) == nt * 16);
   }
-  auto y = torch::empty({M, mt * 16}, xt.options().dtype(torch::kBFloat16));
-  if (M == 0) return y;
+  const bool has_acc = accum_out.has_value() && accum_out->defined();
+  if (has_acc) {
+    TORCH_CHECK(accum_out->is_cuda() && accum_out->is_contiguous() && accum_out->dim() == 2 &&
+                accum_out->size(0) == M && accum_out->size(1) == mt * 16 && accum_out->scalar_type() == torch::kBFloat16);
+  }
+  if (M == 0) return has_acc ? *accum_out : torch::empty({0, mt * 16}, xt.options().dtype(torch::kBFloat16));
   auto st = c10::hip::getCurrentHIPStream().stream();
   auto qwp = reinterpret_cast<const uint32_t*>(qw.data_ptr<int32_t>());
   auto xp = reinterpret_cast<const _Float16*>(xt.data_ptr<at::Half>());
@@ -866,12 +882,20 @@ torch::Tensor dense_prefill_wmma_unsplit(
   auto svp = sv.data_ptr<uint8_t>();
   const uint16_t* bp = (bias.has_value() && bias->defined())
       ? reinterpret_cast<const uint16_t*>(bias->data_ptr<at::BFloat16>()) : nullptr;
-  auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
   if (is_m256) {
-    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 1>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
-                       qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
+    torch::Tensor y = has_acc ? *accum_out : torch::empty({M, mt * 16}, xt.options().dtype(torch::kBFloat16));
+    auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
+    if (has_acc) {
+      hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 1, 1>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+                         qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
+    } else {
+      hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 1, 0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+                         qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
+    }
     return y;
   }
+  auto y = torch::empty({M, mt * 16}, xt.options().dtype(torch::kBFloat16));
+  auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
   if (bm <= 0) bm = (M >= 256 && mt > 64) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
   if (bm == 256) {
     hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
@@ -888,6 +912,10 @@ torch::Tensor dense_prefill_wmma_unsplit(
   } else {
     hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp<4, 0>), dim3(mt / 8, (M + 63) / 64, 1), dim3(256), 0, st,
                        qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
+  }
+  if (has_acc) {
+    accum_out->add_(y);
+    return *accum_out;
   }
   return y;
 }
@@ -2960,7 +2988,12 @@ std::vector<torch::Tensor> prologue_b16_m256(torch::Tensor x, torch::Tensor su) 
 PYBIND11_MODULE(ernie_k5_sp_prefill, m) {
   m.def("repack_k5_packed", &repack_k5_packed);
   m.def("dense_prefill_wmma_sp16", &dense_prefill_wmma_sp16);
-  m.def("dense_prefill_wmma_unsplit", &dense_prefill_wmma_unsplit);
+  m.def("dense_prefill_wmma_unsplit", &dense_prefill_wmma_unsplit,
+        py::arg("qw"), py::arg("xt"), py::arg("tok"),
+        py::arg("scales"), py::arg("cb"), py::arg("sv"),
+        py::arg("bias"), py::arg("bm"),
+        py::arg("accum_out") = c10::nullopt);
+  m.attr("SUPPORTS_UNSPLIT_ACCUM_OUT") = true;
   m.def("gemv_k5_sp16_ns1", &gemv_k5_sp16_ns1);
   m.def("situ_and_mul_htr_prologue", &situ_and_mul_htr_prologue);
   m.def("rmsnorm_htr_prologue", &rmsnorm_htr_prologue);
