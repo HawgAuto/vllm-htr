@@ -148,6 +148,11 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                 ext = get_dsa_attn()
                 if ext is not None:
                     k_fp8, k_scale = kv
+                    from .fast_ops import get_p7_attn
+                    p7 = get_p7_attn() if q.shape[0] >= 256 else None
+                    if p7 is not None:  # bit-identical; neighbouring queries share each decoded K tile
+                        fn = p7.idx_score_q4k4 if q.shape[0] >= 2048 else p7.idx_score_q2k4
+                        return fn(q, k_fp8, k_scale, weights, cu_seqlen_ks, cu_seqlen_ke)
                     return ext.fp8_mqa_logits_prefill(
                         q, k_fp8, k_scale, weights, cu_seqlen_ks, cu_seqlen_ke
                     )
