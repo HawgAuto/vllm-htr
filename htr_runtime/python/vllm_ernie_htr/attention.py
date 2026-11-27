@@ -93,6 +93,14 @@ import sys as _sys
 _USE_NATIVE_WOA = _os.environ.get("ERNIE_NATIVE_WOA", "1") == "1"
 _USE_VHA_HIP = _os.environ.get("ERNIE_VHA_HIP", "1") == "1"
 _WOA_NS = int(_os.environ.get("ERNIE_WOA_NS", "8"))
+# Prefill row thresholds (0 = stock behaviour). The native VHA and wo_a kernels are tuned for decode-sized batches; at
+# prompt sizes torch.matmul / dequant + hipBLASLt are faster. Recommended: ERNIE_VHA_MATMUL_MIN_T=16 (vha_mix_bf16 is
+# 0.010 vs 0.019 ms at T=6 but 5.1 vs 0.65 ms at T=1024), ERNIE_WOA_GROUPS_MIN_T=385 (run wo_a through the 8 per-group
+# K5 linears, which reach dequant + hipBLASLt above 384 rows with ERNIE_DENSE_PREFILL_WMMA_MAX_M=384).
+_VHA_MATMUL_MIN_T = int(_os.environ.get("ERNIE_VHA_MATMUL_MIN_T", "0"))
+_WOA_GROUPS_MIN_T = int(_os.environ.get("ERNIE_WOA_GROUPS_MIN_T", "0"))
+if _VHA_MATMUL_MIN_T or _WOA_GROUPS_MIN_T:
+    print(f"ERNIE_PREFILL_ROW_THRESHOLDS vha_matmul_min_t={_VHA_MATMUL_MIN_T} woa_groups_min_t={_WOA_GROUPS_MIN_T}", flush=True)
 _WOA_EXT = None
 _WOA_EXT_TRIED = False
 _WOA_SCRATCH: dict[str, tuple[torch.Tensor, torch.Tensor]] = {}
@@ -204,7 +212,8 @@ class VHAPostMix(nn.Module):
     def forward(self, o: torch.Tensor) -> torch.Tensor:
         if self.tp_size == 1:
             if o.dtype == torch.bfloat16 and self._m_bf16 is not None:
-                if _USE_VHA_HIP and o.is_cuda and o.dim() == 3 and o.shape[1] == 64 and (o.shape[2] % 64 == 0) and o.stride(2) == 1:
+                if (_USE_VHA_HIP and o.is_cuda and o.dim() == 3 and o.shape[1] == 64 and (o.shape[2] % 64 == 0)
+                        and o.stride(2) == 1 and not (_VHA_MATMUL_MIN_T and o.shape[0] >= _VHA_MATMUL_MIN_T)):
                     fops = get_fast_ops()
                     if fops is not None and hasattr(fops, "vha_mix_bf16"):
                         return fops.vha_mix_bf16(self._m_bf16, o)
@@ -500,6 +509,7 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
         if (
             self._woa_packed is not None
             and num_tokens > 0
+            and not (_WOA_GROUPS_MIN_T and num_tokens >= _WOA_GROUPS_MIN_T)
             and o_groups.dtype == torch.bfloat16
         ):
             ext = _woa_ext()
