@@ -1194,7 +1194,7 @@ std::vector<torch::Tensor> situ_and_mul_htr_prologue(
   const int T = (int)gate_up.size(0);
   const int D = (int)(gate_up.size(1) / 2);
   TORCH_CHECK((gate_up.size(1) == 2 * D) && (D % 128 == 0) && D <= 14336);
-  const bool use_m256 = (T >= 256 && D >= 4096);
+  const bool use_m256 = (T >= 256 && D >= 1024);
   auto xt = use_m256
       ? torch::empty({(T + 255) / 256, D / 16, 256, 16}, gate_up.options().dtype(torch::kHalf))
       : torch::empty({T, D}, gate_up.options().dtype(torch::kHalf));
@@ -1214,7 +1214,8 @@ std::vector<torch::Tensor> situ_and_mul_htr_prologue(
   const float bf = (float)beta, ibf = 1.0f / bf;
   const float lbf = (float)linear_beta, ilbf = (lbf > 0.0f) ? (1.0f / lbf) : 0.0f;
   if (use_m256) {
-    if (nb <= 4) hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    if (nb <= 2) hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<2, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    else if (nb <= 4) hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
     else if (nb <= 8) hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<8, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
     else if (nb <= 12) hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<12, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
     else hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<14, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
@@ -1365,7 +1366,7 @@ std::vector<torch::Tensor> rmsnorm_htr_prologue(
   const int T = (int)x.size(0);
   const int D = (int)x.size(1);
   TORCH_CHECK((D % 128 == 0) && D <= 8192);
-  const bool use_m256 = (T >= 256 && D >= 4096);
+  const bool use_m256 = (T >= 256 && D >= 1024);
   auto xt = use_m256
       ? torch::empty({(T + 255) / 256, D / 16, 256, 16}, x.options().dtype(torch::kHalf))
       : torch::empty({T, D}, x.options().dtype(torch::kHalf));
@@ -1383,7 +1384,8 @@ std::vector<torch::Tensor> rmsnorm_htr_prologue(
   float* xsp = use_m256 ? nullptr : xs.data_ptr<float>();
   float* tokp = tok.data_ptr<float>();
   if (use_m256) {
-    if (nb <= 4) hipLaunchKernelGGL((k_rmsnorm_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
+    if (nb <= 2) hipLaunchKernelGGL((k_rmsnorm_htr_prologue<2, 1>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
+    else if (nb <= 4) hipLaunchKernelGGL((k_rmsnorm_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
     else hipLaunchKernelGGL((k_rmsnorm_htr_prologue<8, 1>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
   } else if (nb <= 2) {
     hipLaunchKernelGGL((k_rmsnorm_htr_prologue<2, 0>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
@@ -1507,7 +1509,7 @@ std::vector<torch::Tensor> sigmoid_mul_htr_prologue(
   const int T = (int)o_in.size(0);
   const int D = (int)o_in.size(1);
   TORCH_CHECK(g_in.size(0) == T && g_in.size(1) == D && (D % 128 == 0) && D <= 8192);
-  const bool use_m256 = (T >= 256 && D >= 4096);
+  const bool use_m256 = (T >= 256 && D >= 1024);
   auto xt = use_m256
       ? torch::empty({(T + 255) / 256, D / 16, 256, 16}, o_in.options().dtype(torch::kHalf))
       : torch::empty({T, D}, o_in.options().dtype(torch::kHalf));
@@ -1525,7 +1527,8 @@ std::vector<torch::Tensor> sigmoid_mul_htr_prologue(
   float* xsp = use_m256 ? nullptr : xs.data_ptr<float>();
   float* tokp = tok.data_ptr<float>();
   if (use_m256) {
-    if (nb <= 4) hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
+    if (nb <= 2) hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<2, 1>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
+    else if (nb <= 4) hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
     else hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<8, 1>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
   } else if (nb <= 2) {
     hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<2, 0>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);

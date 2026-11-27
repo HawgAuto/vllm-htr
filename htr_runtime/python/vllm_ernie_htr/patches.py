@@ -1348,7 +1348,7 @@ def _patch_htr_linear_for_repacked_k5() -> None:
                     from .fast_ops import get_k5_sp_prefill
                     sp_ext = get_k5_sp_prefill()
                     if sp_ext is not None and hasattr(sp_ext, "dense_prefill_wmma_unsplit"):
-                        if M >= 256 and mt > 64 and qweight.shape[1] >= 256 and x2.dtype == torch.bfloat16 and hasattr(sp_ext, "prologue_b16_m256"):
+                        if M >= 256 and mt >= 64 and qweight.shape[1] >= 64 and x2.dtype == torch.bfloat16 and hasattr(sp_ext, "prologue_b16_m256"):
                             xt, tok = sp_ext.prologue_b16_m256(x2, su)
                             return sp_ext.dense_prefill_wmma_unsplit(
                                 qweight, xt, tok, scales, float(htr_ops.CB), sv, bias, 256
@@ -1402,7 +1402,7 @@ def _patch_htr_linear_for_repacked_k5() -> None:
         from .fast_ops import get_k5_sp_prefill
         sp_ext = get_k5_sp_prefill()
         x_in = x2 if x2.dtype == torch.bfloat16 else x2.to(torch.bfloat16)
-        if M >= 256 and mt > 64 and nt >= 256 and hasattr(sp_ext, "prologue_b16_m256"):
+        if M >= 256 and mt >= 64 and nt >= 64 and hasattr(sp_ext, "prologue_b16_m256"):
             xt, tok = sp_ext.prologue_b16_m256(x_in, su)
             y = sp_ext.dense_prefill_wmma_sp16(p16, p4, xt, tok, scales, float(htr_ops.CB), sv, bias, 256)
         else:
