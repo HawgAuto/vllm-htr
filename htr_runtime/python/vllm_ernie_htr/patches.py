@@ -368,9 +368,14 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                     sink_arg = None if attn_sink is None else attn_sink[:H].contiguous()
                     tl_arg = None if topk_length is None else topk_length.to(torch.int32).contiguous()
                     idx_arg = indices.to(torch.int32).contiguous() if (indices.dtype != torch.int32 or indices.stride(-1) != 1) else indices
-                    ext.hca_prefill(
-                        q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale)
-                    )
+                    from .fast_ops import get_p7_attn
+                    p7 = get_p7_attn() if (T > 16 and H <= 64) else None
+                    if p7 is not None:  # ERNIE_P7_ATTN=1: bit-identical to ext.hca_prefill's T > 16 path
+                        p7.hca_prefill_v4(q, kv, idx_arg, tl_arg, sink_arg, output, float(scale))
+                    else:
+                        ext.hca_prefill(
+                            q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale)
+                        )
                     return output
             return orig_pref_attn(
                 q=q, kv=kv, indices=indices, scale=scale, head_dim=head_dim,

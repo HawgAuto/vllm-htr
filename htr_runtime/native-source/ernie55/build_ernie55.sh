@@ -18,6 +18,7 @@ hipcc $COMMON "$SRC_DIR/ernie_fast_ops.hip" -o "$OUT_DIR/ernie_fast_ops.so" &
 hipcc $COMMON "$SRC_DIR/ernie_hca_attn.hip" -o "$OUT_DIR/ernie_hca_attn.so" &
 hipcc $COMMON "$SRC_DIR/ernie_dsa_attn.hip" -o "$OUT_DIR/ernie_dsa_attn.so" &
 hipcc $COMMON "$SRC_DIR/ernie_k5_sp_prefill.hip" -o "$OUT_DIR/ernie_k5_sp_prefill.so" &
+hipcc $COMMON "$SRC_DIR/ernie_p7_attn.hip" -o "$OUT_DIR/ernie_p7_attn.so" &
 wait
 
 echo "Auditing gfx1151 ISA (VGPRs, spills, divOps)..."
@@ -26,7 +27,7 @@ import os, re, subprocess, sys
 out_dir = sys.argv[1]
 libs = [
     "htr_moe_ernie.so", "hpf5_ernie.so", "htr_wo_a_ernie.so", "mhc_ernie.so",
-    "ernie_fast_ops.so", "ernie_hca_attn.so", "ernie_dsa_attn.so", "ernie_k5_sp_prefill.so",
+    "ernie_fast_ops.so", "ernie_hca_attn.so", "ernie_dsa_attn.so", "ernie_k5_sp_prefill.so", "ernie_p7_attn.so",
 ]
 total_k = 0
 for so in libs:

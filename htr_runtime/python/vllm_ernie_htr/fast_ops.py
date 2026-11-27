@@ -72,6 +72,27 @@ def get_dsa_attn():
     return _DSA_EXT
 
 
+_P7_ATTN = None
+_P7_ATTN_TRIED = False
+
+
+def get_p7_attn():
+    """Opt-in (ERNIE_P7_ATTN=1) HCA / DSA sparse-prefill kernels from ernie_p7_attn.so; bit-identical to the
+    ernie_hca_attn T > 16 path and the ernie_dsa_attn fp8_ds_mla single-pass path. None when off or unavailable."""
+    global _P7_ATTN, _P7_ATTN_TRIED
+    if not _P7_ATTN_TRIED:
+        _P7_ATTN_TRIED = True
+        if os.environ.get("ERNIE_P7_ATTN", "0") == "1":
+            _add_search_paths("ernie_p7_attn.so")
+            try:
+                import ernie_p7_attn
+                _P7_ATTN = ernie_p7_attn
+                print(f"ERNIE_P7_ATTN_ACTIVE {ernie_p7_attn.__file__}", flush=True)
+            except Exception as exc:
+                print(f"ERNIE_P7_ATTN_FAILED {exc!r}", flush=True)
+    return _P7_ATTN
+
+
 def get_hca_attn():
     global _HCA_EXT, _HCA_TRIED
     if not _USE_HCA_ATTN:

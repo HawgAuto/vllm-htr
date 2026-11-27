@@ -79,7 +79,7 @@ from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from htr import ops as htr_ops
 from htr import wire as htr_wire
-from .fast_ops import get_dsa_attn, get_fast_ops, get_split_kv_scratch
+from .fast_ops import get_dsa_attn, get_fast_ops, get_p7_attn, get_split_kv_scratch
 
 logger = init_logger(__name__)
 
@@ -1204,9 +1204,13 @@ class Ernie5_5ROCmSparseMLAImpl(MLAAttentionImpl[Ernie5_5ROCmSparseMLAMetadata])
                     q_abs, kv_cache, global_idx, self.sinks, self.scale, po, pm, pl, 8, kv_fmt
                 )
             else:
-                attn_latent = dsa_ext.dsa_sparse_mla_quant(
-                    q_abs, kv_cache, global_idx, self.sinks, self.scale, None, None, None, 1, kv_fmt
-                )
+                p7 = get_p7_attn() if kv_fmt == 1 else None
+                if p7 is not None:  # ERNIE_P7_ATTN=1: bit-identical to dsa_sparse_mla_quant's single-pass path
+                    attn_latent = p7.dsa_prefill_v4q(q_abs, kv_cache, global_idx, self.sinks, self.scale, kv_fmt)
+                else:
+                    attn_latent = dsa_ext.dsa_sparse_mla_quant(
+                        q_abs, kv_cache, global_idx, self.sinks, self.scale, None, None, None, 1, kv_fmt
+                    )
         else:
             row_stride = kv_cache.stride(1)
             assert kv_cache.stride(0) % row_stride == 0, (kv_cache.shape, kv_cache.stride())
