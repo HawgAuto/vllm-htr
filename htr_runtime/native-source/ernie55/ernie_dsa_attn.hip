@@ -2448,13 +2448,17 @@ __global__ __launch_bounds__(256) void k_ernie_dsa_sparse_mla_quant_qreg_v28(
 //   -> V=186 (NVFP4) / V=188 (FP8), vSp=0, sSp=0, scr=0, LDS<=63.0 KiB -> 2 WGs/WGP = 32 waves/WGP (+33% occ!)
 //   -> 1.206x (-90 ms) NVFP4, 1.240x (-107 ms) FP8 at T=4096 W=2048 (6L), 0.000000e+00 bit-exact!
 // ============================================================================
-template <int KV_FMT>
+template <int KV_FMT, int NUM_SPLITS = 1>
 __global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8, 8)))
 void k_ernie_dsa_sparse_mla_quant_512_v28(
     const uint16_t* __restrict__ q_ptr,
     const uint8_t* __restrict__ kv_ptr,
     const int32_t* __restrict__ idx_ptr,
+    const float* __restrict__ sink_ptr,
     uint16_t* __restrict__ out_ptr,
+    float* __restrict__ part_o,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
     int64_t q_s0, int64_t q_s1,
     int64_t kv_blk_stride, int64_t kv_row_stride,
     int64_t idx_s0, int64_t out_s0, int64_t out_s1,
@@ -2525,6 +2529,10 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
   const int kr_ld = tid >> 5;
   const int mb32  = tid & 31;
   const int total_blks = (W + 15) >> 4;
+  const int sp = (NUM_SPLITS > 1) ? (int)blockIdx.y : 0;
+  const int blk_chunk = (NUM_SPLITS > 1) ? ((total_blks + NUM_SPLITS - 1) / NUM_SPLITS) : total_blks;
+  const int blk_lo = (NUM_SPLITS > 1) ? (sp * blk_chunk) : 0;
+  const int blk_hi = (NUM_SPLITS > 1) ? min(blk_lo + blk_chunk, total_blks) : total_blks;
 
   struct RawKV16 {
     u4v raw_fp8;
@@ -2567,11 +2575,11 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
   };
 
   RawKV16 cur_raw;
-  if (total_blks > 0) prefetch_raw(0, cur_raw);
+  if (blk_lo < blk_hi) prefetch_raw(blk_lo, cur_raw);
   __syncthreads();
 
 #pragma unroll 1
-  for (int blk = 0; blk < total_blks; ++blk) {
+  for (int blk = blk_lo; blk < blk_hi; ++blk) {
     uint32_t pk_hold[8];
     if (cur_raw.sc_vld) {
       if constexpr (KV_FMT == 1) {
@@ -2663,7 +2671,7 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
         vt_dst[(p * 2 + 1) * DSA_VT_STRIDE] = (uint16_t)(pk_hold[p] >> 16);
       }
     }
-    if (blk + 1 < total_blks) {
+    if (blk + 1 < blk_hi) {
       prefetch_raw(blk + 1, cur_raw);
     }
     __builtin_amdgcn_sched_barrier(0);
@@ -2725,16 +2733,44 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
     __syncthreads();
   }
 
+  if constexpr (NUM_SPLITS > 1) {
+    if (wd == 0 && l16 == 0) {
 #pragma unroll
-  for (int ei = 0; ei < 8; ++ei) {
-    const int hm = 2 * ei + hrow;
-    const int h_loc = wh * 16 + hm;
-    const float lv = s_l[h_loc];
-    const float inv_l = (lv > 0.0f) ? __builtin_amdgcn_rcpf(lv) : 0.0f;
-    uint16_t* dst = out_ptr + (int64_t)t * out_s0 + (int64_t)(h0 + hm) * out_s1 + vd_start + l16;
+      for (int ei = 0; ei < 8; ++ei) {
+        const int h = h0 + 2 * ei + hrow;
+        const int64_t off = ((int64_t)t * 64 + h) * NUM_SPLITS + sp;
+        part_m[off] = s_m[h];
+        part_l[off] = s_l[h];
+      }
+    }
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-      dst[j * 16] = f32_to_bf16_rne(o_acc[j][ei] * inv_l);
+    for (int ei = 0; ei < 8; ++ei) {
+      const int h = h0 + 2 * ei + hrow;
+      float* dst = part_o + (((int64_t)t * 64 + h) * NUM_SPLITS + sp) * DSA_NOPE + vd_start + l16;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) dst[j * 16] = o_acc[j][ei];
+    }
+  } else {
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      const int hm = 2 * ei + hrow;
+      const int h_loc = wh * 16 + hm;
+      const float lv = s_l[h_loc];
+      float inv_l = (lv > 0.0f) ? __builtin_amdgcn_rcpf(lv) : 0.0f;
+      if (sink_ptr != nullptr) {
+        const float sk = sink_ptr[h_loc];
+        const float mv = s_m[h_loc];
+        const float m_fin = fmaxf(mv, sk);
+        const float w_o = (lv > 0.0f) ? exp2f((mv - m_fin) * LOG2E) : 0.0f;
+        const float w_s = exp2f((sk - m_fin) * LOG2E);
+        const float l_tot = lv * w_o + w_s;
+        inv_l = (l_tot > 0.0f) ? (__builtin_amdgcn_rcpf(l_tot) * w_o) : 0.0f;
+      }
+      uint16_t* dst = out_ptr + (int64_t)t * out_s0 + (int64_t)(h0 + hm) * out_s1 + vd_start + l16;
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        dst[j * 16] = f32_to_bf16_rne(o_acc[j][ei] * inv_l);
+      }
     }
   }
 }
@@ -2766,14 +2802,16 @@ torch::Tensor ernie_dsa_sparse_mla_quant(
 
   if (num_splits <= 1 || W <= 32) {
     if (T >= 32) {
-      if (block_size == 64 && !attn_sink.has_value()) {
+      if (block_size == 64) {
         if (kv_fmt == 1) {
-          hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_512_v28<1>), dim3(T, 1, 1), dim3(512), 0, st,
-              qp, kvp, ip, op, q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+          hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_512_v28<1, 1>), dim3(T, 1, 1), dim3(512), 0, st,
+              qp, kvp, ip, sp, op, nullptr, nullptr, nullptr,
+              q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
               indices.stride(0), out.stride(0), out.stride(1), num_blocks, block_size, W, (float)scale);
         } else {
-          hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_512_v28<2>), dim3(T, 1, 1), dim3(512), 0, st,
-              qp, kvp, ip, op, q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+          hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_512_v28<2, 1>), dim3(T, 1, 1), dim3(512), 0, st,
+              qp, kvp, ip, sp, op, nullptr, nullptr, nullptr,
+              q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
               indices.stride(0), out.stride(0), out.stride(1), num_blocks, block_size, W, (float)scale);
         }
         return out;
@@ -2823,6 +2861,41 @@ torch::Tensor ernie_dsa_sparse_mla_quant(
                          num_blocks, block_size, W, (float)scale);
     }
   } else {
+    auto launch_512_split = [&](auto tag) {
+      constexpr int SX = decltype(tag)::value;
+      torch::Tensor po = (part_o_opt.has_value() && part_o_opt->numel() >= (int64_t)T * 64 * SX * DSA_NOPE)
+          ? *part_o_opt : torch::empty({T, 64, SX, DSA_NOPE}, q.options().dtype(torch::kFloat32));
+      torch::Tensor pm = (part_m_opt.has_value() && part_m_opt->numel() >= (int64_t)T * 64 * SX)
+          ? *part_m_opt : torch::empty({T, 64, SX}, q.options().dtype(torch::kFloat32));
+      torch::Tensor pl = (part_l_opt.has_value() && part_l_opt->numel() >= (int64_t)T * 64 * SX)
+          ? *part_l_opt : torch::empty({T, 64, SX}, q.options().dtype(torch::kFloat32));
+      if (kv_fmt == 1) {
+        hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_512_v28<1, SX>), dim3(T, SX, 1), dim3(512), 0, st,
+            qp, kvp, ip, sp, op, po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
+            q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+            indices.stride(0), out.stride(0), out.stride(1), num_blocks, block_size, W, (float)scale);
+      } else {
+        hipLaunchKernelGGL((k_ernie_dsa_sparse_mla_quant_512_v28<2, SX>), dim3(T, SX, 1), dim3(512), 0, st,
+            qp, kvp, ip, sp, op, po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(),
+            q.stride(0), q.stride(1), kv_cache.stride(0), kv_cache.stride(1),
+            indices.stride(0), out.stride(0), out.stride(1), num_blocks, block_size, W, (float)scale);
+      }
+      hipLaunchKernelGGL((k_ernie_dsa_split_reduce<SX>), dim3(T, 64), dim3(128), 0, st,
+                         po.data_ptr<float>(), pm.data_ptr<float>(), pl.data_ptr<float>(), sp, op,
+                         out.stride(0), out.stride(1));
+    };
+    if (block_size == 64) {
+      // Strix Halo 20-WGP (40 WG slots at 2 WGs/WGP) optimal split-K schedule:
+      // T<=2: S=16 fills 16-32 WGPs (2.0-2.2x); T=5..8 & 15..20: S=4 avoids 40-WG wave tail (1.53-2.12x); else S=8 (1.7-2.1x)
+      if (T <= 2 && W >= 256 && (!part_o_opt.has_value() || part_o_opt->numel() >= (int64_t)T * 64 * 16 * DSA_NOPE)) {
+        launch_512_split(std::integral_constant<int, 16>{});
+      } else if ((T >= 5 && T <= 8) || (T >= 15 && T <= 20)) {
+        launch_512_split(std::integral_constant<int, 4>{});
+      } else {
+        launch_512_split(std::integral_constant<int, 8>{});
+      }
+      return out;
+    }
     constexpr int S = 8;
     torch::Tensor po = part_o_opt.has_value() ? *part_o_opt : torch::empty({T, 64, S, DSA_NOPE}, q.options().dtype(torch::kFloat32));
     torch::Tensor pm = part_m_opt.has_value() ? *part_m_opt : torch::empty({T, 64, S}, q.options().dtype(torch::kFloat32));

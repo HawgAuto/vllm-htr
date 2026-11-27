@@ -107,7 +107,7 @@ _DSA_SPLIT_SCRATCH: dict[str, tuple[torch.Tensor, torch.Tensor, torch.Tensor]] =
 
 
 def _dsa_split_scratch(dev: torch.device, T: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    return get_split_kv_scratch(dev, T, H=64, S=8, D=512)
+    return get_split_kv_scratch(dev, T, H=64, S=16 if T <= 2 else 8, D=512)
 
 
 def _woa_ext():
