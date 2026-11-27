@@ -445,7 +445,7 @@ class Ernie5_5HCAAttention(DeepseekV4ROCMAiterMLAAttention):
         sc = torch.stack([g.htr_scales.data for g in self.wo_a_groups], dim=0).contiguous()
         su = torch.stack([g.htr_su.data for g in self.wo_a_groups], dim=0).contiguous()
         sv = torch.stack([g.htr_sv.data for g in self.wo_a_groups], dim=0).contiguous()
-        if _os.environ.get("ERNIE_WOA_SP16", "0") == "1" and hasattr(ext, "repack_wo_a_sp16") and qw.is_cuda:
+        if _os.environ.get("ERNIE_WOA_SP16", "1") == "1" and hasattr(ext, "repack_wo_a_sp16") and qw.is_cuda:
             qw = ext.repack_wo_a_sp16(qw)
             self._woa_sp16 = True
         # Rebind each group's parameters to slices of the stacked buffer (zero duplicate VRAM!)
