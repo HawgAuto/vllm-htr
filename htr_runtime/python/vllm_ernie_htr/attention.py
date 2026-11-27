@@ -932,10 +932,8 @@ class Ernie5_5IndexerROCm(nn.Module):
         else:
             q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        if use_nt and T <= 8 and self.wk_weights_proj.weight.dtype == torch.bfloat16 and (hidden_states.shape[1] % 256) == 0:
-            kw = fops.bf16_gemv_nt(hidden_states.contiguous(), self.wk_weights_proj.weight, True)
-        else:
-            kw, _ = self.wk_weights_proj(hidden_states)
+        # Wave 30/33: small-N (192x4096) F.linear hits 218 GB/s vs bf16_gemv_nt 140 GB/s
+        kw, _ = self.wk_weights_proj(hidden_states)
         k, weights = kw.split([self.head_dim, self.n_head], dim=-1)
         cs = getattr(self.rotary_emb, "cos_sin_cache", None)
         if (
@@ -1588,19 +1586,8 @@ class Ernie5_5DSAAttention(nn.Module):
         num_tokens = hidden_states.shape[0]
         q_c = self.q_a_layernorm(self.q_a_proj(hidden_states))
         fops = get_fast_ops()
-        if (
-            1 <= num_tokens <= 8
-            and _os.environ.get("ERNIE_BF16_GEMV_NT", "1") == "1"
-            and fops is not None
-            and hasattr(fops, "bf16_gemv_nt")
-            and hidden_states.is_cuda
-            and hidden_states.dtype == torch.bfloat16
-            and self.kv_a_proj_with_mqa.weight.dtype == torch.bfloat16
-            and (hidden_states.shape[1] % 256) == 0
-        ):
-            kv_lora = fops.bf16_gemv_nt(hidden_states.contiguous(), self.kv_a_proj_with_mqa.weight, True)
-        else:
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)
+        # Wave 30/33: small-N (576x4096) F.linear hits 218 GB/s vs bf16_gemv_nt 140 GB/s
+        kv_lora = self.kv_a_proj_with_mqa(hidden_states)
         o_gate_raw = self.o_gate(q_c)
         q = self.q_b_proj(q_c)[0].view(-1, self.num_local_heads, self.qk_head_dim)
         kv_c, k_pe = kv_lora.split([self.kv_lora_rank, self.qk_rope_head_dim], -1)

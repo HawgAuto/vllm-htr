@@ -3258,6 +3258,324 @@ __global__ __launch_bounds__(NWAVES * 32, 4) void k_bmm_q_uk_cat_pe_bf16_decode(
   }
 }
 
+
+// ============================================================================
+// Wave 33: Single-Pass 64x256 DSA BMMs (BK=64, 32-bank XOR swizzle, GL2-swizzled UV_PROJ)
+//   - k_bmm_uv_bf16_64x256_swz<1, 1, 8, 8>: reads attn_lat ONCE (eliminates 1.61 GB/6L duplicate reads!),
+//     8-head x 8-mt GL2 swizzle pins 2 MiB w_uv in 4 MiB GL2 (0 TLB thrash), NT_A=1 + NT_O=1 -> 1.21x (-5.3..-6.0ms/4K, 0.0 parity!)
+//   - k_bmm_q_uk_cat_pe_singleq_64x256_swz<1, 0, 1, 1>: reads q_nope ONCE into Q_lds, only 2 nb passes x 3 K-steps (6 barriers vs 48!)
+//     -> 1.20x (-3.7..-4.1ms/4K, 0.0 parity!)
+// ============================================================================
+__device__ __forceinline__ int bmm_sw32(int row, int col4) { return ((col4 ^ (row & 7)) << 2); }
+
+template <int GH, int GM>
+__device__ __forceinline__ void bmm_swizzle_hm(int H, int mt, int& h, int& m_blk) {
+  if constexpr (GM <= 1) {
+    h = blockIdx.x;
+    m_blk = blockIdx.y;
+  } else {
+    const int lin = blockIdx.y * H + blockIdx.x;
+    const int mg = lin / (H * GM);
+    const int rem_m = lin - mg * (H * GM);
+    const int m_cnt = min(GM, mt - mg * GM);
+    const int hg = rem_m / (GH * m_cnt);
+    const int rem_h = rem_m - hg * (GH * m_cnt);
+    const int h_cnt = min(GH, H - hg * GH);
+    const int loc_m = rem_h / h_cnt;
+    const int loc_h = rem_h - loc_m * h_cnt;
+    h = hg * GH + loc_h;
+    m_blk = mg * GM + loc_m;
+  }
+}
+
+template <int NT_A, int NT_O, int GH, int GM>
+__global__ __launch_bounds__(256, 2) void k_bmm_uv_bf16_64x256_swz(
+    const uint16_t* __restrict__ attn_lat,
+    const uint16_t* __restrict__ w_uv_rm,
+    uint16_t* __restrict__ out,
+    int64_t a_s0, int64_t a_s1,
+    int64_t w_s0, int64_t w_s1,
+    int64_t o_s0, int64_t o_s1,
+    int T, int H, int mt) {
+  __shared__ __attribute__((aligned(16))) union {
+    struct {
+      uint32_t A[64][32];    // 8 KiB
+      uint32_t W[256][32];   // 32 KiB
+    } stage;                 // 40 KiB -> 3 WGs/WGP!
+    uint16_t E[32][256];     // 16 KiB
+  } smem;
+
+  int h, m_blk;
+  bmm_swizzle_hm<GH, GM>(H, mt, h, m_blk);
+  const int t0 = m_blk * 64;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int wm = wave >> 2;
+  const int wn = wave & 3;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+  const int r_loc = tid >> 3;
+  const int c4 = tid & 7;
+  const int c8 = c4 * 8;
+
+  const uint16_t* a_head = attn_lat + (int64_t)h * a_s1 + c8;
+  const uint16_t* w_head = w_uv_rm  + (int64_t)h * w_s0 + c8;
+
+  auto load_tile = [&](int k0, u4v_q ar[2], u4v_q wr[8]) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int ta = t0 + i * 32 + r_loc;
+      if (ta < T) {
+        const u4va_q* pa = reinterpret_cast<const u4va_q*>(a_head + (int64_t)ta * a_s0 + k0);
+        ar[i] = NT_A ? __builtin_nontemporal_load(pa) : *pa;
+      } else {
+        ar[i] = (u4v_q){0u, 0u, 0u, 0u};
+      }
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      wr[i] = *reinterpret_cast<const u4va_q*>(w_head + (int64_t)(i * 32 + r_loc) * w_s1 + k0);
+    }
+  };
+  auto store_tile = [&](const u4v_q ar[2], const u4v_q wr[8]) {
+#pragma unroll
+    for (int i = 0; i < 2; ++i) {
+      const int rr = i * 32 + r_loc;
+      *reinterpret_cast<u4va_q*>(&smem.stage.A[rr][bmm_sw32(rr, c4)]) = ar[i];
+    }
+#pragma unroll
+    for (int i = 0; i < 8; ++i) {
+      const int rr = i * 32 + r_loc;
+      *reinterpret_cast<u4va_q*>(&smem.stage.W[rr][bmm_sw32(rr, c4)]) = wr[i];
+    }
+  };
+
+  f32x8_q acc[2][4];
+#pragma unroll
+  for (int m = 0; m < 2; ++m)
+#pragma unroll
+    for (int n = 0; n < 4; ++n) acc[m][n] = (f32x8_q){0,0,0,0,0,0,0,0};
+
+  u4v_q a_cur[2], w_cur[8], a_nxt[2], w_nxt[8];
+  load_tile(0, a_cur, w_cur);
+
+#pragma unroll 1
+  for (int k0 = 0; k0 < 512; k0 += 64) {
+    store_tile(a_cur, w_cur);
+    __syncthreads();
+    if (k0 + 64 < 512) load_tile(k0 + 64, a_nxt, w_nxt);
+
+#pragma unroll
+    for (int ks = 0; ks < 4; ++ks) {
+      const int c_lo = ks * 2, c_hi = ks * 2 + 1;
+      bf16x16_q af[2];
+#pragma unroll
+      for (int m = 0; m < 2; ++m) {
+        const int ar = wm * 32 + m * 16 + l16;
+        const u4v_q a0 = *reinterpret_cast<const u4va_q*>(&smem.stage.A[ar][bmm_sw32(ar, c_lo)]);
+        const u4v_q a1 = *reinterpret_cast<const u4va_q*>(&smem.stage.A[ar][bmm_sw32(ar, c_hi)]);
+        af[m] = __builtin_bit_cast(bf16x16_q, (u8v_q){a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w});
+      }
+#pragma unroll
+      for (int n = 0; n < 4; ++n) {
+        const int wr = wn * 64 + n * 16 + l16;
+        const u4v_q b0 = *reinterpret_cast<const u4va_q*>(&smem.stage.W[wr][bmm_sw32(wr, c_lo)]);
+        const u4v_q b1 = *reinterpret_cast<const u4va_q*>(&smem.stage.W[wr][bmm_sw32(wr, c_hi)]);
+        const bf16x16_q bf = __builtin_bit_cast(bf16x16_q, (u8v_q){b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w});
+        acc[0][n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[0], bf, acc[0][n]);
+        acc[1][n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[1], bf, acc[1][n]);
+        __builtin_amdgcn_sched_barrier(0);
+      }
+    }
+    if (k0 + 64 < 512) {
+      __syncthreads();
+#pragma unroll
+      for (int i = 0; i < 2; ++i) a_cur[i] = a_nxt[i];
+#pragma unroll
+      for (int i = 0; i < 8; ++i) w_cur[i] = w_nxt[i];
+    }
+  }
+
+  uint16_t* o_head = out + (int64_t)h * o_s1;
+#pragma unroll 1
+  for (int hf = 0; hf < 2; ++hf) {
+    __syncthreads();
+    if (wm == hf) {
+#pragma unroll
+      for (int m = 0; m < 2; ++m) {
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+          const int col = wn * 64 + n * 16 + l16;
+#pragma unroll
+          for (int ei = 0; ei < 8; ++ei) {
+            smem.E[m * 16 + 2 * ei + hrow][col] = quk_f32_to_bf16_rne(acc[m][n][ei]);
+          }
+        }
+      }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int ri = 0; ri < 4; ++ri) {
+      const int rl = wave * 4 + ri;
+      const int t = t0 + hf * 32 + rl;
+      if (t < T) {
+        const u4v_q v = *reinterpret_cast<const u4va_q*>(&smem.E[rl][lane * 8]);
+        u4va_q* dst = reinterpret_cast<u4va_q*>(o_head + (int64_t)t * o_s0 + lane * 8);
+        if constexpr (NT_O) __builtin_nontemporal_store(v, dst);
+        else *dst = v;
+      }
+    }
+  }
+}
+
+template <int NT_A, int NT_O, int GH, int GM>
+__global__ __launch_bounds__(256, 2) void k_bmm_q_uk_cat_pe_singleq_64x256_swz(
+    const uint16_t* __restrict__ q_nope,
+    const uint16_t* __restrict__ w_uk_rm,
+    const uint16_t* __restrict__ q_pe,
+    uint16_t* __restrict__ q_full,
+    int64_t qn_s0, int64_t qn_s1,
+    int64_t w_s0,  int64_t w_s1,
+    int64_t qp_s0, int64_t qp_s1,
+    int64_t qf_s0, int64_t qf_s1,
+    int T, int H, int mt) {
+  __shared__ __attribute__((aligned(16))) uint32_t Q_lds[64][96];
+  __shared__ __attribute__((aligned(16))) union {
+    uint32_t W[256][32];
+    uint16_t E[32][256];
+  } smem;
+
+  int h, m_blk;
+  bmm_swizzle_hm<GH, GM>(H, mt, h, m_blk);
+  const int t0 = m_blk * 64;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int wm = wave >> 2;
+  const int wn = wave & 3;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+  const int r32 = tid >> 3;
+  const int c4  = tid & 7;
+  const int c8  = c4 * 8;
+
+#pragma unroll
+  for (int rh = 0; rh < 2; ++rh) {
+    const int qr = rh * 32 + r32;
+    const int t = t0 + qr;
+    const int sw = bmm_sw32(qr, c4);
+    if (t < T) {
+      const uint16_t* rowp = q_nope + (int64_t)t * qn_s0 + (int64_t)h * qn_s1 + c8;
+#pragma unroll
+      for (int cc = 0; cc < 3; ++cc) {
+        const u4va_q* src = reinterpret_cast<const u4va_q*>(rowp + cc * 64);
+        *reinterpret_cast<u4va_q*>(&Q_lds[qr][cc * 32 + sw]) = NT_A ? __builtin_nontemporal_load(src) : *src;
+      }
+      const u4va_q* ps = reinterpret_cast<const u4va_q*>(q_pe + (int64_t)t * qp_s0 + (int64_t)h * qp_s1 + c8);
+      const u4v_q pv = NT_A ? __builtin_nontemporal_load(ps) : *ps;
+      u4va_q* pd = reinterpret_cast<u4va_q*>(q_full + (int64_t)t * qf_s0 + (int64_t)h * qf_s1 + 512 + c8);
+      if constexpr (NT_O) __builtin_nontemporal_store(pv, pd); else *pd = pv;
+    } else {
+      const u4v_q z = {0u, 0u, 0u, 0u};
+#pragma unroll
+      for (int cc = 0; cc < 3; ++cc) *reinterpret_cast<u4va_q*>(&Q_lds[qr][cc * 32 + sw]) = z;
+    }
+  }
+
+  const uint16_t* w_head = w_uk_rm + (int64_t)h * w_s0 + c8;
+  uint16_t* o_head = q_full + (int64_t)h * qf_s1;
+
+#pragma unroll 1
+  for (int nb = 0; nb < 2; ++nb) {
+    const int n0 = nb * 256;
+    f32x8_q acc[2][4];
+#pragma unroll
+    for (int m = 0; m < 2; ++m)
+#pragma unroll
+      for (int n = 0; n < 4; ++n) acc[m][n] = (f32x8_q){0,0,0,0,0,0,0,0};
+
+    u4v_q w_cur[8], w_nxt[8];
+#pragma unroll
+    for (int i = 0; i < 8; ++i)
+      w_cur[i] = *reinterpret_cast<const u4va_q*>(w_head + (int64_t)(n0 + i * 32 + r32) * w_s1 + 0);
+
+#pragma unroll 1
+    for (int cc = 0; cc < 3; ++cc) {
+#pragma unroll
+      for (int i = 0; i < 8; ++i) {
+        const int rr = i * 32 + r32;
+        *reinterpret_cast<u4va_q*>(&smem.W[rr][bmm_sw32(rr, c4)]) = w_cur[i];
+      }
+      __syncthreads();
+      if (cc < 2) {
+#pragma unroll
+        for (int i = 0; i < 8; ++i)
+          w_nxt[i] = *reinterpret_cast<const u4va_q*>(w_head + (int64_t)(n0 + i * 32 + r32) * w_s1 + (cc + 1) * 64);
+      }
+
+#pragma unroll
+      for (int ks = 0; ks < 4; ++ks) {
+        const int c_lo = ks * 2, c_hi = ks * 2 + 1;
+        bf16x16_q af[2];
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+          const int ar = wm * 32 + m * 16 + l16;
+          const u4v_q a0 = *reinterpret_cast<const u4va_q*>(&Q_lds[ar][cc * 32 + bmm_sw32(ar, c_lo)]);
+          const u4v_q a1 = *reinterpret_cast<const u4va_q*>(&Q_lds[ar][cc * 32 + bmm_sw32(ar, c_hi)]);
+          af[m] = __builtin_bit_cast(bf16x16_q, (u8v_q){a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w});
+        }
+#pragma unroll
+        for (int n = 0; n < 4; ++n) {
+          const int wr = wn * 64 + n * 16 + l16;
+          const u4v_q b0 = *reinterpret_cast<const u4va_q*>(&smem.W[wr][bmm_sw32(wr, c_lo)]);
+          const u4v_q b1 = *reinterpret_cast<const u4va_q*>(&smem.W[wr][bmm_sw32(wr, c_hi)]);
+          const bf16x16_q bf = __builtin_bit_cast(bf16x16_q, (u8v_q){b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w});
+          acc[0][n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[0], bf, acc[0][n]);
+          acc[1][n] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[1], bf, acc[1][n]);
+          __builtin_amdgcn_sched_barrier(0);
+        }
+      }
+      if (cc < 2) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < 8; ++i) w_cur[i] = w_nxt[i];
+      }
+    }
+
+#pragma unroll 1
+    for (int hf = 0; hf < 2; ++hf) {
+      __syncthreads();
+      if (wm == hf) {
+#pragma unroll
+        for (int m = 0; m < 2; ++m) {
+#pragma unroll
+          for (int n = 0; n < 4; ++n) {
+            const int col = wn * 64 + n * 16 + l16;
+#pragma unroll
+            for (int ei = 0; ei < 8; ++ei) {
+              smem.E[m * 16 + 2 * ei + hrow][col] = quk_f32_to_bf16_rne(acc[m][n][ei]);
+            }
+          }
+        }
+      }
+      __syncthreads();
+#pragma unroll
+      for (int ri = 0; ri < 4; ++ri) {
+        const int rl = wave * 4 + ri;
+        const int t = t0 + hf * 32 + rl;
+        if (t < T) {
+          const u4v_q v = *reinterpret_cast<const u4va_q*>(&smem.E[rl][lane * 8]);
+          u4va_q* dst = reinterpret_cast<u4va_q*>(o_head + (int64_t)t * qf_s0 + n0 + lane * 8);
+          if constexpr (NT_O) __builtin_nontemporal_store(v, dst);
+          else *dst = v;
+        }
+      }
+    }
+    if (nb == 0) __syncthreads();
+  }
+}
+
 torch::Tensor bmm_q_uk_cat_pe_bf16(
     torch::Tensor q_nope, torch::Tensor w_uk_rm, torch::Tensor q_pe) {
   const int D = (int)q_nope.size(2);
@@ -3310,16 +3628,16 @@ torch::Tensor bmm_q_uk_cat_pe_bf16(
           qn_p, w_p, qp_p, qf_p, q_nope.stride(0), q_nope.stride(1),
           w_uk_rm.stride(0), w_uk_rm.stride(1), q_pe.stride(0), q_pe.stride(1),
           q_full.stride(0), q_full.stride(1), T);
-    } else if (T <= 768) {
+    } else if (T < 512) {
       hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_bf16_bk64_192<0, 1>), dim3(H, mt), dim3(256), 0, st,
           qn_p, w_p, qp_p, qf_p, q_nope.stride(0), q_nope.stride(1),
           w_uk_rm.stride(0), w_uk_rm.stride(1), q_pe.stride(0), q_pe.stride(1),
           q_full.stride(0), q_full.stride(1), T);
     } else {
-      hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_bf16_singleq<192, 1, 0>), dim3(H, mt), dim3(256), 0, st,
+      hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_singleq_64x256_swz<1, 0, 1, 1>), dim3(H, mt), dim3(256), 0, st,
           qn_p, w_p, qp_p, qf_p, q_nope.stride(0), q_nope.stride(1),
           w_uk_rm.stride(0), w_uk_rm.stride(1), q_pe.stride(0), q_pe.stride(1),
-          q_full.stride(0), q_full.stride(1), T);
+          q_full.stride(0), q_full.stride(1), T, H, mt);
     }
   }
   return q_full;
@@ -3553,11 +3871,22 @@ void bmm_uv_bf16(
     hipLaunchKernelGGL((k_bmm_uv_bf16_v3<1, 1, 1>), dim3(H, mt, 1), dim3(256), 0, st,
         a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
         w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T);
-  } else {
-    // Empirically optimal gfx1151 policy for D_V=256: L2_C (NT_A=0, NT_O=1, NB_ITERS=2 -> 1.70-1.86x!)
-    hipLaunchKernelGGL((k_bmm_uv_bf16_v3<0, 1, 2>), dim3(H, mt, 1), dim3(256), 0, st,
+  } else if (T >= 512 && H >= 8 && (H % 8) == 0) {
+    // Wave 33: Single-pass 64x256 BK=64 with 8-head x 8-mt GL2 swizzle + NT_A=1 + NT_O=1 (1.21x vs v3, 0.0 parity!)
+    hipLaunchKernelGGL((k_bmm_uv_bf16_64x256_swz<1, 1, 8, 8>), dim3(H, mt, 1), dim3(256), 0, st,
         a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
-        w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T);
+        w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T, H, mt);
+  } else {
+    // Fallback for small T (<512) or non-multiple-of-8 H: single-pass 64x256 without swizzle if T>=256
+    if (T >= 256) {
+      hipLaunchKernelGGL((k_bmm_uv_bf16_64x256_swz<1, 1, 1, 1>), dim3(H, mt, 1), dim3(256), 0, st,
+          a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
+          w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T, H, mt);
+    } else {
+      hipLaunchKernelGGL((k_bmm_uv_bf16_v3<0, 1, 2>), dim3(H, mt, 1), dim3(256), 0, st,
+          a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
+          w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T);
+    }
   }
 }
 
