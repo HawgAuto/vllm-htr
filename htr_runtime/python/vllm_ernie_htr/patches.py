@@ -1578,6 +1578,40 @@ def _patch_enable_thinking() -> None:
         cls.build_chat_params = _without_injected_enable_thinking(cls.build_chat_params)
 
 
+
+def _patch_kv_block_zeroer() -> None:
+    """Wave 50B: Replace Triton _zero_kv_blocks_kernel with native 233.5 GB/s NT u4v HIP zeroer."""
+    try:
+        from vllm.v1.worker import utils as _wu
+        from vllm.utils.torch_utils import async_tensor_h2d
+    except Exception:
+        return
+    cls = getattr(_wu, "KVBlockZeroer", None)
+    if cls is None:
+        return
+    orig = getattr(cls, "zero_block_ids", None)
+    if orig is None or getattr(orig, "_ernie5_nt_hip", False):
+        return
+
+    @functools.wraps(orig)
+    def _zero_block_ids_hip(self, block_ids):
+        if not block_ids or self._meta is None:
+            return
+        from .fast_ops import get_fast_ops
+        fops = get_fast_ops()
+        if fops is not None and hasattr(fops, "zero_kv_blocks_nt"):
+            seg_addrs, seg_block_strides, seg_page_sizes, _mc, _bs, _ns = self._meta
+            if seg_addrs.is_cuda:
+                import torch
+                idx = async_tensor_h2d(block_ids, device=self.device, dtype=torch.int64)
+                fops.zero_kv_blocks_nt(seg_addrs, seg_block_strides, seg_page_sizes, idx)
+                return
+        return orig(self, block_ids)
+
+    _zero_block_ids_hip._ernie5_nt_hip = True  # type: ignore[attr-defined]
+    cls.zero_block_ids = _zero_block_ids_hip
+
+
 def apply_patches() -> None:
     global _applied
     if _applied:
@@ -1593,6 +1627,7 @@ def apply_patches() -> None:
     _register_renderer()
     _patch_enable_thinking()
     _patch_rocm_paged_mqa_logits_triton()
+    _patch_kv_block_zeroer()
     if _dspark_draft_filter_enabled():
         try:
             import q38spec

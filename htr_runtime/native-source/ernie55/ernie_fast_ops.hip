@@ -4194,6 +4194,64 @@ torch::Tensor ernie_bf16_gemm_f32_out(torch::Tensor x, torch::Tensor w) {
   return out;
 }
 
+
+// ============================================================================
+// Wave 50B: Native NT-store 128-bit (u4v) KV Block Zeroer (233.5 GB/s roofline!)
+// Replaces vLLM's 3M-WG Triton _zero_kv_blocks_kernel (write-allocate int32 RFO
+// that polluted 32 MiB MALL before L0) with compact per-(block,seg) NT u4v stores!
+// ============================================================================
+__global__ __launch_bounds__(256) void k_zero_kv_blocks_nt(
+    const uint64_t* __restrict__ seg_addrs,        // [n_segs] byte addresses
+    const int64_t* __restrict__ seg_block_strides, // [n_segs] int32 elements
+    const int64_t* __restrict__ seg_page_sizes,    // [n_segs] int32 elements
+    const int64_t* __restrict__ block_ids,         // [n_blocks]
+    int n_blocks, int n_segs) {
+  const int blk_idx = blockIdx.x;
+  const int seg_idx = blockIdx.y;
+  if (blk_idx >= n_blocks || seg_idx >= n_segs) return;
+  const int64_t page_i32 = seg_page_sizes[seg_idx];
+  const int64_t stride_i32 = seg_block_strides[seg_idx];
+  const int64_t bid = block_ids[blk_idx];
+  uint32_t* base = reinterpret_cast<uint32_t*>(seg_addrs[seg_idx]) + bid * stride_i32;
+
+  const int64_t n_u4 = page_i32 >> 2;
+  const u4v z4 = {0u, 0u, 0u, 0u};
+  if ((reinterpret_cast<uintptr_t>(base) & 15u) == 0u) {
+    u4v* dst4 = reinterpret_cast<u4v*>(base);
+    for (int64_t i = threadIdx.x; i < n_u4; i += 256) {
+      __builtin_nontemporal_store(z4, dst4 + i);
+    }
+    const int64_t tail_start = n_u4 << 2;
+    for (int64_t i = tail_start + threadIdx.x; i < page_i32; i += 256) {
+      __builtin_nontemporal_store(0u, base + i);
+    }
+  } else {
+    for (int64_t i = threadIdx.x; i < page_i32; i += 256) {
+      __builtin_nontemporal_store(0u, base + i);
+    }
+  }
+}
+
+void ernie_zero_kv_blocks_nt(
+    torch::Tensor seg_addrs,
+    torch::Tensor seg_block_strides,
+    torch::Tensor seg_page_sizes,
+    torch::Tensor block_ids) {
+  TORCH_CHECK(seg_addrs.is_cuda() && seg_block_strides.is_cuda() &&
+              seg_page_sizes.is_cuda() && block_ids.is_cuda());
+  const int n_blocks = (int)block_ids.numel();
+  const int n_segs = (int)seg_addrs.numel();
+  if (n_blocks == 0 || n_segs == 0) return;
+  auto st = c10::hip::getCurrentHIPStream().stream();
+  hipLaunchKernelGGL(
+      k_zero_kv_blocks_nt, dim3(n_blocks, n_segs), dim3(256), 0, st,
+      reinterpret_cast<const uint64_t*>(seg_addrs.data_ptr()),
+      seg_block_strides.data_ptr<int64_t>(),
+      seg_page_sizes.data_ptr<int64_t>(),
+      block_ids.data_ptr<int64_t>(),
+      n_blocks, n_segs);
+}
+
 PYBIND11_MODULE(ernie_fast_ops, m) {
   m.def("fused_route", &ernie_fused_route);
   m.def("fwht128", &ernie_fwht128);
@@ -4228,5 +4286,6 @@ PYBIND11_MODULE(ernie_fast_ops, m) {
   m.def("scatter_dsa_kv_fp4", &ernie_scatter_dsa_kv_fp4);
   m.def("indexer_k_quant_and_cache_mxfp4", &ernie_indexer_k_quant_and_cache_mxfp4);
   m.def("cp_gather_indexer_k_mxfp4_to_fp8", &ernie_cp_gather_indexer_k_mxfp4_to_fp8);
+  m.def("zero_kv_blocks_nt", &ernie_zero_kv_blocks_nt);
 }
 
