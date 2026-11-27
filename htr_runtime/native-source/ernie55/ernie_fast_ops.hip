@@ -3024,6 +3024,114 @@ __global__ __launch_bounds__(256, 2) void k_bmm_q_uk_cat_pe_bf16_bk64_192(
   }
 }
 
+
+__device__ __forceinline__ u4v_q quk_nt_load_b128(const uint16_t* p) {
+  return __builtin_nontemporal_load(reinterpret_cast<const u4va_q*>(p));
+}
+
+__device__ __forceinline__ u4v_q quk_shfl_xor16_u4(u4v_q v) {
+  u4v_q r;
+  r[0] = __shfl_xor(v[0], 16, 32);
+  r[1] = __shfl_xor(v[1], 16, 32);
+  r[2] = __shfl_xor(v[2], 16, 32);
+  r[3] = __shfl_xor(v[3], 16, 32);
+  return r;
+}
+
+// v0.2.8 Decode Fast-Path (T <= 16) for bmm_q_uk_cat_pe_bf16:
+//   Zero-LDS-W, zero-loop-barrier, NT b128 streaming Wave32 WMMA (hits ~212 GB/s LPDDR5X roofline, 1.63-1.74x, bit-exact).
+template <int D_NOPE, int NWAVES>
+__global__ __launch_bounds__(NWAVES * 32, 4) void k_bmm_q_uk_cat_pe_bf16_decode(
+    const uint16_t* __restrict__ q_nope,
+    const uint16_t* __restrict__ w_uk_rm,
+    const uint16_t* __restrict__ q_pe,
+    uint16_t* __restrict__ q_full,
+    int64_t qn_s0, int64_t qn_s1,
+    int64_t w_s0, int64_t w_s1,
+    int64_t qp_s0, int64_t qp_s1,
+    int64_t qf_s0, int64_t qf_s1,
+    int T) {
+  constexpr int NTHR = NWAVES * 32;
+  constexpr int BN   = NWAVES * 16;
+  constexpr int C4   = D_NOPE / 8;
+  __shared__ __attribute__((aligned(16))) uint16_t A_lds[16][D_NOPE + 8];
+
+  const int h    = blockIdx.x;
+  const int n0   = blockIdx.y * BN;
+  const int tid  = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int l16  = lane & 15;
+  const int hrow = lane >> 4;
+
+  if (blockIdx.y == 0) {
+    for (int idx = tid; idx < T * 8; idx += NTHR) {
+      const int t = idx >> 3;
+      const int c = (idx & 7) * 8;
+      const u4v_q v = *reinterpret_cast<const u4va_q*>(q_pe + (int64_t)t * qp_s0 + (int64_t)h * qp_s1 + c);
+      *reinterpret_cast<u4va_q*>(q_full + (int64_t)t * qf_s0 + (int64_t)h * qf_s1 + 512 + c) = v;
+    }
+  }
+
+  const uint16_t* a_h = q_nope + (int64_t)h * qn_s1;
+#pragma unroll
+  for (int idx = tid; idx < 16 * C4; idx += NTHR) {
+    const int r = idx / C4;
+    const int c = (idx % C4) * 8;
+    u4v_q v = {0u, 0u, 0u, 0u};
+    if (r < T) v = *reinterpret_cast<const u4va_q*>(a_h + (int64_t)r * qn_s0 + c);
+    *reinterpret_cast<u4va_q*>(&A_lds[r][c]) = v;
+  }
+  __syncthreads();
+
+  const int wn0 = n0 + wave * 16;
+  const uint16_t* wr = w_uk_rm + (int64_t)h * w_s0 + (int64_t)(wn0 + l16) * w_s1 + hrow * 16;
+
+  f32x8_q acc = {0, 0, 0, 0, 0, 0, 0, 0};
+  u4v_q cw0 = quk_nt_load_b128(wr + 0);
+  u4v_q cw1 = quk_nt_load_b128(wr + 8);
+
+#pragma unroll
+  for (int k0 = 0; k0 < D_NOPE; k0 += 32) {
+    u4v_q nw0, nw1;
+    if (k0 + 32 < D_NOPE) {
+      nw0 = quk_nt_load_b128(wr + k0 + 32 + 0);
+      nw1 = quk_nt_load_b128(wr + k0 + 32 + 8);
+    }
+
+    const u4v_q xw0 = quk_shfl_xor16_u4(cw0);
+    const u4v_q xw1 = quk_shfl_xor16_u4(cw1);
+    const u4v_q b0_0 = hrow ? xw0 : cw0;
+    const u4v_q b0_1 = hrow ? xw1 : cw1;
+    const u4v_q b1_0 = hrow ? cw0 : xw0;
+    const u4v_q b1_1 = hrow ? cw1 : xw1;
+
+    const u4v_q a0_0 = *reinterpret_cast<const u4va_q*>(&A_lds[l16][k0 +  0]);
+    const u4v_q a0_1 = *reinterpret_cast<const u4va_q*>(&A_lds[l16][k0 +  8]);
+    const u4v_q a1_0 = *reinterpret_cast<const u4va_q*>(&A_lds[l16][k0 + 16]);
+    const u4v_q a1_1 = *reinterpret_cast<const u4va_q*>(&A_lds[l16][k0 + 24]);
+
+    const bf16x16_q af0 = __builtin_bit_cast(bf16x16_q, (u8v_q){a0_0.x, a0_0.y, a0_0.z, a0_0.w, a0_1.x, a0_1.y, a0_1.z, a0_1.w});
+    const bf16x16_q bf0 = __builtin_bit_cast(bf16x16_q, (u8v_q){b0_0.x, b0_0.y, b0_0.z, b0_0.w, b0_1.x, b0_1.y, b0_1.z, b0_1.w});
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af0, bf0, acc);
+
+    const bf16x16_q af1 = __builtin_bit_cast(bf16x16_q, (u8v_q){a1_0.x, a1_0.y, a1_0.z, a1_0.w, a1_1.x, a1_1.y, a1_1.z, a1_1.w});
+    const bf16x16_q bf1 = __builtin_bit_cast(bf16x16_q, (u8v_q){b1_0.x, b1_0.y, b1_0.z, b1_0.w, b1_1.x, b1_1.y, b1_1.z, b1_1.w});
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af1, bf1, acc);
+
+    if (k0 + 32 < D_NOPE) { cw0 = nw0; cw1 = nw1; }
+  }
+
+  uint16_t* o_base = q_full + (int64_t)h * qf_s1 + wn0 + l16;
+#pragma unroll
+  for (int ei = 0; ei < 8; ++ei) {
+    const int t = 2 * ei + hrow;
+    if (t < T) {
+      o_base[(int64_t)t * qf_s0] = quk_f32_to_bf16_rne(acc[ei]);
+    }
+  }
+}
+
 torch::Tensor bmm_q_uk_cat_pe_bf16(
     torch::Tensor q_nope, torch::Tensor w_uk_rm, torch::Tensor q_pe) {
   const int D = (int)q_nope.size(2);
@@ -3040,6 +3148,22 @@ torch::Tensor bmm_q_uk_cat_pe_bf16(
   auto w_p  = reinterpret_cast<const uint16_t*>(w_uk_rm.data_ptr<at::BFloat16>());
   auto qp_p = reinterpret_cast<const uint16_t*>(q_pe.data_ptr<at::BFloat16>());
   auto qf_p = reinterpret_cast<uint16_t*>(q_full.data_ptr<at::BFloat16>());
+  if (T <= 16 && q_nope.stride(2) == 1 && w_uk_rm.stride(2) == 1 && q_pe.stride(2) == 1 &&
+      ((q_nope.stride(0) | q_nope.stride(1) | w_uk_rm.stride(0) | w_uk_rm.stride(1) |
+        q_pe.stride(0) | q_pe.stride(1)) & 7) == 0) {
+    if (D == 128) {
+      hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_bf16_decode<128, 4>), dim3(H, 512 / 64), dim3(128), 0, st,
+          qn_p, w_p, qp_p, qf_p, q_nope.stride(0), q_nope.stride(1),
+          w_uk_rm.stride(0), w_uk_rm.stride(1), q_pe.stride(0), q_pe.stride(1),
+          q_full.stride(0), q_full.stride(1), T);
+    } else {
+      hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_bf16_decode<192, 4>), dim3(H, 512 / 64), dim3(128), 0, st,
+          qn_p, w_p, qp_p, qf_p, q_nope.stride(0), q_nope.stride(1),
+          w_uk_rm.stride(0), w_uk_rm.stride(1), q_pe.stride(0), q_pe.stride(1),
+          q_full.stride(0), q_full.stride(1), T);
+    }
+    return q_full;
+  }
   if (D == 128) {
     if (T >= 256 && T <= 1536) {
       hipLaunchKernelGGL((k_bmm_q_uk_cat_pe_bf16_singleq<128, 0, 1>), dim3(H, mt), dim3(256), 0, st,
@@ -3199,6 +3323,85 @@ __global__ __launch_bounds__(256, 2) void k_bmm_uv_bf16_v3(
   }
 }
 
+
+// v0.2.8 Decode Fast-Path (T <= 16) for bmm_uv_bf16:
+//   1-Wave32/WG, zero-barrier, 2-ahead NT b128 prefetch WMMA (16.6 KiB A_lds self-throttles to 7 WGs/WGP -> 2.02-2.40x, bit-exact).
+__global__ __launch_bounds__(32) void k_bmm_uv_bf16_decode(
+    const uint16_t* __restrict__ attn_lat,
+    const uint16_t* __restrict__ w_uv_rm,
+    uint16_t* __restrict__ out,
+    int64_t a_s0, int64_t a_s1,
+    int64_t w_s0, int64_t w_s1,
+    int64_t o_s0, int64_t o_s1,
+    int T) {
+  __shared__ __attribute__((aligned(16))) uint16_t A_lds[16][520];
+
+  const int h    = blockIdx.x;
+  const int n0   = blockIdx.y * 16;
+  const int lane = threadIdx.x;
+  const int l16  = lane & 15;
+  const int hrow = lane >> 4;
+
+  const uint16_t* a_h = attn_lat + (int64_t)h * a_s1;
+  const int tot_u4 = T * 64;
+  for (int idx = lane; idx < tot_u4; idx += 32) {
+    const int r = idx >> 6;
+    const int c = (idx & 63) * 8;
+    *reinterpret_cast<u4va_q*>(&A_lds[r][c]) = *reinterpret_cast<const u4va_q*>(a_h + (int64_t)r * a_s0 + c);
+  }
+
+  const uint16_t* wr = w_uv_rm + (int64_t)h * w_s0 + (int64_t)(n0 + l16) * w_s1 + hrow * 16;
+  const bool va = l16 < T;
+  const int ar_idx = va ? l16 : 0;
+
+  f32x8_q acc = {0, 0, 0, 0, 0, 0, 0, 0};
+  u4v_q w0_a = quk_nt_load_b128(wr + 0);
+  u4v_q w1_a = quk_nt_load_b128(wr + 8);
+  u4v_q w0_b = quk_nt_load_b128(wr + 32);
+  u4v_q w1_b = quk_nt_load_b128(wr + 40);
+
+#pragma unroll 4
+  for (int k0 = 0; k0 < 512; k0 += 32) {
+    u4v_q w0_n, w1_n;
+    if (k0 + 64 < 512) {
+      w0_n = quk_nt_load_b128(wr + k0 + 64 + 0);
+      w1_n = quk_nt_load_b128(wr + k0 + 64 + 8);
+    }
+
+    const u4v_q xw0 = quk_shfl_xor16_u4(w0_a);
+    const u4v_q xw1 = quk_shfl_xor16_u4(w1_a);
+    const u4v_q b0_0 = hrow ? xw0 : w0_a;
+    const u4v_q b0_1 = hrow ? xw1 : w1_a;
+    const u4v_q b1_0 = hrow ? w0_a : xw0;
+    const u4v_q b1_1 = hrow ? w1_a : xw1;
+
+    const u4v_q a0_0 = va ? *reinterpret_cast<const u4va_q*>(&A_lds[ar_idx][k0 +  0]) : (u4v_q){0u, 0u, 0u, 0u};
+    const u4v_q a0_1 = va ? *reinterpret_cast<const u4va_q*>(&A_lds[ar_idx][k0 +  8]) : (u4v_q){0u, 0u, 0u, 0u};
+    const u4v_q a1_0 = va ? *reinterpret_cast<const u4va_q*>(&A_lds[ar_idx][k0 + 16]) : (u4v_q){0u, 0u, 0u, 0u};
+    const u4v_q a1_1 = va ? *reinterpret_cast<const u4va_q*>(&A_lds[ar_idx][k0 + 24]) : (u4v_q){0u, 0u, 0u, 0u};
+
+    const bf16x16_q af0 = __builtin_bit_cast(bf16x16_q, (u8v_q){a0_0.x, a0_0.y, a0_0.z, a0_0.w, a0_1.x, a0_1.y, a0_1.z, a0_1.w});
+    const bf16x16_q bf0 = __builtin_bit_cast(bf16x16_q, (u8v_q){b0_0.x, b0_0.y, b0_0.z, b0_0.w, b0_1.x, b0_1.y, b0_1.z, b0_1.w});
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af0, bf0, acc);
+
+    const bf16x16_q af1 = __builtin_bit_cast(bf16x16_q, (u8v_q){a1_0.x, a1_0.y, a1_0.z, a1_0.w, a1_1.x, a1_1.y, a1_1.z, a1_1.w});
+    const bf16x16_q bf1 = __builtin_bit_cast(bf16x16_q, (u8v_q){b1_0.x, b1_0.y, b1_0.z, b1_0.w, b1_1.x, b1_1.y, b1_1.z, b1_1.w});
+    acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af1, bf1, acc);
+
+    w0_a = w0_b; w1_a = w1_b;
+    if (k0 + 64 < 512) { w0_b = w0_n; w1_b = w1_n; }
+  }
+
+  uint16_t* o_base = out + (int64_t)h * o_s1 + n0 + l16;
+#pragma unroll
+  for (int ei = 0; ei < 8; ++ei) {
+    const int t = 2 * ei + hrow;
+    if (t < T) {
+      o_base[(int64_t)t * o_s0] = quk_f32_to_bf16_rne(acc[ei]);
+    }
+  }
+}
+
 void bmm_uv_bf16(
     torch::Tensor attn_latent, torch::Tensor w_uv_rm, torch::Tensor out) {
   const int DV = (int)w_uv_rm.size(1);
@@ -3213,6 +3416,13 @@ void bmm_uv_bf16(
   auto a_p = reinterpret_cast<const uint16_t*>(attn_latent.data_ptr<at::BFloat16>());
   auto w_p = reinterpret_cast<const uint16_t*>(w_uv_rm.data_ptr<at::BFloat16>());
   auto o_p = reinterpret_cast<uint16_t*>(out.data_ptr<at::BFloat16>());
+  if (T <= 16 && attn_latent.stride(2) == 1 && w_uv_rm.stride(2) == 1 && out.stride(2) == 1 &&
+      ((attn_latent.stride(0) | attn_latent.stride(1) | w_uv_rm.stride(0) | w_uv_rm.stride(1)) & 7) == 0) {
+    hipLaunchKernelGGL(k_bmm_uv_bf16_decode, dim3(H, DV / 16), dim3(32), 0, st,
+        a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
+        w_uv_rm.stride(0), w_uv_rm.stride(1), out.stride(0), out.stride(1), T);
+    return;
+  }
   if (DV == 128) {
     hipLaunchKernelGGL((k_bmm_uv_bf16_v3<1, 1, 1>), dim3(H, mt, 1), dim3(256), 0, st,
         a_p, w_p, o_p, attn_latent.stride(0), attn_latent.stride(1),
