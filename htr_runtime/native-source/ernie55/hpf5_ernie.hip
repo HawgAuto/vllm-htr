@@ -792,6 +792,225 @@ static void dispatch_gemm(int bmw, int nt_load, int max_g, hipStream_t st, Ernie
   }
 }
 
+// ============================================================================
+// Wave 22: 1x8 BN=256 Fused Gemm0 (128 gate + 128 up) + SiTU-GLU + Act1 (bmw=128)
+//   - 8 M-groups (bmw=128) x 2 N-groups (wn=0: 128 gate, wn=1: 128 up) = 16 waves (512 thr)
+//   - ALL 512 threads load & decode B in parallel (ZERO idle threads)
+//   - Cuts A1 global reads in HALF (16 N-blocks vs 32 -> -2.68 GB/layer)
+//   - 100% in-register 128-pt FWHT (ZERO ep LDS, ZERO butterfly barriers)
+//   - Eliminates Y1 [P, 4096] DRAM round-trip (736 MB/L x 42L = 30.9 GB/4K) & act1 kernel (-111 ms/4K!)
+//   - ZERO extra VRAM: writes A2 into Y_buf[Pmax*2048:] and S2_blk into Y_buf[0:] before gemm1!
+//   - V=116 (<=120 granule, 0 spills), NT_LOAD=0 exploits MALL reuse across same-expert groups!
+// ============================================================================
+__device__ __forceinline__ void fwht128_reg8(float v[8], int lane) {
+  reg_stage8<1>(v); reg_stage8<2>(v); reg_stage8<4>(v);
+  lane_stage8<1>(v, lane); lane_stage8<2>(v, lane); lane_stage8<4>(v, lane); lane_stage8<8>(v, lane);
+}
+
+struct ErnieFusedG0Args {
+  const _Float16* A1; const float* S1;
+  const uint32_t* qw; const int64_t* qoff;
+  const __half* scales; const uint8_t* sv; const uint8_t* su;
+  const int32_t* sorted_ids; const int32_t* expert_ids;
+  const int32_t* grp_y; const int32_t* grp_nblk; const int32_t* grp_cnt;
+  _Float16* A2; float* S2_blk; unsigned* nsat;
+  int num_valid, pad; float cb;
+};
+
+template <int K, int NT_LOAD>
+__global__ __launch_bounds__(512)
+void k_hpf_ernie_gemm0_1x8_fused(ErnieFusedG0Args a) {
+  constexpr int KDIM = MOE_H, NT = KDIM / 16, NS32 = KDIM / 32, NWT = 8 * K;
+  constexpr int LBMW = 128;
+  constexpr int W_PER_ROW = (K == 3) ? 2 : 1;
+
+  union SmemU {
+    uint32_t Bs[2][256 * RS];     // 40,960 B (double-buffered 256 x 32 f16)
+    struct {
+      uint16_t gate_b[64 * 128];  // 16,384 B (stream 2 halves of 64 rows)
+      uint16_t up_b[64 * 128];    // 16,384 B (32,768 B <= 40,960 B)
+    } epi;
+  };
+  __shared__ __attribute__((aligned(16))) SmemU smem;
+  __shared__ int32_t s_tok[LBMW];
+
+  const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
+  const int wm = wave >> 1, wn = wave & 1;
+  const int ng = a.grp_cnt[0];
+  const int g = ng - 1 - (int)blockIdx.y; // Preserves same-expert MALL locality (REV_G=1)
+  const int blk = blockIdx.x;             // 0..15 (128-col block for BOTH gate & up)
+  if (g < 0 || g >= ng) return;
+  const int y = a.grp_y[g], nblk = a.grp_nblk[g], e = a.expert_ids[y];
+  if (e < 0) return;
+
+  if (tid < LBMW) s_tok[tid] = (tid < BM * nblk) ? a.sorted_ids[y * BM + tid] : a.num_valid;
+  __syncthreads();
+
+  const size_t pitch = (size_t)NT * NWT + a.pad;
+  const int n256 = tid & 255, h2i = tid >> 8;
+  const int is_up_thr = (n256 >> 7) & 1, n2_loc = n256 & 127, r_loc = n2_loc & 15;
+  const uint32_t* qm_thr = a.qw + a.qoff[(size_t)e * 3 + is_up_thr] + (size_t)blk * 8 * pitch + (size_t)(n2_loc >> 4) * pitch;
+
+  const bool m_act = s_tok[wm * 16] < a.num_valid;
+  const _Float16* arow = a.A1 + ((size_t)y * BM + wm * 16 + l16) * KDIM;
+  const int n_base = wn * 128;
+
+  auto loadB = [&](uint32_t* br, int k0) {
+    const uint32_t* tile = qm_thr + (size_t)(k0 / 16 + h2i) * NWT;
+    if constexpr (K == 3) {
+      const int kk = r_loc >> 1;
+      const u32x2a* p2 = reinterpret_cast<const u32x2a*>(tile + 3 * kk + (r_loc & 1));
+      const u32x2 pair = NT_LOAD ? __builtin_nontemporal_load(p2) : *p2;
+      br[0] = pair[0]; br[1] = pair[1];
+    } else {
+      br[0] = NT_LOAD ? __builtin_nontemporal_load(tile + r_loc) : tile[r_loc];
+    }
+  };
+  auto storeB = [&](int buf, const uint32_t* br) {
+    uint32_t* bs = smem.Bs[buf];
+    uint32_t o[8];
+    decode_row_k<K>(br, r_loc, o);
+    *(u32x4*)(&bs[sw4(n256, 2 * h2i)])     = (u32x4){o[0], o[1], o[2], o[3]};
+    *(u32x4*)(&bs[sw4(n256, 2 * h2i + 1)]) = (u32x4){o[4], o[5], o[6], o[7]};
+  };
+  auto loadA16 = [&](u32x4 dst[2], int k0) {
+    if (m_act) { dst[0] = *(const u32x4*)(arow + k0); dst[1] = *(const u32x4*)(arow + k0 + 8); }
+  };
+
+  f32x8 acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+
+  uint32_t bX[W_PER_ROW], bY[W_PER_ROW], bZ[W_PER_ROW];
+  u32x4 a0[2], a1[2];
+  loadA16(a0, 0); loadB(bX, 0); loadB(bY, 32); storeB(0, bX);
+  __syncthreads();
+
+  auto step = [&](int s, int buf, const uint32_t* b1, uint32_t* b2) {
+    loadA16(a1, s * 32 + 16);
+    if (s + 2 < NS32) loadB(b2, (s + 2) * 32);
+    if (m_act) {
+      const uint32_t* bs = smem.Bs[buf];
+      const f16x16 af0 = __builtin_bit_cast(f16x16, (u32x8){a0[0][0], a0[0][1], a0[0][2], a0[0][3], a0[1][0], a0[1][1], a0[1][2], a0[1][3]});
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int n = n_base + 16 * j + l16;
+        const u32x4 y0 = *(const u32x4*)(&bs[sw4(n, 0)]);
+        const u32x4 y1 = *(const u32x4*)(&bs[sw4(n, 1)]);
+        const f16x16 bf = __builtin_bit_cast(f16x16, (u32x8){y0[0], y0[1], y0[2], y0[3], y1[0], y1[1], y1[2], y1[3]});
+        acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af0, bf, acc[j]);
+        __builtin_amdgcn_sched_barrier(0);
+      }
+      if (s + 1 < NS32) loadA16(a0, (s + 1) * 32);
+      const f16x16 af1 = __builtin_bit_cast(f16x16, (u32x8){a1[0][0], a1[0][1], a1[0][2], a1[0][3], a1[1][0], a1[1][1], a1[1][2], a1[1][3]});
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int n = n_base + 16 * j + l16;
+        const u32x4 y0 = *(const u32x4*)(&bs[sw4(n, 2)]);
+        const u32x4 y1 = *(const u32x4*)(&bs[sw4(n, 3)]);
+        const f16x16 bf = __builtin_bit_cast(f16x16, (u32x8){y0[0], y0[1], y0[2], y0[3], y1[0], y1[1], y1[2], y1[3]});
+        acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(af1, bf, acc[j]);
+        __builtin_amdgcn_sched_barrier(0);
+      }
+    }
+    if (s + 1 < NS32) storeB(buf ^ 1, b1);
+    __syncthreads();
+  };
+
+  for (int s = 0; s < NS32; s += 6) {
+    step(s + 0, 0, bY, bZ);
+    if (s + 1 < NS32) step(s + 1, 1, bZ, bX);
+    if (s + 2 < NS32) step(s + 2, 0, bX, bY);
+    if (s + 3 < NS32) step(s + 3, 1, bY, bZ);
+    if (s + 4 < NS32) step(s + 4, 0, bZ, bX);
+    if (s + 5 < NS32) step(s + 5, 1, bX, bY);
+  }
+
+  // 100% in-register FWHT-128 -> BF16 LDS -> SiTU-GLU -> su -> FWHT-128 -> A2 FP16 + S2_blk!
+  const int row0 = blk * 128;
+  const __half* scl = a.scales + (size_t)e * SC_STRIDE + (wn ? MOE_I : 0) + row0;
+  const uint8_t* svp = a.sv + (size_t)e * SV_STRIDE + (wn ? (MOE_I / 8) : 0) + (row0 >> 3);
+  const unsigned sg4_a2 = (unsigned)(*(a.su + (size_t)e * SU_STRIDE + (MOE_H / 8) + ((row0 + lane * 4) >> 3))) >> ((row0 + lane * 4) & 7);
+  float sc[8]; uint32_t neg = 0;
+#pragma unroll
+  for (int j = 0; j < 8; ++j) {
+    sc[j] = __half2float(scl[16 * j + l16]) * a.cb;
+    neg |= ((uint32_t)(svp[2 * j + (l16 >> 3)] >> (l16 & 7)) & 1u) << j;
+  }
+  const int hrow = lane >> 4;
+  const size_t prow = (size_t)y * BM + wm * 16;
+  uint16_t* dst_buf = wn ? smem.epi.up_b : smem.epi.gate_b;
+  unsigned sat = 0;
+
+#pragma unroll 1
+  for (int hf = 0; hf < 2; ++hf) {
+    const int wm_lo = hf * 4;
+    if (wm >= wm_lo && wm < wm_lo + 4 && m_act) {
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) {
+        const int rl = wm * 16 + 2 * ei + hrow;
+        if (s_tok[rl] < a.num_valid) {
+          const float bias = VBIAS * a.S1[prow + 2 * ei + hrow];
+          float v[8];
+#pragma unroll
+          for (int j = 0; j < 8; ++j) v[j] = (acc[j][ei] - bias) * sc[j];
+          fwht128_reg8(v, lane);
+          uint16_t* dst_lds = dst_buf + ((wm - wm_lo) * 16 + 2 * ei + hrow) * 128 + l16;
+#pragma unroll
+          for (int j = 0; j < 8; ++j) {
+            float yv = v[j] * INV128;
+            if ((neg >> j) & 1u) yv = -yv;
+            dst_lds[16 * j] = f32_to_bf16_rne(yv);
+          }
+        }
+      }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int ri = 0; ri < 4; ++ri) {
+      const int r_loc = wave * 4 + ri;
+      const int s_rl = wm_lo * 16 + r_loc;
+      if (s_tok[s_rl] < a.num_valid) {
+        const uint2 rg = *reinterpret_cast<const uint2*>(smem.epi.gate_b + r_loc * 128 + lane * 4);
+        const uint2 ru = *reinterpret_cast<const uint2*>(smem.epi.up_b   + r_loc * 128 + lane * 4);
+        float v[4] = {
+          situ_glu_f(__uint_as_float((rg.x & 0xFFFFu) << 16), __uint_as_float((ru.x & 0xFFFFu) << 16)),
+          situ_glu_f(__uint_as_float(rg.x & 0xFFFF0000u),     __uint_as_float(ru.x & 0xFFFF0000u)),
+          situ_glu_f(__uint_as_float((rg.y & 0xFFFFu) << 16), __uint_as_float((ru.y & 0xFFFFu) << 16)),
+          situ_glu_f(__uint_as_float(rg.y & 0xFFFF0000u),     __uint_as_float(ru.y & 0xFFFF0000u)),
+        };
+        if (sg4_a2 & 1u) v[0] = -v[0]; if (sg4_a2 & 2u) v[1] = -v[1];
+        if (sg4_a2 & 4u) v[2] = -v[2]; if (sg4_a2 & 8u) v[3] = -v[3];
+        fwht128_wave(v, lane);
+        _Float16 h[4]; float bs = 0.f;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) { h[k] = f16sat(v[k] * INV128, sat); bs += (float)h[k]; }
+        bs += shx<16>(bs); bs += shx<8>(bs); bs += shx<4>(bs); bs += shx<2>(bs); bs += shx<1>(bs);
+        const size_t s_prow = (size_t)y * BM + s_rl;
+        uint2 o = {
+          (uint32_t)__builtin_bit_cast(uint16_t, h[0]) | ((uint32_t)__builtin_bit_cast(uint16_t, h[1]) << 16),
+          (uint32_t)__builtin_bit_cast(uint16_t, h[2]) | ((uint32_t)__builtin_bit_cast(uint16_t, h[3]) << 16),
+        };
+        *reinterpret_cast<uint2*>(a.A2 + s_prow * MOE_I + row0 + lane * 4) = o;
+        if (lane == 0) a.S2_blk[s_prow * 16 + blk] = bs;
+      }
+    }
+    __syncthreads();
+  }
+  if (sat) atomicAdd(a.nsat, sat);
+}
+
+__global__ __launch_bounds__(256) void k_sum_s2_16(
+    const float* __restrict__ s2_blk, float* __restrict__ s2, const int32_t* __restrict__ ntpp) {
+  const int p = blockIdx.x * 16 + (threadIdx.x >> 4);
+  const int c = threadIdx.x & 15;
+  if (p >= ntpp[0]) return;
+  float v = s2_blk[(size_t)p * 16 + c];
+  v += shx<8>(v); v += shx<4>(v); v += shx<2>(v); v += shx<1>(v);
+  if (c == 0) s2[p] = v;
+}
+
 torch::Tensor hpf5_ernie_forward(
     torch::Tensor x, torch::Tensor topk_ids, torch::Tensor topk_weights,
     torch::Tensor qw, torch::Tensor qoff, torch::Tensor scales, torch::Tensor su, torch::Tensor sv,
@@ -849,17 +1068,41 @@ torch::Tensor hpf5_ernie_forward(
                      reinterpret_cast<const __hip_bfloat16*>(x.data_ptr<at::BFloat16>()),
                      sid, eid, ntpp_p, su.data_ptr<uint8_t>(), topk, nv, Ap, Sp, ns_p);
 
-  // 2. Gemm0: A1 @ W13 -> Y1 [P, 4096] bf16
-  if (K == 3) dispatch_gemm<3, 0>((int)bmw, (int)nt_load, max_g, st, a);
-  else        dispatch_gemm<2, 0>((int)bmw, (int)nt_load, max_g, st, a);
+  if (bmw == 128) {
+    // Wave 22: Fused 1x8 BN=256 Gemm0 + SiTU-GLU + Act1 (ZERO Y1 DRAM round-trip, ZERO act1, ZERO extra VRAM!)
+    // A2 aliases second half of Y_buf (Yp + Pmax*2048); S2_blk (Pmax*16 f32) aliases dead start of Y_buf before Gemm1!
+    _Float16* A2p = reinterpret_cast<_Float16*>(Yp + (size_t)Pmax * MOE_I);
+    float* S2_blkp = reinterpret_cast<float*>(Yp);
+    ErnieFusedG0Args g0;
+    g0.A1 = Ap; g0.S1 = Sp; g0.qw = a.qw; g0.qoff = a.qoff;
+    g0.scales = a.scales; g0.sv = a.sv; g0.su = su.data_ptr<uint8_t>();
+    g0.sorted_ids = sid; g0.expert_ids = eid;
+    g0.grp_y = gy_p; g0.grp_nblk = gn_p; g0.grp_cnt = gc_p;
+    g0.A2 = A2p; g0.S2_blk = S2_blkp; g0.nsat = ns_p;
+    g0.num_valid = nv; g0.pad = (int)pad; g0.cb = (float)cb;
 
-  // 3. Act1: Y1 -> SiTU-GLU -> A2 (reuses A_buf!) [P, 2048] f16 + S
-  hipLaunchKernelGGL((k_hpf_ernie_act<1>), dim3(pg), dim3(128), 0, st,
-                     Yp, sid, eid, ntpp_p, su.data_ptr<uint8_t>(), topk, nv, Ap, Sp, ns_p);
+    if (K == 3) hipLaunchKernelGGL((k_hpf_ernie_gemm0_1x8_fused<3, 0>), dim3(MOE_I / BN, max_g), dim3(512), 0, st, g0);
+    else        hipLaunchKernelGGL((k_hpf_ernie_gemm0_1x8_fused<2, 0>), dim3(MOE_I / BN, max_g), dim3(512), 0, st, g0);
 
-  // 4. Gemm1: A2 @ W2 -> Y2 (reuses first half of Y_buf!) [P, 2048] bf16
-  if (K == 3) dispatch_gemm<3, 1>((int)bmw, (int)nt_load, max_g, st, a);
-  else        dispatch_gemm<2, 1>((int)bmw, (int)nt_load, max_g, st, a);
+    hipLaunchKernelGGL(k_sum_s2_16, dim3((Pmax + 15) / 16), dim3(256), 0, st, S2_blkp, Sp, ntpp_p);
+
+    // 4. Gemm1: A2 @ W2 -> Y2 (first half of Y_buf; S2_blk is dead!) [P, 2048] bf16
+    a.A = A2p;
+    if (K == 3) dispatch_gemm<3, 1>(128, 0, max_g, st, a);
+    else        dispatch_gemm<2, 1>(128, 0, max_g, st, a);
+  } else {
+    // 2. Gemm0: A1 @ W13 -> Y1 [P, 4096] bf16
+    if (K == 3) dispatch_gemm<3, 0>((int)bmw, (int)nt_load, max_g, st, a);
+    else        dispatch_gemm<2, 0>((int)bmw, (int)nt_load, max_g, st, a);
+
+    // 3. Act1: Y1 -> SiTU-GLU -> A2 (reuses A_buf!) [P, 2048] f16 + S
+    hipLaunchKernelGGL((k_hpf_ernie_act<1>), dim3(pg), dim3(128), 0, st,
+                       Yp, sid, eid, ntpp_p, su.data_ptr<uint8_t>(), topk, nv, Ap, Sp, ns_p);
+
+    // 4. Gemm1: A2 @ W2 -> Y2 (reuses first half of Y_buf!) [P, 2048] bf16
+    if (K == 3) dispatch_gemm<3, 1>((int)bmw, (int)nt_load, max_g, st, a);
+    else        dispatch_gemm<2, 1>((int)bmw, (int)nt_load, max_g, st, a);
+  }
 
   // 5. Inv + weighted reduce -> out [T, 2048] bf16
   auto out = torch::empty({T, MOE_H}, x.options());
