@@ -253,7 +253,7 @@ class Ernie5_5DSparkModel(nn.Module):
     def combine_hidden_states(self, aux_hidden_states: torch.Tensor) -> torch.Tensor:
         T = aux_hidden_states.shape[0]
         if (
-            1 <= T <= 8
+            1 <= T <= 16
             and os.environ.get("ERNIE_BF16_GEMV_NT", "1") == "1"
             and aux_hidden_states.is_cuda
             and aux_hidden_states.dtype == torch.bfloat16

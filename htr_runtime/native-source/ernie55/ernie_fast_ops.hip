@@ -2110,20 +2110,130 @@ __global__ __launch_bounds__(128) void k_bf16_gemv_nt(
   }
 }
 
+// Wave 19B: k_bf16_gemv_nt_xlds512_v28 (T = 1..16, maxV <= 75, 0/0/0/0, single-launch sk=1!)
+//   - Stages 512 BF16 (64 u4v) per token in x_lds[R][64] (4x fewer X VMEM loads, 2x NT b128 W MLP!)
+//   - Intra-WG 4-channel 256B LPDDR5X stagger (wave w starts at u4v (w*16 + lane) & 63) + inter-WG block stagger
+//     -> breaks 8-way power-of-2 channel collisions on K=2048 (Router) & K=4096 (main_proj, kv_a, wk_weights)!
+//   - Supports T = 1..16 (B=1 & B=2 DSpark!), single kernel launch, zero atomics.
+template <int R, int OUT_BF16>
+__global__ __launch_bounds__(128) void k_bf16_gemv_nt_xlds512_v28(
+    const uint16_t* __restrict__ x, int64_t x_s0,
+    const uint16_t* __restrict__ w, int64_t w_s0,
+    void* __restrict__ out, int N, int K) {
+  __shared__ __attribute__((aligned(16))) u4v x_lds[R][64];
+
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int n = blockIdx.x * 4 + wave;
+  const bool vn = (n < N);
+
+  const uint16_t* w_row = w + (int64_t)(vn ? n : (N - 1)) * w_s0;
+
+  float acc0[R], acc1[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) { acc0[r] = 0.0f; acc1[r] = 0.0f; }
+
+  const int u0 = (wave * 16 + lane) & 63;
+  const int u1 = (wave * 16 + 32 + lane) & 63;
+  const int k_512 = K & ~511;
+  const int n512 = k_512 >> 9;
+  const int blk_ph = (n512 >= 4) ? (((int)blockIdx.x & 3) * 512)
+                   : ((n512 >= 2) ? (((int)blockIdx.x & 1) * 512) : 0);
+
+  int ks = 0;
+  for (; ks < k_512; ks += 512) {
+    int k_blk = ks + blk_ph;
+    if (k_blk >= k_512) k_blk -= k_512;
+    for (int idx = tid; idx < R * 64; idx += 128) {
+      const int rr = idx >> 6;
+      const int cc = idx & 63;
+      x_lds[rr][cc] = *reinterpret_cast<const u4va*>(x + (int64_t)rr * x_s0 + k_blk + cc * 8);
+    }
+    const u4v wv0 = vn ? __builtin_nontemporal_load(reinterpret_cast<const u4va*>(w_row + k_blk + u0 * 8)) : (u4v){0u,0u,0u,0u};
+    const u4v wv1 = vn ? __builtin_nontemporal_load(reinterpret_cast<const u4va*>(w_row + k_blk + u1 * 8)) : (u4v){0u,0u,0u,0u};
+    __syncthreads();
+#define _XL512_STEP2(IDX, R0, R1) \
+    if constexpr (R > (IDX)) { \
+      const u4v xv0 = x_lds[IDX][u0]; \
+      BF16_DUAL_DOT2_8_PIN(acc0[IDX], acc1[IDX], wv0, xv0, R0, R1); \
+      const u4v xv1 = x_lds[IDX][u1]; \
+      BF16_DUAL_DOT2_8_PIN(acc0[IDX], acc1[IDX], wv1, xv1, R0, R1); \
+    }
+    _XL512_STEP2(0,  "v16", "v17"); _XL512_STEP2(1,  "v18", "v19");
+    _XL512_STEP2(2,  "v20", "v21"); _XL512_STEP2(3,  "v22", "v23");
+    _XL512_STEP2(4,  "v24", "v25"); _XL512_STEP2(5,  "v26", "v27");
+    _XL512_STEP2(6,  "v28", "v29"); _XL512_STEP2(7,  "v30", "v31");
+    _XL512_STEP2(8,  "v32", "v33"); _XL512_STEP2(9,  "v34", "v35");
+    _XL512_STEP2(10, "v36", "v37"); _XL512_STEP2(11, "v38", "v39");
+    _XL512_STEP2(12, "v40", "v41"); _XL512_STEP2(13, "v42", "v43");
+    _XL512_STEP2(14, "v44", "v45"); _XL512_STEP2(15, "v46", "v47");
+#undef _XL512_STEP2
+    __syncthreads();
+  }
+  for (; ks < K; ks += 256) {
+    for (int idx = tid; idx < R * 32; idx += 128) {
+      const int rr = idx >> 5;
+      const int cc = idx & 31;
+      x_lds[rr][cc] = *reinterpret_cast<const u4va*>(x + (int64_t)rr * x_s0 + ks + cc * 8);
+    }
+    const u4v wv0 = vn ? __builtin_nontemporal_load(reinterpret_cast<const u4va*>(w_row + ks + lane * 8)) : (u4v){0u,0u,0u,0u};
+    __syncthreads();
+#define _XL512_STEPT(IDX, R0, R1) \
+    if constexpr (R > (IDX)) { \
+      const u4v xv0 = x_lds[IDX][lane]; \
+      BF16_DUAL_DOT2_8_PIN(acc0[IDX], acc1[IDX], wv0, xv0, R0, R1); \
+    }
+    _XL512_STEPT(0,  "v16", "v17"); _XL512_STEPT(1,  "v18", "v19");
+    _XL512_STEPT(2,  "v20", "v21"); _XL512_STEPT(3,  "v22", "v23");
+    _XL512_STEPT(4,  "v24", "v25"); _XL512_STEPT(5,  "v26", "v27");
+    _XL512_STEPT(6,  "v28", "v29"); _XL512_STEPT(7,  "v30", "v31");
+    _XL512_STEPT(8,  "v32", "v33"); _XL512_STEPT(9,  "v34", "v35");
+    _XL512_STEPT(10, "v36", "v37"); _XL512_STEPT(11, "v38", "v39");
+    _XL512_STEPT(12, "v40", "v41"); _XL512_STEPT(13, "v42", "v43");
+    _XL512_STEPT(14, "v44", "v45"); _XL512_STEPT(15, "v46", "v47");
+#undef _XL512_STEPT
+    __syncthreads();
+  }
+
+  if (!vn) return;
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    float a = acc0[r] + acc1[r];
+    a += shx_f<16>(a); a += shx_f<8>(a); a += shx_f<4>(a); a += shx_f<2>(a); a += shx_f<1>(a);
+    if (lane == 0) {
+      if constexpr (OUT_BF16) {
+        static_cast<uint16_t*>(out)[(int64_t)r * N + n] = f32_to_bf16_rne(a);
+      } else {
+        static_cast<float*>(out)[(int64_t)r * N + n] = a;
+      }
+    }
+  }
+}
+
 template <int OUT_BF16>
-static void dispatch_bf16_gemv_nt(
+static void dispatch_bf16_gemv_xlds512(
     int T, dim3 grid, hipStream_t st,
-    const uint16_t* xp, int64_t xs0, const uint16_t* wp, int64_t ws0, void* op, int N, int K) {
+    const uint16_t* xp, int64_t xs0, const uint16_t* wp, int64_t ws0,
+    void* op, int N, int K) {
   switch (T) {
-    case 1: hipLaunchKernelGGL((k_bf16_gemv_nt<1, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
-    case 2: hipLaunchKernelGGL((k_bf16_gemv_nt<2, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
-    case 3: hipLaunchKernelGGL((k_bf16_gemv_nt<3, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
-    case 4: hipLaunchKernelGGL((k_bf16_gemv_nt<4, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
-    case 5: hipLaunchKernelGGL((k_bf16_gemv_nt<5, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
-    case 6: hipLaunchKernelGGL((k_bf16_gemv_nt<6, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
-    case 7: hipLaunchKernelGGL((k_bf16_gemv_nt<7, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
-    case 8: hipLaunchKernelGGL((k_bf16_gemv_nt<8, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
-    default: TORCH_CHECK(false, "T must be 1..8");
+    case 1:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<1,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 2:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<2,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 3:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<3,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 4:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<4,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 5:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<5,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 6:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<6,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 7:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<7,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 8:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<8,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 9:  hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<9,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 10: hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<10, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 11: hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<11, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 12: hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<12, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 13: hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<13, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 14: hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<14, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 15: hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<15, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 16: hipLaunchKernelGGL((k_bf16_gemv_nt_xlds512_v28<16, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    default: TORCH_CHECK(false, "T must be 1..16");
   }
 }
 
@@ -2133,18 +2243,34 @@ torch::Tensor ernie_bf16_gemv_nt(torch::Tensor x, torch::Tensor w, bool out_bf16
   const int T = (int)x.size(0);
   const int K = (int)x.size(1);
   const int N = (int)w.size(0);
-  TORCH_CHECK(w.size(1) == K && (K % 256) == 0 && x.stride(1) == 1 && w.stride(1) == 1 && T >= 1 && T <= 8);
-  auto out = torch::empty({T, N}, x.options().dtype(out_bf16 ? torch::kBFloat16 : torch::kFloat32));
+  TORCH_CHECK(w.size(1) == K && (K % 256) == 0 && x.stride(1) == 1 && w.stride(1) == 1 && T >= 1 && T <= 16);
   auto st = c10::hip::getCurrentHIPStream().stream();
   const dim3 grid((N + 3) / 4);
   const uint16_t* xp = reinterpret_cast<const uint16_t*>(x.data_ptr());
   const uint16_t* wp = reinterpret_cast<const uint16_t*>(w.data_ptr());
-  if (out_bf16) {
-    dispatch_bf16_gemv_nt<1>(T, grid, st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
-  } else {
-    dispatch_bf16_gemv_nt<0>(T, grid, st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+
+  // T==1 on non-pow2-K tall shapes (e.g. DSA idx wq_b 8192x1536): 4x MLP direct kernel peaks at 230 GB/s!
+  if (T == 1 && N >= 4096 && (K & 2047) != 0) {
+    if (out_bf16) {
+      auto out = torch::empty({T, N}, x.options());
+      hipLaunchKernelGGL((k_bf16_gemv_nt<1, 1>), grid, dim3(128), 0, st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+      return out;
+    } else {
+      auto out = torch::empty({T, N}, x.options().dtype(torch::kFloat32));
+      hipLaunchKernelGGL((k_bf16_gemv_nt<1, 0>), grid, dim3(128), 0, st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+      return out;
+    }
   }
-  return out;
+
+  if (out_bf16) {
+    auto out = torch::empty({T, N}, x.options());
+    dispatch_bf16_gemv_xlds512<1>(T, grid, st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+    return out;
+  } else {
+    auto out = torch::empty({T, N}, x.options().dtype(torch::kFloat32));
+    dispatch_bf16_gemv_xlds512<0>(T, grid, st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+    return out;
+  }
 }
 
 // ------------------------------------------------------------------ 21 & 22: Fused NT-Streaming DSA MLA Absorption (6x/tok = 100.7 MB/step!)

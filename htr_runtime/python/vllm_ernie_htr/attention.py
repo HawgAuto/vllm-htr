@@ -920,7 +920,7 @@ class Ernie5_5IndexerROCm(nn.Module):
         fops = get_fast_ops()
         T = hidden_states.shape[0]
         use_nt = (
-            1 <= T <= 8
+            1 <= T <= 16
             and _os.environ.get("ERNIE_BF16_GEMV_NT", "1") == "1"
             and fops is not None
             and hasattr(fops, "bf16_gemv_nt")
@@ -932,7 +932,7 @@ class Ernie5_5IndexerROCm(nn.Module):
         else:
             q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
-        if use_nt and self.wk_weights_proj.weight.dtype == torch.bfloat16 and (hidden_states.shape[1] % 256) == 0:
+        if use_nt and T <= 8 and self.wk_weights_proj.weight.dtype == torch.bfloat16 and (hidden_states.shape[1] % 256) == 0:
             kw = fops.bf16_gemv_nt(hidden_states.contiguous(), self.wk_weights_proj.weight, True)
         else:
             kw, _ = self.wk_weights_proj(hidden_states)
