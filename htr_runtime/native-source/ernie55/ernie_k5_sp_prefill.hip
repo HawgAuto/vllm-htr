@@ -540,7 +540,7 @@ __device__ __forceinline__ int k5_sw_col4(int row, int col4) {
 
 // Wave 25: 2 WGs/CU (16w/CU, V<=192, vSp=0!) 24 KiB XOR-swizzled STR=8 + ds_store_b64
 //          + compile-time ping-pong j+=2 + b0,b1/1-a snake reuse (11 LDS loads vs 12)!
-template <int SP16 = 1>
+template <int SP16 = 1, int M256 = 0>
 __global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8)))
 void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
     const uint32_t* __restrict__ p16,
@@ -580,8 +580,9 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
   const size_t w_row_base = (size_t)w_sgpr * nt;
   const int rr_0 = m0 + (tid >> 1);
   const int rr_1 = m0 + 128 + (tid >> 1);
-  const uint32_t x_off0 = (uint32_t)(((rr_0 < M) ? rr_0 : (M - 1)) * n + (tid & 1) * 8);
-  const uint32_t x_off1 = (uint32_t)(((rr_1 < M) ? rr_1 : (M - 1)) * n + (tid & 1) * 8);
+  const uint32_t x_off0 = M256 ? (uint32_t)(tid * 8) : (uint32_t)(((rr_0 < M) ? rr_0 : (M - 1)) * n + (tid & 1) * 8);
+  const uint32_t x_off1 = M256 ? (uint32_t)(2048 + tid * 8) : (uint32_t)(((rr_1 < M) ? rr_1 : (M - 1)) * n + (tid & 1) * 8);
+  const _Float16* xt_mb = M256 ? (xt + (size_t)(m0 >> 8) * ((size_t)nt * 4096)) : xt;
   const bool v_rr0 = (rr_0 < M);
   const bool v_rr1 = (rr_1 < M);
 
@@ -598,11 +599,19 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
     }
   };
   auto load_x = [&](int j_idx, uint4 x_reg[2]) {
-    const uint32_t jo = (uint32_t)(j_idx * 16);
-    uint4 r0 = *reinterpret_cast<const uint4*>(xt + (size_t)(x_off0 + jo));
-    uint4 r1 = *reinterpret_cast<const uint4*>(xt + (size_t)(x_off1 + jo));
-    x_reg[0] = v_rr0 ? r0 : make_uint4(0u, 0u, 0u, 0u);
-    x_reg[1] = v_rr1 ? r1 : make_uint4(0u, 0u, 0u, 0u);
+    if constexpr (M256) {
+      const _Float16* xb = xt_mb + (size_t)j_idx * 4096;
+      uint4 r0 = *reinterpret_cast<const uint4*>(xb + x_off0);
+      uint4 r1 = *reinterpret_cast<const uint4*>(xb + x_off1);
+      x_reg[0] = v_rr0 ? r0 : make_uint4(0u, 0u, 0u, 0u);
+      x_reg[1] = v_rr1 ? r1 : make_uint4(0u, 0u, 0u, 0u);
+    } else {
+      const uint32_t jo = (uint32_t)(j_idx * 16);
+      uint4 r0 = *reinterpret_cast<const uint4*>(xt + (size_t)(x_off0 + jo));
+      uint4 r1 = *reinterpret_cast<const uint4*>(xt + (size_t)(x_off1 + jo));
+      x_reg[0] = v_rr0 ? r0 : make_uint4(0u, 0u, 0u, 0u);
+      x_reg[1] = v_rr1 ? r1 : make_uint4(0u, 0u, 0u, 0u);
+    }
   };
   auto decode_store = [&](int buf, const u4v& w4, uint32_t wl, const uint4 x_reg[2]) {
     const int x_rl0 = tid >> 1;
@@ -787,10 +796,15 @@ torch::Tensor dense_prefill_wmma_sp16(
     c10::optional<torch::Tensor> bias, int64_t bm) {
   TORCH_CHECK(p16.is_cuda() && p16.is_contiguous() && p16.dim() == 3 && p16.size(2) == 32);
   TORCH_CHECK(p4.is_cuda() && p4.is_contiguous() && p4.dim() == 3 && p4.size(2) == 8);
-  TORCH_CHECK(xt.is_cuda() && xt.is_contiguous() && xt.dim() == 2 && xt.scalar_type() == torch::kHalf);
+  const bool is_m256 = (xt.dim() == 4);
+  TORCH_CHECK(xt.is_cuda() && xt.is_contiguous() && (xt.dim() == 2 || is_m256) && xt.scalar_type() == torch::kHalf);
   const int mt = (int)p16.size(0), nt = (int)p16.size(1);
-  const int M = (int)xt.size(0);
-  TORCH_CHECK((mt % 8 == 0) && xt.size(1) == nt * 16);
+  const int M = (int)tok.size(0);
+  if (is_m256) {
+    TORCH_CHECK((mt % 8 == 0) && xt.size(0) == (M + 255) / 256 && xt.size(1) == nt && xt.size(2) == 256 && xt.size(3) == 16);
+  } else {
+    TORCH_CHECK((mt % 8 == 0) && xt.size(0) == M && xt.size(1) == nt * 16);
+  }
   auto y = torch::empty({M, mt * 16}, xt.options().dtype(torch::kBFloat16));
   if (M == 0) return y;
   auto st = c10::hip::getCurrentHIPStream().stream();
@@ -803,9 +817,14 @@ torch::Tensor dense_prefill_wmma_sp16(
   const uint16_t* bp = (bias.has_value() && bias->defined())
       ? reinterpret_cast<const uint16_t*>(bias->data_ptr<at::BFloat16>()) : nullptr;
   auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
+  if (is_m256) {
+    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<1, 1>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+                       p16p, p4p, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
+    return y;
+  }
   if (bm <= 0) bm = (M >= 256 && mt > 64) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
   if (bm == 256) {
-    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<1>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<1, 0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
                        p16p, p4p, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
   } else if (bm == 128) {
     hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x128<1>), dim3(mt / 8, (M + 127) / 128, 1), dim3(256), 0, st,
@@ -828,10 +847,15 @@ torch::Tensor dense_prefill_wmma_unsplit(
     torch::Tensor scales, double cb, torch::Tensor sv,
     c10::optional<torch::Tensor> bias, int64_t bm) {
   TORCH_CHECK(qw.is_cuda() && qw.is_contiguous() && qw.dim() == 3 && qw.size(2) == 40);
-  TORCH_CHECK(xt.is_cuda() && xt.is_contiguous() && xt.dim() == 2 && xt.scalar_type() == torch::kHalf);
+  const bool is_m256 = (xt.dim() == 4);
+  TORCH_CHECK(xt.is_cuda() && xt.is_contiguous() && (xt.dim() == 2 || is_m256) && xt.scalar_type() == torch::kHalf);
   const int mt = (int)qw.size(0), nt = (int)qw.size(1);
-  const int M = (int)xt.size(0);
-  TORCH_CHECK((mt % 8 == 0) && xt.size(1) == nt * 16);
+  const int M = (int)tok.size(0);
+  if (is_m256) {
+    TORCH_CHECK((mt % 8 == 0) && xt.size(0) == (M + 255) / 256 && xt.size(1) == nt && xt.size(2) == 256 && xt.size(3) == 16);
+  } else {
+    TORCH_CHECK((mt % 8 == 0) && xt.size(0) == M && xt.size(1) == nt * 16);
+  }
   auto y = torch::empty({M, mt * 16}, xt.options().dtype(torch::kBFloat16));
   if (M == 0) return y;
   auto st = c10::hip::getCurrentHIPStream().stream();
@@ -843,9 +867,14 @@ torch::Tensor dense_prefill_wmma_unsplit(
   const uint16_t* bp = (bias.has_value() && bias->defined())
       ? reinterpret_cast<const uint16_t*>(bias->data_ptr<at::BFloat16>()) : nullptr;
   auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
+  if (is_m256) {
+    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 1>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+                       qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
+    return y;
+  }
   if (bm <= 0) bm = (M >= 256 && mt > 64) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
   if (bm == 256) {
-    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
                        qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
   } else if (bm == 128) {
     hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x128<0>), dim3(mt / 8, (M + 127) / 128, 1), dim3(256), 0, st,
@@ -1055,7 +1084,7 @@ __device__ __forceinline__ float wave_sum_f(float a) {
   return a;
 }
 
-template <int NB>
+template <int NB, int M256 = 0>
 __global__ __launch_bounds__(256) void k_situ_and_mul_htr_prologue(
     const uint16_t* __restrict__ gate_up, // [T, 2*D] bf16 (stride gu_s0)
     const uint8_t* __restrict__ su,       // [D/8] u8
@@ -1114,28 +1143,48 @@ __global__ __launch_bounds__(256) void k_situ_and_mul_htr_prologue(
   }
   __syncthreads();
   const float inv = (1.0f / 11.313708498984761f) * __builtin_amdgcn_rcpf(s_scale);
-  float sum = 0.f;
+  if constexpr (M256) {
+    const int nt = D >> 4;
+    const int mb = row >> 8;
+    const int r_loc = row & 255;
+    _Float16* xt_row = xt + (size_t)mb * ((size_t)nt * 4096) + (size_t)r_loc * 16;
+    const int j_in_blk = lane >> 2;
+    const int e_in_j = (lane & 3) * 4;
 #pragma unroll
-  for (int t = 0; t < NB; ++t) {
-    const int blk = w + 8 * t;
-    if (blk < nblk) {
-      fwht128_wave(v[t], lane);
-      const int base = blk * 128 + lane * 4;
-      const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
-                      (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
-      *reinterpret_cast<h4v*>(xt + (size_t)row * D + base) = h4;
-      sum += (float)h4.x + (float)h4.y + (float)h4.z + (float)h4.w;
+    for (int t = 0; t < NB; ++t) {
+      const int blk = w + 8 * t;
+      if (blk < nblk) {
+        fwht128_wave(v[t], lane);
+        const int j = blk * 8 + j_in_blk;
+        const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
+                        (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
+        *reinterpret_cast<h4v*>(xt_row + (size_t)j * 4096 + e_in_j) = h4;
+      }
     }
-  }
-  sum = wave_sum_f(sum);
-  __syncthreads();
-  if (lane == 0) red[w] = sum;
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    float s = red[0];
+  } else {
+    float sum = 0.f;
 #pragma unroll
-    for (int k = 1; k < 8; ++k) s += red[k];
-    xs[row] = s;
+    for (int t = 0; t < NB; ++t) {
+      const int blk = w + 8 * t;
+      if (blk < nblk) {
+        fwht128_wave(v[t], lane);
+        const int base = blk * 128 + lane * 4;
+        const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
+                        (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
+        *reinterpret_cast<h4v*>(xt + (size_t)row * D + base) = h4;
+        sum += (float)h4.x + (float)h4.y + (float)h4.z + (float)h4.w;
+      }
+    }
+    sum = wave_sum_f(sum);
+    __syncthreads();
+    if (lane == 0) red[w] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float s = red[0];
+#pragma unroll
+      for (int k = 1; k < 8; ++k) s += red[k];
+      xs[row] = s;
+    }
   }
 }
 
@@ -1145,8 +1194,13 @@ std::vector<torch::Tensor> situ_and_mul_htr_prologue(
   const int T = (int)gate_up.size(0);
   const int D = (int)(gate_up.size(1) / 2);
   TORCH_CHECK((gate_up.size(1) == 2 * D) && (D % 128 == 0) && D <= 14336);
-  auto xt = torch::empty({T, D}, gate_up.options().dtype(torch::kHalf));
-  auto xs = torch::empty({T}, gate_up.options().dtype(torch::kFloat32));
+  const bool use_m256 = (T >= 256 && D >= 4096);
+  auto xt = use_m256
+      ? torch::empty({(T + 255) / 256, D / 16, 256, 16}, gate_up.options().dtype(torch::kHalf))
+      : torch::empty({T, D}, gate_up.options().dtype(torch::kHalf));
+  auto xs = use_m256
+      ? torch::empty({0}, gate_up.options().dtype(torch::kFloat32))
+      : torch::empty({T}, gate_up.options().dtype(torch::kFloat32));
   auto tok = torch::empty({T}, gate_up.options().dtype(torch::kFloat32));
   if (T == 0) return {xt, xs, tok};
   const int nblk = D >> 7;
@@ -1155,25 +1209,30 @@ std::vector<torch::Tensor> situ_and_mul_htr_prologue(
   const uint16_t* gup = reinterpret_cast<const uint16_t*>(gate_up.data_ptr());
   const uint8_t* sup = su.data_ptr<uint8_t>();
   _Float16* xtp = reinterpret_cast<_Float16*>(xt.data_ptr<at::Half>());
-  float* xsp = xs.data_ptr<float>();
+  float* xsp = use_m256 ? nullptr : xs.data_ptr<float>();
   float* tokp = tok.data_ptr<float>();
   const float bf = (float)beta, ibf = 1.0f / bf;
   const float lbf = (float)linear_beta, ilbf = (lbf > 0.0f) ? (1.0f / lbf) : 0.0f;
-  if (nb <= 2) {
-    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<2>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+  if (use_m256) {
+    if (nb <= 4) hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    else if (nb <= 8) hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<8, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    else if (nb <= 12) hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<12, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    else hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<14, 1>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+  } else if (nb <= 2) {
+    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<2, 0>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
   } else if (nb <= 4) {
-    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<4>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<4, 0>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
   } else if (nb <= 8) {
-    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<8>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<8, 0>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
   } else if (nb <= 12) {
-    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<12>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<12, 0>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
   } else {
-    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<14>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
+    hipLaunchKernelGGL((k_situ_and_mul_htr_prologue<14, 0>), dim3(T), dim3(256), 0, st, gup, sup, xtp, xsp, tokp, gate_up.stride(0), D, bf, ibf, lbf, ilbf);
   }
   return {xt, xs, tok};
 }
 
-template <int NB>
+template <int NB, int M256 = 0>
 __global__ __launch_bounds__(256) void k_rmsnorm_htr_prologue(
     const uint16_t* __restrict__ x,       // [T, D] bf16 (stride x_s0)
     const uint16_t* __restrict__ norm_w,  // [D] bf16
@@ -1254,28 +1313,48 @@ __global__ __launch_bounds__(256) void k_rmsnorm_htr_prologue(
   }
   __syncthreads();
   const float inv = (1.0f / 11.313708498984761f) * __builtin_amdgcn_rcpf(s_scale);
-  float sum = 0.f;
+  if constexpr (M256) {
+    const int nt = D >> 4;
+    const int mb = row >> 8;
+    const int r_loc = row & 255;
+    _Float16* xt_row = xt + (size_t)mb * ((size_t)nt * 4096) + (size_t)r_loc * 16;
+    const int j_in_blk = lane >> 2;
+    const int e_in_j = (lane & 3) * 4;
 #pragma unroll
-  for (int t = 0; t < NB; ++t) {
-    const int blk = w + 8 * t;
-    if (blk < nblk) {
-      fwht128_wave(v[t], lane);
-      const int base = blk * 128 + lane * 4;
-      const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
-                      (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
-      *reinterpret_cast<h4v*>(xt + (size_t)row * D + base) = h4;
-      sum += (float)h4.x + (float)h4.y + (float)h4.z + (float)h4.w;
+    for (int t = 0; t < NB; ++t) {
+      const int blk = w + 8 * t;
+      if (blk < nblk) {
+        fwht128_wave(v[t], lane);
+        const int j = blk * 8 + j_in_blk;
+        const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
+                        (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
+        *reinterpret_cast<h4v*>(xt_row + (size_t)j * 4096 + e_in_j) = h4;
+      }
     }
-  }
-  sum = wave_sum_f(sum);
-  __syncthreads();
-  if (lane == 0) red[w] = sum;
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    float s = red[0];
+  } else {
+    float sum = 0.f;
 #pragma unroll
-    for (int k = 1; k < 8; ++k) s += red[k];
-    xs[row] = s;
+    for (int t = 0; t < NB; ++t) {
+      const int blk = w + 8 * t;
+      if (blk < nblk) {
+        fwht128_wave(v[t], lane);
+        const int base = blk * 128 + lane * 4;
+        const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
+                        (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
+        *reinterpret_cast<h4v*>(xt + (size_t)row * D + base) = h4;
+        sum += (float)h4.x + (float)h4.y + (float)h4.z + (float)h4.w;
+      }
+    }
+    sum = wave_sum_f(sum);
+    __syncthreads();
+    if (lane == 0) red[w] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float s = red[0];
+#pragma unroll
+      for (int k = 1; k < 8; ++k) s += red[k];
+      xs[row] = s;
+    }
   }
 }
 
@@ -1286,8 +1365,13 @@ std::vector<torch::Tensor> rmsnorm_htr_prologue(
   const int T = (int)x.size(0);
   const int D = (int)x.size(1);
   TORCH_CHECK((D % 128 == 0) && D <= 8192);
-  auto xt = torch::empty({T, D}, x.options().dtype(torch::kHalf));
-  auto xs = torch::empty({T}, x.options().dtype(torch::kFloat32));
+  const bool use_m256 = (T >= 256 && D >= 4096);
+  auto xt = use_m256
+      ? torch::empty({(T + 255) / 256, D / 16, 256, 16}, x.options().dtype(torch::kHalf))
+      : torch::empty({T, D}, x.options().dtype(torch::kHalf));
+  auto xs = use_m256
+      ? torch::empty({0}, x.options().dtype(torch::kFloat32))
+      : torch::empty({T}, x.options().dtype(torch::kFloat32));
   auto tok = torch::empty({T}, x.options().dtype(torch::kFloat32));
   if (T == 0) return {xt, xs, tok};
   const int nb = ((D >> 7) + 7) / 8;
@@ -1296,21 +1380,24 @@ std::vector<torch::Tensor> rmsnorm_htr_prologue(
   const uint16_t* wp = reinterpret_cast<const uint16_t*>(norm_w.data_ptr());
   const uint8_t* sup = su.data_ptr<uint8_t>();
   _Float16* xtp = reinterpret_cast<_Float16*>(xt.data_ptr<at::Half>());
-  float* xsp = xs.data_ptr<float>();
+  float* xsp = use_m256 ? nullptr : xs.data_ptr<float>();
   float* tokp = tok.data_ptr<float>();
-  if (nb <= 2) {
-    hipLaunchKernelGGL((k_rmsnorm_htr_prologue<2>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
+  if (use_m256) {
+    if (nb <= 4) hipLaunchKernelGGL((k_rmsnorm_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
+    else hipLaunchKernelGGL((k_rmsnorm_htr_prologue<8, 1>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
+  } else if (nb <= 2) {
+    hipLaunchKernelGGL((k_rmsnorm_htr_prologue<2, 0>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
   } else if (nb <= 4) {
-    hipLaunchKernelGGL((k_rmsnorm_htr_prologue<4>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
+    hipLaunchKernelGGL((k_rmsnorm_htr_prologue<4, 0>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
   } else {
-    hipLaunchKernelGGL((k_rmsnorm_htr_prologue<8>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
+    hipLaunchKernelGGL((k_rmsnorm_htr_prologue<8, 0>), dim3(T), dim3(256), 0, st, xp, wp, sup, xtp, xsp, tokp, x.stride(0), D, (float)eps);
   }
   return {xt, xs, tok};
 }
 
 // 3. sigmoid_mul_htr_prologue: o [T, D] bf16 * sigmoid(gate [T, D] bf16) -> HTR prologue (xt, xs, tok)
 //    Covers all 6 DSA layers' wo_b(o.flatten(1) * torch.sigmoid(o_gate(q_c))) (-12 launches/step, -384 MB/prefill!)
-template <int NB>
+template <int NB, int M256 = 0>
 __global__ __launch_bounds__(256) void k_sigmoid_mul_htr_prologue(
     const uint16_t* __restrict__ o_in,    // [T, D] bf16 (stride o_s0)
     const uint16_t* __restrict__ g_in,    // [T, D] bf16 (stride g_s0)
@@ -1368,28 +1455,48 @@ __global__ __launch_bounds__(256) void k_sigmoid_mul_htr_prologue(
   }
   __syncthreads();
   const float inv = (1.0f / 11.313708498984761f) * __builtin_amdgcn_rcpf(s_scale);
-  float sum = 0.f;
+  if constexpr (M256) {
+    const int nt = D >> 4;
+    const int mb = row >> 8;
+    const int r_loc = row & 255;
+    _Float16* xt_row = xt + (size_t)mb * ((size_t)nt * 4096) + (size_t)r_loc * 16;
+    const int j_in_blk = lane >> 2;
+    const int e_in_j = (lane & 3) * 4;
 #pragma unroll
-  for (int t = 0; t < NB; ++t) {
-    const int blk = w + 8 * t;
-    if (blk < nblk) {
-      fwht128_wave(v[t], lane);
-      const int base = blk * 128 + lane * 4;
-      const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
-                      (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
-      *reinterpret_cast<h4v*>(xt + (size_t)row * D + base) = h4;
-      sum += (float)h4.x + (float)h4.y + (float)h4.z + (float)h4.w;
+    for (int t = 0; t < NB; ++t) {
+      const int blk = w + 8 * t;
+      if (blk < nblk) {
+        fwht128_wave(v[t], lane);
+        const int j = blk * 8 + j_in_blk;
+        const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
+                        (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
+        *reinterpret_cast<h4v*>(xt_row + (size_t)j * 4096 + e_in_j) = h4;
+      }
     }
-  }
-  sum = wave_sum_f(sum);
-  __syncthreads();
-  if (lane == 0) red[w] = sum;
-  __syncthreads();
-  if (threadIdx.x == 0) {
-    float s = red[0];
+  } else {
+    float sum = 0.f;
 #pragma unroll
-    for (int k = 1; k < 8; ++k) s += red[k];
-    xs[row] = s;
+    for (int t = 0; t < NB; ++t) {
+      const int blk = w + 8 * t;
+      if (blk < nblk) {
+        fwht128_wave(v[t], lane);
+        const int base = blk * 128 + lane * 4;
+        const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
+                        (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
+        *reinterpret_cast<h4v*>(xt + (size_t)row * D + base) = h4;
+        sum += (float)h4.x + (float)h4.y + (float)h4.z + (float)h4.w;
+      }
+    }
+    sum = wave_sum_f(sum);
+    __syncthreads();
+    if (lane == 0) red[w] = sum;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      float s = red[0];
+#pragma unroll
+      for (int k = 1; k < 8; ++k) s += red[k];
+      xs[row] = s;
+    }
   }
 }
 
@@ -1400,8 +1507,13 @@ std::vector<torch::Tensor> sigmoid_mul_htr_prologue(
   const int T = (int)o_in.size(0);
   const int D = (int)o_in.size(1);
   TORCH_CHECK(g_in.size(0) == T && g_in.size(1) == D && (D % 128 == 0) && D <= 8192);
-  auto xt = torch::empty({T, D}, o_in.options().dtype(torch::kHalf));
-  auto xs = torch::empty({T}, o_in.options().dtype(torch::kFloat32));
+  const bool use_m256 = (T >= 256 && D >= 4096);
+  auto xt = use_m256
+      ? torch::empty({(T + 255) / 256, D / 16, 256, 16}, o_in.options().dtype(torch::kHalf))
+      : torch::empty({T, D}, o_in.options().dtype(torch::kHalf));
+  auto xs = use_m256
+      ? torch::empty({0}, o_in.options().dtype(torch::kFloat32))
+      : torch::empty({T}, o_in.options().dtype(torch::kFloat32));
   auto tok = torch::empty({T}, o_in.options().dtype(torch::kFloat32));
   if (T == 0) return {xt, xs, tok};
   const int nb = ((D >> 7) + 7) / 8;
@@ -1410,14 +1522,17 @@ std::vector<torch::Tensor> sigmoid_mul_htr_prologue(
   const uint16_t* gp = reinterpret_cast<const uint16_t*>(g_in.data_ptr());
   const uint8_t* sup = su.data_ptr<uint8_t>();
   _Float16* xtp = reinterpret_cast<_Float16*>(xt.data_ptr<at::Half>());
-  float* xsp = xs.data_ptr<float>();
+  float* xsp = use_m256 ? nullptr : xs.data_ptr<float>();
   float* tokp = tok.data_ptr<float>();
-  if (nb <= 2) {
-    hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<2>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
+  if (use_m256) {
+    if (nb <= 4) hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<4, 1>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
+    else hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<8, 1>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
+  } else if (nb <= 2) {
+    hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<2, 0>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
   } else if (nb <= 4) {
-    hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<4>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
+    hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<4, 0>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
   } else {
-    hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<8>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
+    hipLaunchKernelGGL((k_sigmoid_mul_htr_prologue<8, 0>), dim3(T), dim3(256), 0, st, op, gp, sup, xtp, xsp, tokp, o_in.stride(0), g_in.stride(0), D);
   }
   return {xt, xs, tok};
 }
@@ -2655,6 +2770,190 @@ torch::Tensor gemv_k5_unsplit_epi(
   return y;
 }
 
+
+// ============================================================================
+// Wave 31: Direct M256-blocked HTR prologue [ceil(T/256), D/16, 256, 16] fp16
+// Eliminates power-of-2 row-stride L1/GL2 set thrashing in 128x256_4x4 WMMA
+// for D >= 4096, and skips unused xs reduction!
+// ============================================================================
+template <int NB>
+__global__ __launch_bounds__(256) void k_prologue_b16_m256_1r(
+    const uint16_t* __restrict__ x,       // [T, D] bf16
+    const uint8_t* __restrict__ su,       // [D/8] u8
+    _Float16* __restrict__ xt,            // [M_blk, nt, 256, 16] fp16
+    float* __restrict__ tok,              // [T] fp32
+    int64_t x_s0, int D) {
+  __shared__ float red[8];
+  __shared__ float s_scale;
+  const int row = blockIdx.x;
+  const int lane = threadIdx.x & 31;
+  const int w = threadIdx.x >> 5;
+  const int nblk = D >> 7;
+  const int nt = D >> 4;
+  const uint16_t* xr = x + (int64_t)row * x_s0;
+
+  float v[NB][4];
+  float amax = 0.f;
+#pragma unroll
+  for (int t = 0; t < NB; ++t) {
+    const int blk = w + 8 * t;
+    if (blk < nblk) {
+      const int base = blk * 128 + lane * 4;
+      const uint2 rx = *reinterpret_cast<const uint2*>(xr + base);
+      const float xv[4] = {
+        __uint_as_float((rx.x & 0xFFFFu) << 16), __uint_as_float(rx.x & 0xFFFF0000u),
+        __uint_as_float((rx.y & 0xFFFFu) << 16), __uint_as_float(rx.y & 0xFFFF0000u),
+      };
+      const unsigned sg4 = (unsigned)su[base >> 3] >> (base & 7);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) {
+        amax = fmaxf(amax, fabsf(xv[e]));
+        v[t][e] = ((sg4 >> e) & 1u) ? -xv[e] : xv[e];
+      }
+    }
+  }
+  amax = wave_max_f(amax);
+  if (lane == 0) red[w] = amax;
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float m = red[0];
+#pragma unroll
+    for (int k = 1; k < 8; ++k) m = fmaxf(m, red[k]);
+    const float bound = m * 11.4f;
+    s_scale = bound > 30000.f ? exp2f(ceilf(log2f(bound * (1.0f / 30000.f)))) : 1.f;
+    tok[row] = s_scale;
+  }
+  __syncthreads();
+  const float inv = (1.0f / 11.313708498984761f) * __builtin_amdgcn_rcpf(s_scale);
+  const int mb = row >> 8;
+  const int r_loc = row & 255;
+  _Float16* xt_row = xt + (size_t)mb * ((size_t)nt * 4096) + (size_t)r_loc * 16;
+  const int j_in_blk = lane >> 2;
+  const int e_in_j = (lane & 3) * 4;
+#pragma unroll
+  for (int t = 0; t < NB; ++t) {
+    const int blk = w + 8 * t;
+    if (blk < nblk) {
+      fwht128_wave(v[t], lane);
+      const int j = blk * 8 + j_in_blk;
+      const h4v h4 = {(_Float16)(v[t][0] * inv), (_Float16)(v[t][1] * inv),
+                      (_Float16)(v[t][2] * inv), (_Float16)(v[t][3] * inv)};
+      *reinterpret_cast<h4v*>(xt_row + (size_t)j * 4096 + e_in_j) = h4;
+    }
+  }
+}
+
+__global__ __launch_bounds__(256) void k_prologue_b16_m256_4r2p(
+    const uint16_t* __restrict__ x,       // [T, D] bf16
+    const uint8_t* __restrict__ su,       // [D/8] u8
+    _Float16* __restrict__ xt,            // [M_blk, nt, 256, 16] fp16
+    float* __restrict__ tok,              // [T] fp32
+    int64_t x_s0, int T, int D) {
+  __shared__ __attribute__((aligned(16))) _Float16 s_blk[2][4][128]; // 2 KiB
+  __shared__ float s_amax[4][2];
+  const int w = threadIdx.x >> 5;
+  const int lane = threadIdx.x & 31;
+  const int r_in = w >> 1;
+  const int w_half = w & 1;
+  const int row0 = blockIdx.x * 4;
+  const int row = row0 + r_in;
+  const int nblk = D >> 7;
+  const int nt = D >> 4;
+  const bool valid = (row < T);
+  const uint16_t* xr = valid ? (x + (int64_t)row * x_s0) : x;
+
+  float amax = 0.f;
+  if (valid) {
+    const int n256 = D >> 8;
+    for (int b2 = w_half; b2 < n256; b2 += 2) {
+      const u4v rx = *reinterpret_cast<const u4va*>(xr + b2 * 256 + lane * 8);
+      auto f_abs_pair = [](uint32_t p) -> float {
+        return fmaxf(fabsf(__uint_as_float((p & 0xFFFFu) << 16)), fabsf(__uint_as_float(p & 0xFFFF0000u)));
+      };
+      amax = fmaxf(amax, fmaxf(fmaxf(f_abs_pair(rx.x), f_abs_pair(rx.y)),
+                               fmaxf(f_abs_pair(rx.z), f_abs_pair(rx.w))));
+    }
+    if ((D & 255) != 0 && w_half == 0) {
+      const uint2 rx = *reinterpret_cast<const uint2*>(xr + n256 * 256 + lane * 4);
+      amax = fmaxf(amax, fmaxf(fabsf(__uint_as_float((rx.x & 0xFFFFu) << 16)), fabsf(__uint_as_float(rx.x & 0xFFFF0000u))));
+      amax = fmaxf(amax, fmaxf(fabsf(__uint_as_float((rx.y & 0xFFFFu) << 16)), fabsf(__uint_as_float(rx.y & 0xFFFF0000u))));
+    }
+  }
+  amax = wave_max_f(amax);
+  if (lane == 0) s_amax[r_in][w_half] = amax;
+  __syncthreads();
+  float sc = 1.f;
+  if (valid) {
+    const float m = fmaxf(s_amax[r_in][0], s_amax[r_in][1]);
+    const float bound = m * 11.4f;
+    sc = bound > 30000.f ? exp2f(ceilf(log2f(bound * (1.0f / 30000.f)))) : 1.f;
+    if (w_half == 0 && lane == 0) tok[row] = sc;
+  }
+  const float inv = (1.0f / 11.313708498984761f) * __builtin_amdgcn_rcpf(sc);
+
+  const int mb = row0 >> 8;
+  const int r_loc0 = row0 & 255;
+  _Float16* xt_base = xt + (size_t)mb * ((size_t)nt * 4096) + (size_t)r_loc0 * 16;
+  const int out_r = lane >> 3;
+  const int out_e = (lane & 7) * 2;
+
+  for (int blk0 = 0; blk0 < nblk; blk0 += 2) {
+    const int blk = blk0 + w_half;
+    if (valid && blk < nblk) {
+      const int base = blk * 128 + lane * 4;
+      const uint2 rx = *reinterpret_cast<const uint2*>(xr + base);
+      float v[4] = {
+        __uint_as_float((rx.x & 0xFFFFu) << 16), __uint_as_float(rx.x & 0xFFFF0000u),
+        __uint_as_float((rx.y & 0xFFFFu) << 16), __uint_as_float(rx.y & 0xFFFF0000u),
+      };
+      const unsigned sg4 = (unsigned)su[base >> 3] >> (base & 7);
+#pragma unroll
+      for (int e = 0; e < 4; ++e) if ((sg4 >> e) & 1u) v[e] = -v[e];
+      fwht128_wave(v, lane);
+      const h4v h4 = {(_Float16)(v[0] * inv), (_Float16)(v[1] * inv),
+                      (_Float16)(v[2] * inv), (_Float16)(v[3] * inv)};
+      *reinterpret_cast<h4v*>(&s_blk[w_half][r_in][lane * 4]) = h4;
+    }
+    __syncthreads();
+    {
+      const int j0 = blk0 * 8 + w;
+      const uint32_t p0 = *reinterpret_cast<const uint32_t*>(&s_blk[0][out_r][w * 16 + out_e]);
+      *reinterpret_cast<uint32_t*>(xt_base + (size_t)j0 * 4096 + out_r * 16 + out_e) = p0;
+    }
+    if (blk0 + 1 < nblk) {
+      const int j1 = (blk0 + 1) * 8 + w;
+      const uint32_t p1 = *reinterpret_cast<const uint32_t*>(&s_blk[1][out_r][w * 16 + out_e]);
+      *reinterpret_cast<uint32_t*>(xt_base + (size_t)j1 * 4096 + out_r * 16 + out_e) = p1;
+    }
+    __syncthreads();
+  }
+}
+
+std::vector<torch::Tensor> prologue_b16_m256(torch::Tensor x, torch::Tensor su) {
+  TORCH_CHECK(x.is_cuda() && x.dim() == 2 && x.scalar_type() == torch::kBFloat16 && x.stride(1) == 1);
+  const int T = (int)x.size(0);
+  const int D = (int)x.size(1);
+  TORCH_CHECK((D % 128 == 0) && D > 0);
+  const int m_blks = (T + 255) / 256;
+  const int nt = D >> 4;
+  auto xt = torch::empty({m_blks, nt, 256, 16}, x.options().dtype(torch::kHalf));
+  auto tok = torch::empty({T}, x.options().dtype(torch::kFloat32));
+  if (T == 0) return {xt, tok};
+  auto st = c10::hip::getCurrentHIPStream().stream();
+  auto xp = reinterpret_cast<const uint16_t*>(x.data_ptr());
+  auto sup = su.data_ptr<uint8_t>();
+  auto xtp = reinterpret_cast<_Float16*>(xt.data_ptr<at::Half>());
+  auto tokp = tok.data_ptr<float>();
+  const int nb = ((D >> 7) + 7) / 8;
+  if (D <= 4096) {
+    if (nb <= 2) hipLaunchKernelGGL((k_prologue_b16_m256_1r<2>), dim3(T), dim3(256), 0, st, xp, sup, xtp, tokp, x.stride(0), D);
+    else hipLaunchKernelGGL((k_prologue_b16_m256_1r<4>), dim3(T), dim3(256), 0, st, xp, sup, xtp, tokp, x.stride(0), D);
+  } else {
+    hipLaunchKernelGGL(k_prologue_b16_m256_4r2p, dim3((T + 3) / 4), dim3(256), 0, st, xp, sup, xtp, tokp, x.stride(0), T, D);
+  }
+  return {xt, tok};
+}
+
 PYBIND11_MODULE(ernie_k5_sp_prefill, m) {
   m.def("repack_k5_packed", &repack_k5_packed);
   m.def("dense_prefill_wmma_sp16", &dense_prefill_wmma_sp16);
@@ -2664,5 +2963,6 @@ PYBIND11_MODULE(ernie_k5_sp_prefill, m) {
   m.def("rmsnorm_htr_prologue", &rmsnorm_htr_prologue);
   m.def("sigmoid_mul_htr_prologue", &sigmoid_mul_htr_prologue);
   m.def("gemv_k5_unsplit_epi", &gemv_k5_unsplit_epi);
+  m.def("prologue_b16_m256", &prologue_b16_m256);
 }
 

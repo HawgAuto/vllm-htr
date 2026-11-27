@@ -1226,7 +1226,7 @@ def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
     """Execute an ERNIE-5.5 K=5 linear (unsplit or repacked) using pre-computed (xt, xs, tok)."""
     import torch
     import htr.ops as htr_ops
-    M = xt.shape[0]
+    M = tok.shape[0]
     mt, nt = qweight.shape[0], qweight.shape[1]
     if M == 0:
         return xt.new_empty((0, mt * 16), dtype=torch.bfloat16)
@@ -1257,7 +1257,8 @@ def htr_k5sp_linear_pre_prologued(xt, xs, tok, qweight, scales, sv, bias=None):
             )
         if sp_ext is not None and hasattr(sp_ext, "dense_prefill_wmma_unsplit") and (mt % 8) == 0:
             return sp_ext.dense_prefill_wmma_unsplit(qweight, xt, tok, scales, float(htr_ops.CB), sv, bias, 0)
-        return htr_ops._dpw_ext().dense_prefill_wmma(qweight, xt, tok, scales, htr_ops.CB, sv, bias)
+        xt_2d = xt.permute(0, 2, 1, 3).reshape(-1, nt * 16)[:M].contiguous() if xt.dim() == 4 else xt
+        return htr_ops._dpw_ext().dense_prefill_wmma(qweight, xt_2d, tok, scales, htr_ops.CB, sv, bias)
     flat = qweight.view(-1)
     n16 = mt * nt * 32
     p16 = flat[:n16].view(mt, nt, 32)
@@ -1347,6 +1348,11 @@ def _patch_htr_linear_for_repacked_k5() -> None:
                     from .fast_ops import get_k5_sp_prefill
                     sp_ext = get_k5_sp_prefill()
                     if sp_ext is not None and hasattr(sp_ext, "dense_prefill_wmma_unsplit"):
+                        if M >= 256 and mt > 64 and qweight.shape[1] >= 256 and x2.dtype == torch.bfloat16 and hasattr(sp_ext, "prologue_b16_m256"):
+                            xt, tok = sp_ext.prologue_b16_m256(x2, su)
+                            return sp_ext.dense_prefill_wmma_unsplit(
+                                qweight, xt, tok, scales, float(htr_ops.CB), sv, bias, 256
+                            )
                         xt, xs, tok = htr_ops.ext().prologue(x2, su)
                         return sp_ext.dense_prefill_wmma_unsplit(
                             qweight, xt, tok, scales, float(htr_ops.CB), sv, bias, 0
@@ -1396,8 +1402,12 @@ def _patch_htr_linear_for_repacked_k5() -> None:
         from .fast_ops import get_k5_sp_prefill
         sp_ext = get_k5_sp_prefill()
         x_in = x2 if x2.dtype == torch.bfloat16 else x2.to(torch.bfloat16)
-        xt, xs, tok = E.prologue(x_in, su)
-        y = sp_ext.dense_prefill_wmma_sp16(p16, p4, xt, tok, scales, float(htr_ops.CB), sv, bias, 0)
+        if M >= 256 and mt > 64 and nt >= 256 and hasattr(sp_ext, "prologue_b16_m256"):
+            xt, tok = sp_ext.prologue_b16_m256(x_in, su)
+            y = sp_ext.dense_prefill_wmma_sp16(p16, p4, xt, tok, scales, float(htr_ops.CB), sv, bias, 256)
+        else:
+            xt, xs, tok = E.prologue(x_in, su)
+            y = sp_ext.dense_prefill_wmma_sp16(p16, p4, xt, tok, scales, float(htr_ops.CB), sv, bias, 0)
         return y if x2.dtype == torch.bfloat16 else y.to(x2.dtype)
 
     _linear_impl_k5sp._ernie5_k5sp_inplace = True  # type: ignore[attr-defined]
