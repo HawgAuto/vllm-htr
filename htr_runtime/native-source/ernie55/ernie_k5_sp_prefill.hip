@@ -564,8 +564,11 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
   __shared__ __attribute__((aligned(16))) SharedMem smem;
 
   const int tid = threadIdx.x;
-  const int b = blockIdx.x;
-  const int m0 = (gridDim.y - 1 - blockIdx.y) * 256;
+  // Wave 48: Zero-div 3D serpentine GL2 tile swizzle (dim3(gx, nm, gz), gx=8 when nm>=4 && nb>8)
+  const int b = (int)(blockIdx.z * gridDim.x + blockIdx.x);
+  if (b >= (mt >> 3)) return;
+  const int mb = (blockIdx.z & 1) ? ((int)gridDim.y - 1 - (int)blockIdx.y) : (int)blockIdx.y;
+  const int m0 = mb * 256;
   const int n = nt * 16;
 
   f8v acc[4][4];
@@ -788,6 +791,11 @@ void k_dense_prefill_wmma_k5sp_v28_128x256_4x4(
 
 // === V28_4X4_END ===
 
+static inline dim3 k5sp_grid_3d_swz(int nb, int nm) {
+  const int gx = (nm >= 4 && nb > 8) ? 8 : nb;
+  return dim3(gx, nm, (nb + gx - 1) / gx);
+}
+
 torch::Tensor repack_k5_packed(torch::Tensor qw) {
   TORCH_CHECK(qw.is_cuda() && qw.is_contiguous() && qw.dim() == 3 && qw.size(2) == 40 && qw.scalar_type() == torch::kInt32);
   const int64_t ntiles = qw.size(0) * qw.size(1);
@@ -829,13 +837,13 @@ torch::Tensor dense_prefill_wmma_sp16(
       ? reinterpret_cast<const uint16_t*>(bias->data_ptr<at::BFloat16>()) : nullptr;
   auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
   if (is_m256) {
-    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<1, 1>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<1, 1>), k5sp_grid_3d_swz(mt / 8, (M + 255) / 256), dim3(256), 0, st,
                        p16p, p4p, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
     return y;
   }
   if (bm <= 0) bm = (M >= 256 && mt > 64) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
   if (bm == 256) {
-    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<1, 0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<1, 0>), k5sp_grid_3d_swz(mt / 8, (M + 255) / 256), dim3(256), 0, st,
                        p16p, p4p, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
   } else if (bm == 128) {
     hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x128<1>), dim3(mt / 8, (M + 127) / 128, 1), dim3(256), 0, st,
@@ -886,10 +894,10 @@ torch::Tensor dense_prefill_wmma_unsplit(
     torch::Tensor y = has_acc ? *accum_out : torch::empty({M, mt * 16}, xt.options().dtype(torch::kBFloat16));
     auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
     if (has_acc) {
-      hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 1, 1>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+      hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 1, 1>), k5sp_grid_3d_swz(mt / 8, (M + 255) / 256), dim3(256), 0, st,
                          qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
     } else {
-      hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 1, 0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+      hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 1, 0>), k5sp_grid_3d_swz(mt / 8, (M + 255) / 256), dim3(256), 0, st,
                          qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
     }
     return y;
@@ -898,7 +906,7 @@ torch::Tensor dense_prefill_wmma_unsplit(
   auto yp = reinterpret_cast<uint16_t*>(y.data_ptr<at::BFloat16>());
   if (bm <= 0) bm = (M >= 256 && mt > 64) ? 256 : (M >= 128 ? 128 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
   if (bm == 256) {
-    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 0>), dim3(mt / 8, (M + 255) / 256, 1), dim3(256), 0, st,
+    hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x256_4x4<0, 0>), k5sp_grid_3d_swz(mt / 8, (M + 255) / 256), dim3(256), 0, st,
                        qwp, nullptr, xp, tp, sp, (float)cb, svp, bp, yp, M, mt, nt);
   } else if (bm == 128) {
     hipLaunchKernelGGL((k_dense_prefill_wmma_k5sp_v28_128x128<0>), dim3(mt / 8, (M + 127) / 128, 1), dim3(256), 0, st,
