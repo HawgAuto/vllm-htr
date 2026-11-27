@@ -441,7 +441,7 @@ class Ernie5_5MoE(nn.Module):
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         T = hidden_states.shape[0]
         if (
-            1 <= T <= 8
+            1 <= T <= 16
             and os.environ.get("ERNIE_ROUTER_GEMV_NT", "1") == "1"
             and os.environ.get("ERNIE_BF16_GEMV_NT", "1") == "1"
             and hidden_states.is_cuda
@@ -452,6 +452,22 @@ class Ernie5_5MoE(nn.Module):
             fops = get_fast_ops()
             if fops is not None and hasattr(fops, "bf16_gemv_nt"):
                 logits = fops.bf16_gemv_nt(hidden_states.contiguous(), self.gate.weight)
+            else:
+                logits, _ = self.gate(hidden_states)
+        elif (
+            T > 16
+            and os.environ.get("ERNIE_ROUTER_GEMM_WMMA", "1") == "1"
+            and hidden_states.is_cuda
+            and hidden_states.dtype == torch.bfloat16
+            and self.gate.weight.dtype == torch.bfloat16
+            and (hidden_states.shape[1] % 128) == 0
+            and (self.gate.weight.shape[0] % 64) == 0
+        ):
+            fops = get_fast_ops()
+            if fops is not None and hasattr(fops, "bf16_gemm_f32_out"):
+                logits = fops.bf16_gemm_f32_out(
+                    hidden_states.contiguous(), self.gate.weight.contiguous()
+                )
             else:
                 logits, _ = self.gate(hidden_states)
         else:
