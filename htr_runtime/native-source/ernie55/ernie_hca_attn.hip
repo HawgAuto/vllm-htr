@@ -1135,8 +1135,9 @@ void ernie_hca_decode(
     }
   };
 
-  // Wave 15B: 64H/WG dim3(512) pipelined HCA decode (V<=192 2 WGs/WGP, 20-WGP-matched S=20/6/3)
-  if (pow2_bs && H == 64 && (has_extra || main_indices.numel() > (int64_t)T * 256)) {
+  // Wave 15B + Wave 23: 64H/WG dim3(512) pipelined HCA decode (V<=192, S=3 cuts part_o 2x at T=3..8!)
+  // Also route short-ctx SWA-only (T=3..8, K>=64) through 512_v28 S=3 (-0.28ms/37L vs qreg_v28 S=4!)
+  if (pow2_bs && H == 64 && (has_extra || main_indices.numel() > (int64_t)T * 256 || (T >= 3 && T <= 8 && main_indices.numel() >= (int64_t)T * 64))) {
     auto run_512 = [&](auto tag) {
       constexpr int S = decltype(tag)::value;
       if (has_extra) {
@@ -1159,7 +1160,6 @@ void ernie_hca_decode(
     const int64_t cap = part_o.numel();
     if (T <= 2 && cap >= (int64_t)T * 64 * 20 * HCA_DIM) run_512(std::integral_constant<int, 20>{});
     else if (T <= 2)      run_512(std::integral_constant<int, 8>{});
-    else if (T <= 6)      run_512(std::integral_constant<int, 6>{});
     else                  run_512(std::integral_constant<int, 3>{});
     return;
   }
