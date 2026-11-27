@@ -1308,7 +1308,7 @@ class Ernie5_5ROCmSparseMLAImpl(MLAAttentionImpl[Ernie5_5ROCmSparseMLAMetadata])
             and q_act.is_cuda
             and q_act.dtype == torch.bfloat16
             and self._w_uk_rm.dtype == torch.bfloat16
-            and num_actual >= 64
+            and (1 <= num_actual <= 16 or num_actual >= 64)
             and self.num_heads == 64
             and self.qk_nope_head_dim in (128, 192)
             and self.kv_lora_rank == 512
@@ -1410,7 +1410,7 @@ class Ernie5_5ROCmSparseMLAImpl(MLAAttentionImpl[Ernie5_5ROCmSparseMLAMetadata])
             and attn_latent.is_cuda
             and attn_latent.dtype == torch.bfloat16
             and self._w_uv_rm.dtype == torch.bfloat16
-            and num_actual >= 256
+            and (1 <= num_actual <= 16 or num_actual >= 256)
             and self.num_heads == 64
             and self.kv_lora_rank == 512
             and self.v_head_dim in (128, 256)
