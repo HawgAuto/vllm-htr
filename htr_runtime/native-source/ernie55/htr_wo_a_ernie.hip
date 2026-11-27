@@ -1562,6 +1562,167 @@ __global__ __launch_bounds__(256) void k_vha_wo_a_prologue(
   }
 }
 
+
+// Wave 53: 1 WG/token (dim3(T), 256 thr -> ALL 64 heads = 8 groups!) for T >= 64!
+//   - Cuts global O[t, 64, 512] reads & scalar O_lds ds_store_b16 by 4x (hits 181 GB/s R+W roof!)
+//   - Keeps cached h4v stores for GL2 write-combining (-13.9 ms/4K, 1.126x, 0.0 bit-exact!)
+__global__ __launch_bounds__(256) void k_vha_wo_a_prologue_1wg(
+    const uint16_t* __restrict__ M_ptr,
+    const uint16_t* __restrict__ o_ptr,
+    const uint8_t* __restrict__ su,
+    _Float16* __restrict__ xt,
+    float* __restrict__ tok,
+    int T, int64_t o_s0, int64_t o_s1) {
+  __shared__ __attribute__((aligned(16))) uint16_t M_lds[64][72]; // 9,216 B
+  __shared__ __attribute__((aligned(16))) union {
+    uint16_t O_lds[512][18];                                      // 18,432 B
+    uint16_t Y_lds[16][512];                                      // 16,384 B
+  } smem;                                                         // 27,648 B -> 4 WGs/WGP!
+  __shared__ float s_wmax[8];
+
+  const int t   = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int w   = tid >> 5;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hb  = lane >> 4;
+
+  // 1. Load ALL 64x64 of M_ptr into M_lds (256 threads x 16 bf16 = 4096 exact!)
+  {
+    const int mr = tid >> 3;
+    const int mc = (tid & 7) * 8;
+    *reinterpret_cast<u4va*>(&M_lds[mr][mc])      = *reinterpret_cast<const u4va*>(M_ptr + mr * 64 + mc);
+    *reinterpret_cast<u4va*>(&M_lds[mr + 32][mc]) = *reinterpret_cast<const u4va*>(M_ptr + (mr + 32) * 64 + mc);
+  }
+
+  const int kr_ld = tid >> 4;
+  const int sub_ld = tid & 15;
+  const uint16_t* o_tok = o_ptr + (int64_t)t * o_s0;
+
+  f8v acc[4][4];
+#pragma unroll
+  for (int hm = 0; hm < 4; ++hm)
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) acc[hm][ni] = f8v{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+  u4v o_cur[4];
+  {
+    const uint16_t* src0 = o_tok + (int64_t)kr_ld * o_s1 + sub_ld * 8;
+#pragma unroll
+    for (int c = 0; c < 4; ++c) o_cur[c] = *reinterpret_cast<const u4va*>(src0 + c * 128);
+  }
+
+#pragma unroll
+  for (int k = 0; k < 4; ++k) {
+#pragma unroll
+    for (int c = 0; c < 4; ++c) {
+      const int col0 = c * 128 + sub_ld * 8;
+      const uint32_t w0 = o_cur[c].x, w1 = o_cur[c].y, w2 = o_cur[c].z, w3 = o_cur[c].w;
+      smem.O_lds[col0 + 0][kr_ld] = (uint16_t)(w0 & 0xFFFFu);
+      smem.O_lds[col0 + 1][kr_ld] = (uint16_t)(w0 >> 16);
+      smem.O_lds[col0 + 2][kr_ld] = (uint16_t)(w1 & 0xFFFFu);
+      smem.O_lds[col0 + 3][kr_ld] = (uint16_t)(w1 >> 16);
+      smem.O_lds[col0 + 4][kr_ld] = (uint16_t)(w2 & 0xFFFFu);
+      smem.O_lds[col0 + 5][kr_ld] = (uint16_t)(w2 >> 16);
+      smem.O_lds[col0 + 6][kr_ld] = (uint16_t)(w3 & 0xFFFFu);
+      smem.O_lds[col0 + 7][kr_ld] = (uint16_t)(w3 >> 16);
+    }
+    woa_lds_barrier();
+
+    u4v o_nxt[4];
+    if (k < 3) {
+      const uint16_t* srcn = o_tok + (int64_t)((k + 1) * 16 + kr_ld) * o_s1 + sub_ld * 8;
+#pragma unroll
+      for (int c = 0; c < 4; ++c) o_nxt[c] = *reinterpret_cast<const u4va*>(srcn + c * 128);
+    }
+    __builtin_amdgcn_sched_barrier(0);
+
+    vha_bf16x16 af[4];
+#pragma unroll
+    for (int hm = 0; hm < 4; ++hm) {
+      const u4v a0 = *reinterpret_cast<const u4va*>(&M_lds[hm * 16 + l16][k * 16 + 0]);
+      const u4v a1 = *reinterpret_cast<const u4va*>(&M_lds[hm * 16 + l16][k * 16 + 8]);
+      af[hm] = __builtin_bit_cast(vha_bf16x16, (vha_u8v){a0.x, a0.y, a0.z, a0.w, a1.x, a1.y, a1.z, a1.w});
+    }
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+      const int col_l = w * 64 + ni * 16 + l16;
+      const u4v b0 = *reinterpret_cast<const u4va*>(&smem.O_lds[col_l][0]);
+      const u4v b1 = *reinterpret_cast<const u4va*>(&smem.O_lds[col_l][8]);
+      const vha_bf16x16 bf = __builtin_bit_cast(vha_bf16x16, (vha_u8v){b0.x, b0.y, b0.z, b0.w, b1.x, b1.y, b1.z, b1.w});
+#pragma unroll
+      for (int hm = 0; hm < 4; ++hm) {
+        acc[hm][ni] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(af[hm], bf, acc[hm][ni]);
+      }
+    }
+    woa_lds_barrier();
+    if (k < 3) {
+#pragma unroll
+      for (int c = 0; c < 4; ++c) o_cur[c] = o_nxt[c];
+    }
+  }
+
+  const int sub_blk = lane >> 4;
+  const int col64 = (lane & 15) * 4;
+#pragma unroll 1
+  for (int hm = 0; hm < 4; ++hm) {
+    if (hm > 0) woa_lds_barrier();
+#pragma unroll
+    for (int ni = 0; ni < 4; ++ni) {
+      const int col = w * 64 + ni * 16 + l16;
+      const f8v cur = (hm == 0) ? acc[0][ni] : (hm == 1) ? acc[1][ni] : (hm == 2) ? acc[2][ni] : acc[3][ni];
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) smem.Y_lds[2 * ei + hb][col] = f2bf(cur[ei]);
+    }
+    woa_lds_barrier();
+#pragma unroll 1
+    for (int gi = 0; gi < 2; ++gi) {
+      const int grp = hm * 2 + gi;
+      const uint16_t* xr = &smem.Y_lds[gi * 8][0];
+      const uint8_t* sup = su + (size_t)grp * 512;
+      float vals[4][4];
+      float am = 0.0f;
+#pragma unroll
+      for (int bl = 0; bl < 4; ++bl) {
+        const int base = (w * 4 + bl) * 128 + lane * 4;
+        const uint2 raw = *reinterpret_cast<const uint2*>(xr + base);
+        vals[bl][0] = __uint_as_float((raw.x & 0xFFFFu) << 16);
+        vals[bl][1] = __uint_as_float(raw.x & 0xFFFF0000u);
+        vals[bl][2] = __uint_as_float((raw.y & 0xFFFFu) << 16);
+        vals[bl][3] = __uint_as_float(raw.y & 0xFFFF0000u);
+        const unsigned sg4 = (unsigned)sup[base >> 3] >> (base & 7);
+        if (sg4 & 1u) vals[bl][0] = -vals[bl][0];
+        if (sg4 & 2u) vals[bl][1] = -vals[bl][1];
+        if (sg4 & 4u) vals[bl][2] = -vals[bl][2];
+        if (sg4 & 8u) vals[bl][3] = -vals[bl][3];
+        fwht128_wave(vals[bl], lane);
+#pragma unroll
+        for (int e2 = 0; e2 < 4; ++e2) {
+          vals[bl][e2] *= (1.0f / 11.313708498984761f);
+          am = fmaxf(am, fabsf(vals[bl][e2]));
+        }
+      }
+      am = wave_max(am);
+      if (lane == 0) s_wmax[w] = am;
+      woa_lds_barrier();
+      float gmax = s_wmax[0];
+#pragma unroll
+      for (int i = 1; i < 8; ++i) gmax = fmaxf(gmax, s_wmax[i]);
+      const float tscale = fmaxf(gmax, 1e-12f) * (1.0f / 32.0f);
+      const float inv = __builtin_amdgcn_rcpf(tscale);
+      if (tid == 0) tok[(size_t)t * 8 + grp] = tscale;
+      _Float16* dst_g = xt + (size_t)grp * 64 * (size_t)T * 64 + (size_t)t * 64 + col64;
+#pragma unroll
+      for (int bl = 0; bl < 4; ++bl) {
+        const int jblk = (w * 4 + bl) * 2 + sub_blk;
+        h4v h4 = {(_Float16)(vals[bl][0] * inv), (_Float16)(vals[bl][1] * inv),
+                  (_Float16)(vals[bl][2] * inv), (_Float16)(vals[bl][3] * inv)};
+        *reinterpret_cast<h4v*>(dst_g + (size_t)jblk * (size_t)T * 64) = h4;
+      }
+    }
+  }
+}
+
 void launch_wo_a_vha_k5_prefill_wmma(
     torch::Tensor qw, torch::Tensor scales, torch::Tensor su, torch::Tensor sv,
     torch::Tensor vha_m, torch::Tensor o_in, c10::optional<torch::Tensor> gate,
@@ -1583,8 +1744,13 @@ void launch_wo_a_vha_k5_prefill_wmma(
   float* tok_p = tok_buf.data_ptr<float>();
   uint16_t* out_p = reinterpret_cast<uint16_t*>(out.data_ptr());
 
-  hipLaunchKernelGGL(k_vha_wo_a_prologue, dim3(4, T), dim3(256), 0, stream,
-                     m_p, o_p, su_p, xt_p, tok_p, T, o_in.stride(0), o_in.stride(1));
+  if (T >= 64) {
+    hipLaunchKernelGGL(k_vha_wo_a_prologue_1wg, dim3(T), dim3(256), 0, stream,
+                       m_p, o_p, su_p, xt_p, tok_p, T, o_in.stride(0), o_in.stride(1));
+  } else {
+    hipLaunchKernelGGL(k_vha_wo_a_prologue, dim3(4, T), dim3(256), 0, stream,
+                       m_p, o_p, su_p, xt_p, tok_p, T, o_in.stride(0), o_in.stride(1));
+  }
   if (T >= 256) {
     dim3 grid(8, (T + 255) / 256, 8);
     if (sp16) {
