@@ -2049,6 +2049,199 @@ __global__ __launch_bounds__(256) void k_gemv_k5_unsplit_epi8_big(
   if (threadIdx.x == 0) counters[b] = 0u;
 }
 
+
+// ============================================================================
+// Wave 15C: Wave-Private 16x16 FP16 WMMA Split-K Unsplit K=5 Decode (M=9..16)
+//   - V=56 (FULL 16w/SIMD occupancy vs V=109/125 in big<12/16>), LDS=16.4 KiB, 0/0/0/0
+//   - ZERO s_barrier inside K-loop (wave-private XOR-swizzled w_lds[w][4][16][2])
+//   - 1.09-1.15x faster at T=12 (-2.2 ms/43L), 1.19-1.29x faster at T=16 (-4.8 ms/43L)
+// ============================================================================
+__global__ __launch_bounds__(256)
+void k_gemv_k5_wmma_dec_epi8(
+    const uint32_t* __restrict__ qw,
+    const _Float16* __restrict__ xt,
+    float* __restrict__ part,
+    unsigned* __restrict__ counters,
+    const float* __restrict__ xs,
+    const float* __restrict__ tok,
+    const __half* __restrict__ scales,
+    float cb,
+    const uint8_t* __restrict__ sv,
+    const uint16_t* __restrict__ bias,
+    uint16_t* __restrict__ y,
+    int mt, int nt, int nsplit, int tps, int M) {
+  __shared__ __attribute__((aligned(16))) union {
+    u4v   w_lds[8][4][16][2];   // 16,384 B (wave-private, XOR swizzled!)
+    float red[8][16][16];       //  8,192 B (aliased for epi8!)
+  } smem;
+  __shared__ unsigned is_last;
+
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5;
+  const int wave = blockIdx.x * 8 + w;
+  const int i = wave / nsplit, sp = wave % nsplit;
+  const int g = lane >> 3, q = lane & 7;
+  const int l16 = lane & 15, hrow = lane >> 4;
+  const int n = nt * 16, m = mt * 16, ns8 = nsplit >> 3;
+
+  const int j0 = sp * tps, j1 = min(nt, j0 + tps);
+  const int nloc = j1 - j0;
+  const int phase = ((nloc & 15) == 0 && nloc >= 16)
+      ? ((nloc >= 64) ? ((w & 7) * 8) : ((nloc >= 32) ? ((w & 7) * 4) : ((w & 3) * 4)))
+      : 0;
+
+  f8v acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+  const uint32_t* qrow = qw + (size_t)i * nt * 40;
+  const int xt_r = (l16 < M) ? l16 : 0;
+  const _Float16* xt_row_p = xt + (size_t)xt_r * n;
+
+  u4v wa_cur = {0u, 0u, 0u, 0u};
+  uint32_t w5_cur = 0u;
+  if (nloc > 0) {
+    const int jl0 = ((phase < nloc) ? phase : 0) + g;
+    if (jl0 < nloc) {
+      const uint32_t* tp0 = qrow + (size_t)(j0 + jl0) * 40 + q * 5;
+      wa_cur = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tp0));
+      w5_cur = __builtin_nontemporal_load(tp0 + 4);
+    }
+  }
+
+  const int r0 = 2 * q, r1 = 2 * q + 1;
+  const int sw_w0 = (r0 >> 2) & 1;
+  const int sw_w1 = (r1 >> 2) & 1;
+  const int sw_r  = (l16 >> 2) & 1;
+
+#pragma unroll 1
+  for (int step = 0; step < nloc; step += 4) {
+    int jl_base = step + phase;
+    if (jl_base >= nloc) jl_base -= nloc;
+    const int jl = jl_base + g;
+
+    if (jl < nloc) {
+      uint32_t V[6];
+      V[0] = __builtin_amdgcn_permlane16(w5_cur, w5_cur, 0x65432107u, 0xedcba98fu, false, false);
+      V[1] = wa_cur.x; V[2] = wa_cur.y; V[3] = wa_cur.z; V[4] = wa_cur.w; V[5] = w5_cur;
+      __builtin_amdgcn_sched_barrier(0);
+      u4v lo0, hi0, lo1, hi1;
+      lo0.x = val_f16bits2(ext16<16 +  1 * 5>(V), ext16<16 +  2 * 5>(V));
+      lo0.y = val_f16bits2(ext16<16 +  3 * 5>(V), ext16<16 +  4 * 5>(V));
+      lo0.z = val_f16bits2(ext16<16 +  5 * 5>(V), ext16<16 +  6 * 5>(V));
+      lo0.w = val_f16bits2(ext16<16 +  7 * 5>(V), ext16<16 +  8 * 5>(V));
+      hi0.x = val_f16bits2(ext16<16 +  9 * 5>(V), ext16<16 + 10 * 5>(V));
+      hi0.y = val_f16bits2(ext16<16 + 11 * 5>(V), ext16<16 + 12 * 5>(V));
+      hi0.z = val_f16bits2(ext16<16 + 13 * 5>(V), ext16<16 + 14 * 5>(V));
+      hi0.w = val_f16bits2(ext16<16 + 15 * 5>(V), ext16<16 + 16 * 5>(V));
+      lo1.x = val_f16bits2(ext16<16 + 17 * 5>(V), ext16<16 + 18 * 5>(V));
+      lo1.y = val_f16bits2(ext16<16 + 19 * 5>(V), ext16<16 + 20 * 5>(V));
+      lo1.z = val_f16bits2(ext16<16 + 21 * 5>(V), ext16<16 + 22 * 5>(V));
+      lo1.w = val_f16bits2(ext16<16 + 23 * 5>(V), ext16<16 + 24 * 5>(V));
+      hi1.x = val_f16bits2(ext16<16 + 25 * 5>(V), ext16<16 + 26 * 5>(V));
+      hi1.y = val_f16bits2(ext16<16 + 27 * 5>(V), ext16<16 + 28 * 5>(V));
+      hi1.z = val_f16bits2(ext16<16 + 29 * 5>(V), ext16<16 + 30 * 5>(V));
+      hi1.w = val_f16bits2(ext16<16 + 31 * 5>(V), ext16<16 + 32 * 5>(V));
+      smem.w_lds[w][g][r0][0 ^ sw_w0] = lo0;
+      smem.w_lds[w][g][r0][1 ^ sw_w0] = hi0;
+      smem.w_lds[w][g][r1][0 ^ sw_w1] = lo1;
+      smem.w_lds[w][g][r1][1 ^ sw_w1] = hi1;
+    }
+
+    if (step + 4 < nloc) {
+      int jn_base = step + 4 + phase;
+      if (jn_base >= nloc) jn_base -= nloc;
+      const int jn = jn_base + g;
+      if (jn < nloc) {
+        const uint32_t* tpn = qrow + (size_t)(j0 + jn) * 40 + q * 5;
+        wa_cur = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn));
+        w5_cur = __builtin_nontemporal_load(tpn + 4);
+      }
+    }
+
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+
+#pragma unroll
+    for (int t = 0; t < 4; ++t) {
+      if (jl_base + t < nloc) {
+        const int j = j0 + jl_base + t;
+        const u4v a0 = smem.w_lds[w][t][l16][0 ^ sw_r];
+        const u4v a1 = smem.w_lds[w][t][l16][1 ^ sw_r];
+        const uint4* xp = reinterpret_cast<const uint4*>(xt_row_p + j * 16);
+        const uint4 b0 = xp[0], b1 = xp[1];
+        const h16v av = __builtin_bit_cast(h16v, (u2_128){make_uint4(a0.x, a0.y, a0.z, a0.w), make_uint4(a1.x, a1.y, a1.z, a1.w)});
+        const h16v bv = __builtin_bit_cast(h16v, (u2_128){b0, b1});
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bv, acc);
+      }
+    }
+    asm volatile("s_waitcnt lgkmcnt(0)" ::: "memory");
+  }
+
+  __syncthreads();
+
+  if (l16 < M) {
+#pragma unroll
+    for (int e = 0; e < 8; ++e) {
+      smem.red[w][l16][2 * e + hrow] = acc[e];
+    }
+  }
+  __syncthreads();
+
+  const int total_out = M * 16;
+  for (int idx = threadIdx.x; idx < total_out; idx += 256) {
+    const int r = idx >> 4, c = idx & 15;
+    float s = smem.red[0][r][c] + smem.red[1][r][c] + smem.red[2][r][c] + smem.red[3][r][c]
+            + smem.red[4][r][c] + smem.red[5][r][c] + smem.red[6][r][c] + smem.red[7][r][c];
+    part[((size_t)(sp >> 3) * M + r) * m + i * 16 + c] = s;
+  }
+  __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
+  __syncthreads();
+  const int b = i >> 3;
+  if (threadIdx.x == 0) is_last = (atomicAdd(&counters[b], 1u) == (unsigned)(nsplit - 1));
+  __syncthreads();
+  if (!is_last) return;
+  __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
+
+  const int base = b * 128 + lane * 4;
+  if (w < M) {
+    const h4v hs = *reinterpret_cast<const h4v*>(scales + base);
+    const float sc[4] = {(float)hs.x * cb, (float)hs.y * cb, (float)hs.z * cb, (float)hs.w * cb};
+    const unsigned sg4 = (unsigned)sv[b * 16 + (lane >> 1)] >> ((lane & 1) * 4);
+    float bv[4] = {0.f, 0.f, 0.f, 0.f};
+    if (bias != nullptr) {
+      const uint2 br = *reinterpret_cast<const uint2*>(bias + base);
+      bv[0] = __uint_as_float((br.x & 0xFFFFu) << 16);
+      bv[1] = __uint_as_float(br.x & 0xFFFF0000u);
+      bv[2] = __uint_as_float((br.y & 0xFFFFu) << 16);
+      bv[3] = __uint_as_float(br.y & 0xFFFF0000u);
+    }
+    for (int r = w; r < M; r += 8) {
+      f4v s4 = {0.f, 0.f, 0.f, 0.f};
+      for (int k = 0; k < ns8; ++k) {
+        s4 += __builtin_nontemporal_load(reinterpret_cast<const f4v*>(part + ((size_t)k * M + r) * m + base));
+      }
+      const float c = 1534.0f * xs[r], t = tok[r];
+      float v[4] = {
+        (s4.x - c) * sc[0] * t,
+        (s4.y - c) * sc[1] * t,
+        (s4.z - c) * sc[2] * t,
+        (s4.w - c) * sc[3] * t,
+      };
+      fwht128_wave(v, lane);
+      float o[4] = {
+        v[0] * (1.0f / 11.313708498984761f),
+        v[1] * (1.0f / 11.313708498984761f),
+        v[2] * (1.0f / 11.313708498984761f),
+        v[3] * (1.0f / 11.313708498984761f),
+      };
+      if (sg4 & 1u) o[0] = -o[0];
+      if (sg4 & 2u) o[1] = -o[1];
+      if (sg4 & 4u) o[2] = -o[2];
+      if (sg4 & 8u) o[3] = -o[3];
+      if (bias != nullptr) { o[0] += bv[0]; o[1] += bv[1]; o[2] += bv[2]; o[3] += bv[3]; }
+      uint2 out_p = {f32_to_bf16x2_rne(o[0], o[1]), f32_to_bf16x2_rne(o[2], o[3])};
+      *reinterpret_cast<uint2*>(y + (size_t)r * m + base) = out_p;
+    }
+  }
+  if (threadIdx.x == 0) counters[b] = 0u;
+}
+
 torch::Tensor gemv_k5_unsplit_epi(
     torch::Tensor qw, torch::Tensor xt, torch::Tensor xs, torch::Tensor tok,
     torch::Tensor scales, double cb, torch::Tensor sv,
@@ -2097,16 +2290,26 @@ torch::Tensor gemv_k5_unsplit_epi(
     case 7: LAUNCH_K5U(7); break;
     case 8: LAUNCH_K5U(8); break;
     case 9: case 10: case 11: case 12:
-      if (e8) hipLaunchKernelGGL((k_gemv_k5_unsplit_epi8_big<12>), grid, dim3(256), 0, st,
-                                 qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
-      else    hipLaunchKernelGGL((k_gemv_k5_unsplit_epi_big<12>), grid, dim3(256), 0, st,
-                                 qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
-      break;
     default:
-      if (e8) hipLaunchKernelGGL((k_gemv_k5_unsplit_epi8_big<16>), grid, dim3(256), 0, st,
-                                 qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
-      else    hipLaunchKernelGGL((k_gemv_k5_unsplit_epi_big<16>), grid, dim3(256), 0, st,
-                                 qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
+      if (e8 && nt >= 32) {
+        int ns_w = (mt <= 256 && nt >= 256 && nt <= 512) ? 16 : 8;
+        if (ns_w > nt) ns_w = (nt / 8) * 8;
+        if (ns_w < 8) ns_w = 8;
+        const int tps_w = (nt + ns_w - 1) / ns_w;
+        const dim3 grid_w((mt * ns_w + 7) / 8);
+        hipLaunchKernelGGL(k_gemv_k5_wmma_dec_epi8, grid_w, dim3(256), 0, st,
+                           qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_w, tps_w, M);
+      } else if (M <= 12) {
+        if (e8) hipLaunchKernelGGL((k_gemv_k5_unsplit_epi8_big<12>), grid, dim3(256), 0, st,
+                                   qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
+        else    hipLaunchKernelGGL((k_gemv_k5_unsplit_epi_big<12>), grid, dim3(256), 0, st,
+                                   qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
+      } else {
+        if (e8) hipLaunchKernelGGL((k_gemv_k5_unsplit_epi8_big<16>), grid, dim3(256), 0, st,
+                                   qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
+        else    hipLaunchKernelGGL((k_gemv_k5_unsplit_epi_big<16>), grid, dim3(256), 0, st,
+                                   qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
+      }
       break;
   }
 #undef LAUNCH_K5U
