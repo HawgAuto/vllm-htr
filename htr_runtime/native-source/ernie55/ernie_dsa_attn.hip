@@ -2889,8 +2889,9 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
         for (int b = 0; b < 4; ++b) {
           const uint32_t byte0 = (rx >> (b * 8)) & 0xFFu;
           const uint32_t byte1 = (ry >> (b * 8)) & 0xFFu;
-          pk_hold[b]     = f32_to_bf16x2_fast(decode_e2m1(byte0 & 0xFu, tbl) * sc, decode_e2m1(byte0 >> 4, tbl) * sc);
-          pk_hold[b + 4] = f32_to_bf16x2_fast(decode_e2m1(byte1 & 0xFu, tbl) * sc, decode_e2m1(byte1 >> 4, tbl) * sc);
+          // Wave 37: exact-mantissa NVFP4 (2b) * FP8 E4M3 (4b) = 6b <= 7b BF16 -> lower 16b always 0 -> single v_perm_b32 (0.0 bit-exact!)
+          pk_hold[b]     = __builtin_amdgcn_perm(__float_as_uint(decode_e2m1(byte0 >> 4, tbl) * sc), __float_as_uint(decode_e2m1(byte0 & 0xFu, tbl) * sc), 0x07060302u);
+          pk_hold[b + 4] = __builtin_amdgcn_perm(__float_as_uint(decode_e2m1(byte1 >> 4, tbl) * sc), __float_as_uint(decode_e2m1(byte1 & 0xFu, tbl) * sc), 0x07060302u);
           if (b == 1) __builtin_amdgcn_sched_barrier(0);
         }
         const int col0 = mb32 * 16;
@@ -2899,10 +2900,10 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
         if (mb32 < 8) {
           const uint32_t rrx = cur_raw.rope_nv4.x, rry = cur_raw.rope_nv4.y;
           u4v rp;
-          rp.x = f32_to_bf16x2_fast((float)fp8_lut16[rrx & 0xFFu], (float)fp8_lut16[(rrx >> 8) & 0xFFu]);
-          rp.y = f32_to_bf16x2_fast((float)fp8_lut16[(rrx >> 16) & 0xFFu], (float)fp8_lut16[(rrx >> 24) & 0xFFu]);
-          rp.z = f32_to_bf16x2_fast((float)fp8_lut16[rry & 0xFFu], (float)fp8_lut16[(rry >> 8) & 0xFFu]);
-          rp.w = f32_to_bf16x2_fast((float)fp8_lut16[(rry >> 16) & 0xFFu], (float)fp8_lut16[(rry >> 24) & 0xFFu]);
+          rp.x = __builtin_amdgcn_perm(__float_as_uint((float)fp8_lut16[(rrx >> 8) & 0xFFu]),  __float_as_uint((float)fp8_lut16[rrx & 0xFFu]), 0x07060302u);
+          rp.y = __builtin_amdgcn_perm(__float_as_uint((float)fp8_lut16[(rrx >> 24) & 0xFFu]), __float_as_uint((float)fp8_lut16[(rrx >> 16) & 0xFFu]), 0x07060302u);
+          rp.z = __builtin_amdgcn_perm(__float_as_uint((float)fp8_lut16[(rry >> 8) & 0xFFu]),  __float_as_uint((float)fp8_lut16[rry & 0xFFu]), 0x07060302u);
+          rp.w = __builtin_amdgcn_perm(__float_as_uint((float)fp8_lut16[(rry >> 24) & 0xFFu]), __float_as_uint((float)fp8_lut16[(rry >> 16) & 0xFFu]), 0x07060302u);
           *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][512 + mb32 * 8]) = rp;
         }
       }
@@ -2988,11 +2989,14 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
     }
     __syncthreads();
 
+    // Wave 37: wave-uniform conditional o_acc rescale (skips ~90% of 8,192 muls/token when alpha==1.0, 0.0 bit-exact!)
 #pragma unroll
     for (int ei = 0; ei < 8; ++ei) {
       const float a = s_alpha[wh * 16 + 2 * ei + hrow];
+      if (__any(a != 1.0f)) {
 #pragma unroll
-      for (int j = 0; j < 8; ++j) o_acc[j][ei] *= a;
+        for (int j = 0; j < 8; ++j) o_acc[j][ei] *= a;
+      }
     }
 
     const u4v p0 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][0]);
