@@ -2313,6 +2313,69 @@ __global__ __launch_bounds__(512) void k_gemv_k5_unsplit_ns1_128_w16(
 //   - w8_big  (dim3(256), 0 K-splits): tall shapes (lm_head, DSA q_b, DSA o_gate, L0 gu)
 //   - w16_big (dim3(512), 2 K-splits in LDS): medium-mt / narrow-K (HCA o_gate, MoE up_lat, wq_b)
 // Uses gcd(5,8)=1 8-channel LPDDR5X bijection stagger (((ti+b)&7)*8) + VMEM-FIFO prefetch!
+// Wave 29: Zero-partial, zero-atomic, zero-fence 128-row WG (8 waves = 256 thr) for M=1..8 (B=1 decode!)
+//          Uses 8-ch LPDDR5X bijection stagger + VMEM-FIFO prefetch (k5_unsplit_tile_loop<M>), V<=88, vSp=0!
+template <int M>
+__global__ __launch_bounds__(256) void k_gemv_k5_unsplit_ns1_128_w8(
+    const uint32_t* __restrict__ qw, const _Float16* __restrict__ xt,
+    const float* __restrict__ xs, const float* __restrict__ tok,
+    const __half* __restrict__ scales, float cb,
+    const uint8_t* __restrict__ sv, const uint16_t* __restrict__ bias,
+    uint16_t* __restrict__ y, int mt, int nt) {
+  __shared__ float o_lds[M][128];
+  const int lane = threadIdx.x & 31, w = threadIdx.x >> 5, b = blockIdx.x;
+  const int i = b * 8 + w, g = lane >> 3, q = lane & 7;
+  const int n = nt * 16, m = mt * 16;
+
+  float a0[M], a1[M];
+#pragma unroll
+  for (int r = 0; r < M; ++r) { a0[r] = 0.f; a1[r] = 0.f; }
+
+  const int phase = (nt >= 64 && (nt & 3) == 0)
+      ? (((w + b) & 7) * 8)
+      : ((nt >= 16 && (nt & 3) == 0) ? (((w + b) & 3) * 4) : 0);
+  k5_unsplit_tile_loop<M>(qw + (size_t)i * nt * 40, xt, 0, nt, n, lane, phase, a0, a1);
+
+#pragma unroll
+  for (int r = 0; r < M; ++r) {
+    a0[r] += shx<8>(a0[r]); a0[r] += shx<16>(a0[r]);
+    a1[r] += shx<8>(a1[r]); a1[r] += shx<16>(a1[r]);
+  }
+  if (g == 0) {
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      o_lds[r][w * 16 + 2 * q]     = a0[r];
+      o_lds[r][w * 16 + 2 * q + 1] = a1[r];
+    }
+  }
+  __syncthreads();
+
+  if (w < M) {
+    const int base = b * 128 + lane * 4;
+    const float xsm = xs[w] * 1534.0f, tt = tok[w];
+    float v[4];
+#pragma unroll
+    for (int e = 0; e < 4; ++e)
+      v[e] = (o_lds[w][lane * 4 + e] - xsm) * __half2float(scales[base + e]) * cb * tt;
+    fwht128_wave(v, lane);
+    const unsigned sg4 = (unsigned)sv[b * 16 + (lane >> 1)] >> ((lane & 1) * 4);
+    float o[4] = {
+      v[0] * (1.0f / 11.313708498984761f), v[1] * (1.0f / 11.313708498984761f),
+      v[2] * (1.0f / 11.313708498984761f), v[3] * (1.0f / 11.313708498984761f),
+    };
+    if (sg4 & 1u) o[0] = -o[0]; if (sg4 & 2u) o[1] = -o[1];
+    if (sg4 & 4u) o[2] = -o[2]; if (sg4 & 8u) o[3] = -o[3];
+    if (bias != nullptr) {
+      const uint2 braw = *reinterpret_cast<const uint2*>(bias + base);
+      o[0] += __uint_as_float((braw.x & 0xFFFFu) << 16);
+      o[1] += __uint_as_float(braw.x & 0xFFFF0000u);
+      o[2] += __uint_as_float((braw.y & 0xFFFFu) << 16);
+      o[3] += __uint_as_float(braw.y & 0xFFFF0000u);
+    }
+    *reinterpret_cast<uint2*>(y + (size_t)w * m + base) = {f32_to_bf16x2_rne(o[0], o[1]), f32_to_bf16x2_rne(o[2], o[3])};
+  }
+}
+
 template <int M_CAP>
 __global__ __launch_bounds__(256) void k_gemv_k5_unsplit_ns1_128_w8_big(
     const uint32_t* __restrict__ qw, const _Float16* __restrict__ xt,
@@ -2474,27 +2537,48 @@ torch::Tensor gemv_k5_unsplit_epi(
   const uint16_t* bp = bias.has_value() ? reinterpret_cast<const uint16_t*>(bias->data_ptr()) : nullptr;
   uint16_t* yp = reinterpret_cast<uint16_t*>(y.data_ptr());
 
-  // Zero-fence, zero-atomic 128-row WG for medium-mt / short-K shapes at M=1..8:
-  // HCA o_gate (mt=256,nt=96), MoE up_lat (mt=256,nt=128), DSA o_gate (mt=512,nt=96) -> 180-193 GB/s!
-  if (M <= 8 && mt >= 256 && mt <= 512 && nt >= 32 && nt <= 128) {
-    dim3 g128(mt >> 3);
+  // Wave 29: Zero-partial, zero-fence, zero-atomic 128-row WG for B=1 decode (M=1..8):
+  //   - w16: mt in 128..256 (nt in 32..256 or nt>=768), DSA o_gate (512x96), lm_head (>=8192x256)
+  //   - w8 : tall/short-K shapes HCA wq_b (2048x64), DSA q_b (1024x96)
+  if (M <= 8 && mt >= 128 && nt >= 32) {
+    const bool use_w16_s =
+        (mt <= 256 && (nt <= 256 || nt >= 768)) ||
+        (mt <= 512 && nt <= 128) ||
+        (mt >= 8192 && nt == 256);
+    const bool use_w8_s = (!use_w16_s) && (mt >= 1024 && mt <= 4096 && nt >= 64 && nt <= 128);
+    if (use_w16_s) {
+      dim3 g128(mt >> 3);
 #define LAUNCH_K5U_NS1(MM) \
-    hipLaunchKernelGGL((k_gemv_k5_unsplit_ns1_128_w16<MM>), g128, dim3(512), 0, st, \
-                       qwp, xtp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt)
-    switch (M) {
-      case 1: LAUNCH_K5U_NS1(1); break; case 2: LAUNCH_K5U_NS1(2); break;
-      case 3: LAUNCH_K5U_NS1(3); break; case 4: LAUNCH_K5U_NS1(4); break;
-      case 5: LAUNCH_K5U_NS1(5); break; case 6: LAUNCH_K5U_NS1(6); break;
-      case 7: LAUNCH_K5U_NS1(7); break; case 8: LAUNCH_K5U_NS1(8); break;
-    }
+      hipLaunchKernelGGL((k_gemv_k5_unsplit_ns1_128_w16<MM>), g128, dim3(512), 0, st, \
+                         qwp, xtp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt)
+      switch (M) {
+        case 1: LAUNCH_K5U_NS1(1); break; case 2: LAUNCH_K5U_NS1(2); break;
+        case 3: LAUNCH_K5U_NS1(3); break; case 4: LAUNCH_K5U_NS1(4); break;
+        case 5: LAUNCH_K5U_NS1(5); break; case 6: LAUNCH_K5U_NS1(6); break;
+        case 7: LAUNCH_K5U_NS1(7); break; case 8: LAUNCH_K5U_NS1(8); break;
+      }
 #undef LAUNCH_K5U_NS1
-    return y;
+      return y;
+    } else if (use_w8_s) {
+      dim3 g128(mt >> 3);
+#define LAUNCH_K5U_NS1_W8(MM) \
+      hipLaunchKernelGGL((k_gemv_k5_unsplit_ns1_128_w8<MM>), g128, dim3(256), 0, st, \
+                         qwp, xtp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt)
+      switch (M) {
+        case 1: LAUNCH_K5U_NS1_W8(1); break; case 2: LAUNCH_K5U_NS1_W8(2); break;
+        case 3: LAUNCH_K5U_NS1_W8(3); break; case 4: LAUNCH_K5U_NS1_W8(4); break;
+        case 5: LAUNCH_K5U_NS1_W8(5); break; case 6: LAUNCH_K5U_NS1_W8(6); break;
+        case 7: LAUNCH_K5U_NS1_W8(7); break; case 8: LAUNCH_K5U_NS1_W8(8); break;
+      }
+#undef LAUNCH_K5U_NS1_W8
+      return y;
+    }
   }
-  // Wave 21: Zero-partial, zero-fence, zero-atomic 128-row WG for concurrent B=2 decode (M=9..16):
-  //   - w16_big: HCA o_gate (256x96), MoE up_lat (256x128), wq_b (2048x64) (-2.5 ms/step B=2!)
-  //   - w8_big : DSA o_gate (512x96), DSA q_b (1024x96), L0 gu (1792x256), lm_head (12576x256) (-0.65 ms/step B=2!)
-  if (M >= 9 && M <= 16 && mt >= 256 && nt >= 32) {
-    const bool use_w16 = (mt <= 256 && nt <= 128) || (mt >= 2048 && nt == 64);
+  // Wave 21+29: Zero-partial, zero-fence, zero-atomic 128-row WG for concurrent B=2 decode (M=9..16):
+  //   - w16_big: ALL mt in 128..256 (MoE_fc1_lat, HCA_kv_a, SH_gate_up, HCA_DSA_wo_b, HCA_o_gate, MoE_fc2, L0_down) + wq_b (2048x64)
+  //   - w8_big : DSA o_gate (512x96), DSA q_b (1024x96), L0 gu (1792x256), lm_head (12576x256)
+  if (M >= 9 && M <= 16 && mt >= 128 && nt >= 32) {
+    const bool use_w16 = (mt <= 256) || (mt >= 2048 && nt == 64);
     const bool use_w8  = (!use_w16) && (mt >= 512 && nt >= 64);
     if (use_w16) {
       dim3 g128(mt >> 3);
