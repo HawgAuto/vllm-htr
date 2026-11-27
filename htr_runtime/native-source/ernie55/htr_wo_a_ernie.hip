@@ -1091,8 +1091,16 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma(
 //     fits 100% in GL0/GL2 across all 8 sb WGs, killing 64 KiB channel collision!)
 // Grid: dim3(8 /*sb*/, (T + 255) / 256, 8 /*grp*/), Block: 256 (8 waves)
 // ============================================================================
+__device__ __forceinline__ int woa_sw_col4(int row, int col4) {
+  return (col4 ^ ((row >> 2) & 1)) << 2;
+}
+
+// Wave 51: 24 KiB XOR-swizzled STR=8 (4 WGs/WGP = 2 WGs/CU, 16w/CU, V<=192, vSp=0!)
+//          + ds_store_b64 + compile-time ping-pong j+=2 + b0,b1/1-a snake reuse (11 LDS loads vs 12)
+//          + wave-uniform SGPR bases for w & xt!
 template <int HAS_GATE, int SP16>
-__global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma_4x4(
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void k_wo_a_k5_prefill_wmma_4x4(
     const uint32_t* __restrict__ qw,       // [8, 64, 256, 40] (or per-group sp16)
     const _Float16* __restrict__ xt,       // [8, 64, T, 64]
     const float* __restrict__ tok,         // [T, 8]
@@ -1106,40 +1114,21 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma_4x4(
   constexpr int K_DIM = 4096;
   constexpr int MT = M_OUT / 16;           // 64
   constexpr int NT = K_DIM / 16;           // 256
-  constexpr int STR = 12;                  // 48 B row stride -> conflict-free ds_load_b128!
+  constexpr int STR = 8;                   // 32 B row stride + XOR swizzle -> 24,576 B total = 4 WGs/WGP!
 
   union SharedMem {
     struct {
-      uint32_t w_lds[2][128][STR];         // 12,288 B
-      uint32_t x_lds[2][256][STR];         // 24,576 B
-    } stage;                               // 36,864 B total (double-buffered)
+      uint32_t w_lds[2][128][STR];         //  8,192 B
+      uint32_t x_lds[2][256][STR];         // 16,384 B
+    } stage;                               // 24,576 B TOTAL -> 4 WGs/WGP = 2 WGs/CU!
     float o_lds[32][128];                  // 16,384 B (reused in epilogue)
   };
   __shared__ __attribute__((aligned(16))) SharedMem smem;
 
   const int tid = threadIdx.x;             // 0..255
-  const int w = tid >> 5;                  // 0..7
-  const int wn = w & 1;                    // 0..1 (4 N-tiles = 64 cols)
-  const int wm = w >> 1;                   // 0..3 (4 M-tiles = 64 rows)
-  const int lane = tid & 31;
-  const int l16 = lane & 15;
-  const int hb = lane >> 4;
-
-  const int q = lane & 7;
-  const int g = lane >> 3;                 // 0..3
-  const uint32_t sh_e = (uint32_t)((g * 12 + 11) & 31);
-  const uint32_t sh_o = (uint32_t)((g * 12 + 27) & 31);
-
-  const int sb = blockIdx.x;               // 0..7 (128-row output block)
-  const int m0 = blockIdx.y * 256;         // token block start
-  const int grp = blockIdx.z;              // 0..7 group
-  const int i_dec = sb * 8 + w;
-
-  const size_t pitch = (size_t)NT * 40 + (size_t)spad;
-  const size_t grp_words = (size_t)MT * pitch;
-  const uint32_t* qm = qw + (size_t)grp * grp_words + (size_t)i_dec * pitch;
-  const uint32_t* p16_grp = qw + (size_t)grp * ((size_t)MT * NT * 40);
-  const uint32_t* p4_grp  = p16_grp + (size_t)MT * NT * 32;
+  const int sb  = blockIdx.x;              // 0..7
+  const int m0  = ((int)gridDim.y - 1 - (int)blockIdx.y) * 256;
+  const int grp = blockIdx.z;              // 0..7
 
   f8v acc[4][4];
 #pragma unroll
@@ -1148,27 +1137,31 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma_4x4(
     for (int mi = 0; mi < 4; ++mi)
       acc[ni][mi] = f8v{0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
 
-  // Precompute branchless clamped token offsets into [8, 64, T, 64] (128B token stride!)
+  // Wave-uniform SGPR bases for w (0 VGPRs!) and 32-bit offsets for xt!
+  const int i_dec_s = __builtin_amdgcn_readfirstlane(sb * 8 + (tid >> 5));
+  const size_t w_row_base = (size_t)i_dec_s * NT;
+  const uint32_t* w_base0 = SP16
+      ? (qw + (size_t)grp * ((size_t)MT * NT * 40))
+      : (qw + (size_t)grp * ((size_t)MT * ((size_t)NT * 40 + (size_t)spad)) + (size_t)i_dec_s * ((size_t)NT * 40 + (size_t)spad));
+  const uint32_t* p4_grp = qw + (size_t)grp * ((size_t)MT * NT * 40) + (size_t)MT * NT * 32;
+
   const int rr_0 = m0 + (tid >> 1);
-  const int rr_1 = m0 + ((256 + tid) >> 1);
-  const int c_rr0 = (rr_0 < T) ? rr_0 : (T - 1);
-  const int c_rr1 = (rr_1 < T) ? rr_1 : (T - 1);
-  const int hk_0 = tid & 1;
-  const int hk_1 = (256 + tid) & 1;
+  const int rr_1 = m0 + 128 + (tid >> 1);
   const bool v_rr0 = (rr_0 < T);
   const bool v_rr1 = (rr_1 < T);
   const size_t jblk_stride = (size_t)T * 64;
   const _Float16* xt_g0 = xt + (size_t)grp * 64 * jblk_stride;
-  const size_t x_off0 = (size_t)c_rr0 * 64 + hk_0 * 8;
-  const size_t x_off1 = (size_t)c_rr1 * 64 + hk_1 * 8;
+  const uint32_t x_off0 = (uint32_t)((v_rr0 ? rr_0 : (T - 1)) * 64 + (tid & 1) * 8);
+  const uint32_t x_off1 = (uint32_t)((v_rr1 ? rr_1 : (T - 1)) * 64 + (tid & 1) * 8);
 
   auto load_w = [&](int j_idx, u4v& w4, uint32_t& wl) {
+    const int q = tid & 7;
     if constexpr (SP16) {
-      const size_t tid0 = (size_t)i_dec * NT + j_idx;
-      w4 = *reinterpret_cast<const u4v*>(p16_grp + tid0 * 32 + q * 4);
+      const size_t tid0 = w_row_base + j_idx;
+      w4 = *reinterpret_cast<const u4v*>(w_base0 + tid0 * 32 + q * 4);
       wl = p4_grp[tid0 * 8 + q];
     } else {
-      const uint32_t* tp0 = qm + (size_t)j_idx * 40 + q * 5;
+      const uint32_t* tp0 = w_base0 + (size_t)j_idx * 40 + q * 5;
       w4 = *reinterpret_cast<const u4va*>(tp0);
       wl = tp0[4];
     }
@@ -1181,8 +1174,14 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma_4x4(
     x_reg[1] = v_rr1 ? r1 : make_uint4(0u, 0u, 0u, 0u);
   };
   auto decode_store = [&](int buf, const u4v& w4, uint32_t wl, const uint4 x_reg[2]) {
-    *reinterpret_cast<uint4*>(&smem.stage.x_lds[buf][tid >> 1][hk_0 * 4]) = x_reg[0];
-    *reinterpret_cast<uint4*>(&smem.stage.x_lds[buf][(256 + tid) >> 1][hk_1 * 4]) = x_reg[1];
+    const int x_rl0 = tid >> 1;
+    const int x_rl1 = 128 + (tid >> 1);
+    *reinterpret_cast<uint4*>(&smem.stage.x_lds[buf][x_rl0][woa_sw_col4(x_rl0, tid & 1)]) = x_reg[0];
+    *reinterpret_cast<uint4*>(&smem.stage.x_lds[buf][x_rl1][woa_sw_col4(x_rl1, tid & 1)]) = x_reg[1];
+
+    const int w = tid >> 5, lane = tid & 31, q = lane & 7, g = lane >> 3;
+    const uint32_t sh_e = (uint32_t)((g * 12 + 11) & 31);
+    const uint32_t sh_o = (uint32_t)((g * 12 + 27) & 31);
     const uint32_t v0 = __builtin_amdgcn_permlane16(wl, wl, 0x65432107u, 0xedcba98fu, false, false);
     const uint32_t v1 = w4.x, v2 = w4.y, v3 = w4.z, v4 = w4.w, v5 = wl;
     const uint32_t ea = (g == 0) ? v0 : ((g == 3) ? v2 : v1);
@@ -1197,59 +1196,77 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma_4x4(
     h2v o0 = as_h2(val_f16bits2((ohi >> 16) & 0xFFFFu, (ohi >> 11) & 0xFFFFu)) - bias2;
     h2v o1 = as_h2(val_f16bits2((ohi >>  6) & 0xFFFFu, (ohi >>  1) & 0xFFFFu)) - bias2;
     const int r_even = w * 16 + 2 * q;
-    const int col2 = g * 2;
-    smem.stage.w_lds[buf][r_even][col2 + 0]     = __builtin_bit_cast(uint32_t, e0);
-    smem.stage.w_lds[buf][r_even][col2 + 1]     = __builtin_bit_cast(uint32_t, e1);
-    smem.stage.w_lds[buf][r_even + 1][col2 + 0] = __builtin_bit_cast(uint32_t, o0);
-    smem.stage.w_lds[buf][r_even + 1][col2 + 1] = __builtin_bit_cast(uint32_t, o1);
+    const int col2_sw = (g * 2) ^ (((r_even >> 2) & 1) << 2);
+    *reinterpret_cast<uint2*>(&smem.stage.w_lds[buf][r_even][col2_sw]) =
+        make_uint2(__builtin_bit_cast(uint32_t, e0), __builtin_bit_cast(uint32_t, e1));
+    *reinterpret_cast<uint2*>(&smem.stage.w_lds[buf][r_even + 1][col2_sw]) =
+        make_uint2(__builtin_bit_cast(uint32_t, o0), __builtin_bit_cast(uint32_t, o1));
   };
 
-  u4v w4_cur; uint32_t wl_cur;
-  uint4 x_cur[2];
-  load_w(0, w4_cur, wl_cur);
-  load_x(0, x_cur);
-  decode_store(0, w4_cur, wl_cur, x_cur);
-  woa_lds_barrier();
+  {
+    u4v w4_0; uint32_t wl_0; uint4 x_0[2];
+    load_w(0, w4_0, wl_0);
+    load_x(0, x_0);
+    decode_store(0, w4_0, wl_0, x_0);
+    woa_lds_barrier();
+  }
 
-  const int n_base = wn * 64 + l16;
-  const int m_base = wm * 64 + l16;
+  auto ld_a = [&](int buf, int ni) -> h16v {
+    const int l16 = tid & 15, wn = (tid >> 5) & 1;
+    const uint32_t* p = &smem.stage.w_lds[buf][wn * 64 + ni * 16 + l16][0];
+    const int c0 = woa_sw_col4(l16, 0), c1 = woa_sw_col4(l16, 1);
+    return __builtin_bit_cast(h16v, u2_128{*reinterpret_cast<const uint4*>(p + c0), *reinterpret_cast<const uint4*>(p + c1)});
+  };
+  auto ld_b = [&](int buf, int mi) -> h16v {
+    const int l16 = tid & 15, wm = tid >> 6;
+    const uint32_t* p = &smem.stage.x_lds[buf][wm * 64 + mi * 16 + l16][0];
+    const int c0 = woa_sw_col4(l16, 0), c1 = woa_sw_col4(l16, 1);
+    return __builtin_bit_cast(h16v, u2_128{*reinterpret_cast<const uint4*>(p + c0), *reinterpret_cast<const uint4*>(p + c1)});
+  };
 
-  auto run_wmma = [&](int buf) {
-    h16v a[4];
+  auto step = [&](int buf, int j_nxt, bool has_nxt) {
+    u4v w4_n; uint32_t wl_n; uint4 x_n[2];
+    if (has_nxt) {
+      load_w(j_nxt, w4_n, wl_n);
+      load_x(j_nxt, x_n);
+    }
+    h16v b0 = ld_b(buf, 0), b1 = ld_b(buf, 1);
+    h16v at;
 #pragma unroll
     for (int ni = 0; ni < 4; ++ni) {
-      const uint4* ap = reinterpret_cast<const uint4*>(&smem.stage.w_lds[buf][n_base + ni * 16][0]);
-      a[ni] = __builtin_bit_cast(h16v, u2_128{ap[0], ap[1]});
+      at = ld_a(buf, ni);
+      acc[ni][0] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(at, b0, acc[ni][0]);
+      acc[ni][1] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(at, b1, acc[ni][1]);
+      __builtin_amdgcn_sched_barrier(0);
     }
-    h16v b_tile[4];
+    b0 = ld_b(buf, 2); b1 = ld_b(buf, 3);
+    acc[3][2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(at, b0, acc[3][2]);
+    acc[3][3] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(at, b1, acc[3][3]);
+    __builtin_amdgcn_sched_barrier(0);
 #pragma unroll
-    for (int mi = 0; mi < 4; ++mi) {
-      const uint4* bp = reinterpret_cast<const uint4*>(&smem.stage.x_lds[buf][m_base + mi * 16][0]);
-      b_tile[mi] = __builtin_bit_cast(h16v, u2_128{bp[0], bp[1]});
+    for (int ni = 2; ni >= 0; --ni) {
+      at = ld_a(buf, ni);
+      acc[ni][2] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(at, b0, acc[ni][2]);
+      acc[ni][3] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(at, b1, acc[ni][3]);
+      __builtin_amdgcn_sched_barrier(0);
     }
-#pragma unroll
-    for (int mi = 0; mi < 4; ++mi) {
-#pragma unroll
-      for (int ni = 0; ni < 4; ++ni) {
-        acc[ni][mi] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a[ni], b_tile[mi], acc[ni][mi]);
-      }
+    if (has_nxt) {
+      decode_store(buf ^ 1, w4_n, wl_n, x_n);
+      woa_lds_barrier();
     }
   };
 
 #pragma unroll 1
-  for (int j = 0; j < NT - 1; ++j) {
-    const int buf = j & 1;
-    u4v w4_nxt; uint32_t wl_nxt;
-    uint4 x_nxt[2];
-    load_w(j + 1, w4_nxt, wl_nxt);
-    load_x(j + 1, x_nxt);
-    run_wmma(buf);
-    decode_store(buf ^ 1, w4_nxt, wl_nxt, x_nxt);
-    woa_lds_barrier();
+  for (int j = 0; j < NT - 2; j += 2) {
+    step(0, j + 1, true);
+    step(1, j + 2, true);
   }
-  run_wmma((NT - 1) & 1);
+  step(0, NT - 1, true);
+  step(1, 0, false);
 
   // Epilogue: 32 rows at a time in o_lds[32][128], bit-exact FWHT-128 + fused sigmoid(gate)
+  const int w = tid >> 5, wn = w & 1, wm = w >> 1;
+  const int lane = tid & 31, l16 = lane & 15, hb = lane >> 4;
   const __half* scl = scales + (size_t)grp * M_OUT;
   const uint8_t* svp = sv + (size_t)grp * (M_OUT / 8);
   const int base_col = sb * 128 + lane * 4;
@@ -1320,11 +1337,9 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_prefill_wmma_4x4(
               const float gb = bf2f(f2bf(sig));
               prod[e2] = zb * gb;
             }
-            out_p.x = f32_to_bf16x2_rne(prod[0], prod[1]);
-            out_p.y = f32_to_bf16x2_rne(prod[2], prod[3]);
+            out_p = make_uint2((uint32_t)f2bf(prod[0]) | ((uint32_t)f2bf(prod[1]) << 16), (uint32_t)f2bf(prod[2]) | ((uint32_t)f2bf(prod[3]) << 16));
           } else {
-            out_p.x = f32_to_bf16x2_rne(o[0], o[1]);
-            out_p.y = f32_to_bf16x2_rne(o[2], o[3]);
+            out_p = make_uint2((uint32_t)f2bf(o[0]) | ((uint32_t)f2bf(o[1]) << 16), (uint32_t)f2bf(o[2]) | ((uint32_t)f2bf(o[3]) << 16));
           }
           *reinterpret_cast<uint2*>(out + out_off) = out_p;
         }
