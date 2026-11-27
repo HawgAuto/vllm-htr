@@ -1681,7 +1681,7 @@ class Ernie5_5DSAAttention(nn.Module):
             and o_gate_raw.dtype == torch.bfloat16
             and o_flat.stride(1) == 1
             and o_gate_raw.stride(1) == 1
-            and o_flat.shape[1] <= 8192
+            and (o_flat.shape[1] <= 8192 or (o_flat.shape[1] <= 16384 and o_flat.shape[0] >= 256))
             and (o_flat.shape[1] % 128 == 0)
             and _os.environ.get("ERNIE_FUSED_PROLOGUE", "1") == "1"
         ):
