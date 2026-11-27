@@ -287,7 +287,7 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
     if orig_dec is not None and not getattr(orig_dec, "_ernie5_gfx1151_hip", False):
         def _get_hca_scratch(dev, T, H):
             from .fast_ops import get_split_kv_scratch
-            return get_split_kv_scratch(dev, T, H=H, S=8, D=512)
+            return get_split_kv_scratch(dev, T, H=H, S=20 if T <= 2 else 8, D=512)
 
         @functools.wraps(orig_dec)
         def _rocm_sparse_attn_decode_hip(

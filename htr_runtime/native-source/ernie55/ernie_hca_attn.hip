@@ -763,6 +763,316 @@ __global__ __launch_bounds__(256, 2) void k_ernie_hca_decode_qreg_v28(
   }
 }
 
+// Wave 15B: 64-Head/WG dim3(512) HCA Decode Kernel (V<=192, 2 WGs/WGP = 32w/WGP)
+//   - Covers ALL 64 heads in 1 WG -> 2x fewer FP8 KV DRAM loads, dequants & VT writes!
+//   - 1-ahead global KV prefetch overlapped behind Softmax + all 8 P@V WMMAs!
+//   - Holds decoded pk_hold[8] in VGPRs -> ZERO KV_lds re-read!
+//   - Conflict-free VT_lds_g[16][32*18+2] + 1-ahead u4v ds_load_b128 (replaces 8x b32)!
+//   - Conflict-free Q7_lds[4][4][16][3] (PAD=12) + q_reg[0..6] + _Float16 FP8 LUTs!
+// ============================================================================
+template <int NUM_SPLITS, int HAS_EXTRA>
+__global__ __launch_bounds__(512) __attribute__((amdgpu_waves_per_eu(8, 8)))
+void k_ernie_hca_decode_512_v28(
+    const uint16_t* __restrict__ q_ptr,
+    const uint8_t* __restrict__ main_cache,
+    const int32_t* __restrict__ main_indices,
+    const int32_t* __restrict__ main_indptr,
+    const uint8_t* __restrict__ extra_cache,
+    const int32_t* __restrict__ extra_indices,
+    const int32_t* __restrict__ extra_indptr,
+    float* __restrict__ part_o,
+    float* __restrict__ part_m,
+    float* __restrict__ part_l,
+    int64_t q_s0, int64_t q_s1,
+    int64_t main_s0, int64_t extra_s0,
+    int main_num_rows, int extra_num_rows,
+    int main_bs, int extra_bs,
+    float scale, int is_fnuz_main) {
+  constexpr int VT_STR = 18;
+  __shared__ union {
+    __attribute__((aligned(16))) uint16_t KV_lds[16][HCA_STRIDE];           // 16,640 B
+    __attribute__((aligned(16))) uint16_t VT_lds_g[16][32 * VT_STR + 2];    // 18,496 B
+  } u_kv;
+  __shared__ float S_part[4][4][16][16];                                    // 16,384 B
+  __shared__ __attribute__((aligned(16))) uint16_t P_lds[4][16][16];        //  2,048 B
+  __shared__ _Float16 fp8_lut_main[256];                                    //    512 B
+  __shared__ _Float16 fp8_lut_ocp[HAS_EXTRA ? 256 : 1];                     //    512 B
+  __shared__ __attribute__((aligned(16))) u4v Q_lds[4][4][16][6];           // 24,576 B (swizzled, 0-way conflict!)
+  __shared__ float s_alpha[64];                                             //    256 B
+  __shared__ float s_m[64];                                                 //    256 B
+  __shared__ float s_l[64];                                                 //    256 B
+  __shared__ HcaPassArgs s_pass[2];                                         //     96 B
+
+  const int t    = blockIdx.x;
+  const int sp   = blockIdx.y;
+  const int tid  = threadIdx.x;   // 0..511
+  const int wave = tid >> 5;      // 0..15
+  const int wh   = wave >> 2;     // 0..3 (head group of 16 -> 64 heads total!)
+  const int wd   = wave & 3;      // 0..3 (D-quarter of 128 -> 512 dims total!)
+  const int lane = tid & 31;
+  const int l16  = lane & 15;
+  const int hrow = lane >> 4;
+  const int h0   = wh * 16;
+  const int d_start = wd * 128;
+
+  if (tid < 256) {
+    fp8_lut_main[tid] = (_Float16)fp8_byte_to_f32((uint32_t)tid, is_fnuz_main);
+    if constexpr (HAS_EXTRA) {
+      fp8_lut_ocp[tid] = (_Float16)fp8_byte_to_f32((uint32_t)tid, 0);
+    }
+  }
+  if (tid < 64) { s_m[tid] = NEG_INF; s_l[tid] = 0.0f; }
+  if (tid == 0) {
+    s_pass[0] = {main_cache, main_indices, main_indptr, main_s0, main_num_rows, main_bs};
+    if constexpr (HAS_EXTRA) {
+      s_pass[1] = {extra_cache, extra_indices, extra_indptr, extra_s0, extra_num_rows, extra_bs};
+    }
+  }
+
+  // Load Q[0..4] into VGPRs (40 VGPRs), Q[5..7] into zero-byte swizzled Q_lds (0-way bank conflicts!)
+  constexpr int Q_NREG = 5;
+  const uint16_t* q_base = q_ptr + (int64_t)t * q_s0 + (int64_t)(h0 + l16) * q_s1 + d_start;
+  bf16x16 q_reg[Q_NREG];
+#pragma unroll
+  for (int step = 0; step < Q_NREG; ++step) {
+    const u4v q0 = *reinterpret_cast<const u4va*>(q_base + step * 16 + 0);
+    const u4v q1 = *reinterpret_cast<const u4va*>(q_base + step * 16 + 8);
+    q_reg[step] = __builtin_bit_cast(bf16x16, (u8v){q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w});
+  }
+  auto q_swz = [](int c, int r) -> int {
+    const int cs = c + ((r >> 2) & 1);
+    return (cs >= 6) ? (cs - 6) : cs;
+  };
+  if (hrow == 0) {
+#pragma unroll
+    for (int qi = 0; qi < 3; ++qi) {
+      const int step = Q_NREG + qi;
+      Q_lds[wh][wd][l16][q_swz(qi * 2 + 0, l16)] = *reinterpret_cast<const u4va*>(q_base + step * 16 + 0);
+      Q_lds[wh][wd][l16][q_swz(qi * 2 + 1, l16)] = *reinterpret_cast<const u4va*>(q_base + step * 16 + 8);
+    }
+  }
+
+  f32x8 o_acc[8];
+#pragma unroll
+  for (int j = 0; j < 8; ++j) o_acc[j] = (f32x8){0, 0, 0, 0, 0, 0, 0, 0};
+
+  const int kr_ld = tid >> 5;   // 0..15 (1 wave per KV token -> wave-uniform slot load!)
+  const int mb32  = tid & 31;   // 0..31 (16 dims per thread: 0..27 NOPE FP8, 28..31 ROPE BF16)
+
+  struct RawHca16 {
+    u4v r0;
+    uint32_t sc_vld;
+  };
+
+  auto prefetch_raw = [&](const HcaPassArgs& pa, int bs_shift, int bs_mask, int p_start, int p_hi, int k0, RawHca16& dst) {
+    const int kp = k0 + kr_ld;
+    int32_t sl = (kp < p_hi) ? pa.indices[p_start + kp] : -1;
+    if (sl < 0 || sl >= pa.num_rows) sl = -1;
+    if (sl >= 0) {
+      const int blk_i = sl >> bs_shift;
+      const int pos_i = sl & bs_mask;
+      const uint8_t* blk_ptr = pa.cache_ptr + (int64_t)blk_i * pa.stride0;
+      const uint8_t* tok_data = blk_ptr + (int64_t)pos_i * HCA_ROW_BYTES;
+      if (mb32 < 28) {
+        const int sub = mb32 >> 2;
+        const int qtr = mb32 & 3;
+        const uint8_t* tok_sc = blk_ptr + (int64_t)pa.block_size * HCA_ROW_BYTES + (int64_t)pos_i * 8;
+        dst.r0 = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tok_data + sub * 64 + qtr * 16));
+        dst.sc_vld = 0x100u | (uint32_t)tok_sc[sub];
+      } else {
+        const int rq = mb32 - 28;
+        const uint16_t* rp = reinterpret_cast<const uint16_t*>(tok_data + HCA_NOPE) + rq * 16;
+        dst.r0 = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(rp + 0));
+        dst.sc_vld = 0x80000000u | (uint32_t)sl;
+      }
+    } else {
+      dst.sc_vld = 0u;
+    }
+  };
+
+  auto clean_bf16x2 = [](uint32_t v) -> uint32_t {
+    uint32_t lo = v & 0xFFFFu, hi = v >> 16;
+    if ((lo & 0x7FFFu) > 0x7F80u) lo = 0u;
+    if ((hi & 0x7FFFu) > 0x7F80u) hi = 0u;
+    return lo | (hi << 16);
+  };
+
+  __syncthreads();
+
+  constexpr int NUM_PASSES = HAS_EXTRA ? 2 : 1;
+#pragma unroll 1
+  for (int pass = 0; pass < NUM_PASSES; ++pass) {
+    const HcaPassArgs pa = s_pass[pass];
+    const _Float16* c_lut = (pass == 0) ? fp8_lut_main : fp8_lut_ocp;
+    const int bs_shift = 31 - __clz(pa.block_size);
+    const int bs_mask  = pa.block_size - 1;
+    const int p_start = pa.indptr[t];
+    const int p_len   = pa.indptr[t + 1] - p_start;
+    const int p_chunk = (p_len + NUM_SPLITS - 1) / NUM_SPLITS;
+    const int p_lo    = sp * p_chunk;
+    const int p_hi    = min(p_lo + p_chunk, p_len);
+    if (p_lo >= p_hi) continue;
+
+    RawHca16 cur_raw;
+    prefetch_raw(pa, bs_shift, bs_mask, p_start, p_hi, p_lo, cur_raw);
+
+#pragma unroll 1
+    for (int k0 = p_lo; k0 < p_hi; k0 += 16) {
+      uint32_t pk_hold[8];
+      if (cur_raw.sc_vld) {
+        if (mb32 < 28) {
+          const float sc = ue8m0_to_f32((uint8_t)(cur_raw.sc_vld & 0xFFu));
+          const uint32_t ws[4] = {cur_raw.r0.x, cur_raw.r0.y, cur_raw.r0.z, cur_raw.r0.w};
+#pragma unroll
+          for (int w = 0; w < 4; ++w) {
+            const uint32_t x = ws[w];
+            pk_hold[w * 2 + 0] = f32_to_bf16x2_rne_finite((float)c_lut[x & 0xFFu] * sc,         (float)c_lut[(x >> 8) & 0xFFu] * sc);
+            pk_hold[w * 2 + 1] = f32_to_bf16x2_rne_finite((float)c_lut[(x >> 16) & 0xFFu] * sc, (float)c_lut[(x >> 24) & 0xFFu] * sc);
+            if (w == 1) __builtin_amdgcn_sched_barrier(0);
+          }
+        } else {
+          const int32_t sl_r = (int32_t)(cur_raw.sc_vld & 0x7FFFFFFFu);
+          const int rq = mb32 - 28;
+          const uint8_t* blk_ptr = pa.cache_ptr + (int64_t)(sl_r >> bs_shift) * pa.stride0;
+          const uint16_t* rp = reinterpret_cast<const uint16_t*>(blk_ptr + (int64_t)(sl_r & bs_mask) * HCA_ROW_BYTES + HCA_NOPE) + rq * 16;
+          const u4v r1 = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(rp + 8));
+          pk_hold[0] = clean_bf16x2(cur_raw.r0.x);
+          pk_hold[1] = clean_bf16x2(cur_raw.r0.y);
+          pk_hold[2] = clean_bf16x2(cur_raw.r0.z);
+          pk_hold[3] = clean_bf16x2(cur_raw.r0.w);
+          pk_hold[4] = clean_bf16x2(r1.x);
+          pk_hold[5] = clean_bf16x2(r1.y);
+          pk_hold[6] = clean_bf16x2(r1.z);
+          pk_hold[7] = clean_bf16x2(r1.w);
+        }
+        const int col0 = mb32 * 16;
+        *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][col0 + 0]) = (u4v){pk_hold[0], pk_hold[1], pk_hold[2], pk_hold[3]};
+        *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][col0 + 8]) = (u4v){pk_hold[4], pk_hold[5], pk_hold[6], pk_hold[7]};
+      } else {
+        const u4v z = {0u, 0u, 0u, 0u};
+#pragma unroll
+        for (int i = 0; i < 8; ++i) pk_hold[i] = 0u;
+        const int col0 = mb32 * 16;
+        *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][col0 + 0]) = z;
+        *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][col0 + 8]) = z;
+      }
+      __syncthreads();
+
+      // 2. Q @ K^T: 8 WMMA steps with 1-ahead KV_lds prefetch + anti-LICM zero-hoist!
+      float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f, z4 = 0.0f, z5 = 0.0f, z6 = 0.0f, z7 = 0.0f;
+      asm volatile("" : "+v"(z0), "+v"(z1), "+v"(z2), "+v"(z3), "+v"(z4), "+v"(z5), "+v"(z6), "+v"(z7));
+      f32x8 s_acc = {z0, z1, z2, z3, z4, z5, z6, z7};
+
+#pragma unroll
+      for (int step = 0; step < 8; ++step) {
+        const int dn = d_start + step * 16;
+        const u4v k0_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn]);
+        const u4v k1_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn + 8]);
+        const bf16x16 kf = __builtin_bit_cast(bf16x16, (u8v){k0_c.x, k0_c.y, k0_c.z, k0_c.w, k1_c.x, k1_c.y, k1_c.z, k1_c.w});
+        if (step < Q_NREG) {
+          s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(q_reg[step], kf, s_acc);
+        } else {
+          const int qi = step - Q_NREG;
+          const u4v q0 = Q_lds[wh][wd][l16][q_swz(qi * 2 + 0, l16)];
+          const u4v q1 = Q_lds[wh][wd][l16][q_swz(qi * 2 + 1, l16)];
+          const bf16x16 qf = __builtin_bit_cast(bf16x16, (u8v){q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w});
+          s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qf, kf, s_acc);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+      }
+
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) S_part[wh][wd][2 * ei + hrow][l16] = s_acc[ei];
+      __syncthreads();
+
+      // 3. Direct pk_hold -> VT_lds_g (ZERO KV_lds re-read!) + immediate 1-ahead global prefetch!
+      {
+        uint16_t* vt_dst = &u_kv.VT_lds_g[mb32 >> 1][(mb32 & 1) * 16 * VT_STR + kr_ld];
+#pragma unroll
+        for (int p = 0; p < 8; ++p) {
+          vt_dst[(p * 2 + 0) * VT_STR] = (uint16_t)(pk_hold[p] & 0xFFFFu);
+          vt_dst[(p * 2 + 1) * VT_STR] = (uint16_t)(pk_hold[p] >> 16);
+        }
+      }
+      if (k0 + 16 < p_hi) {
+        prefetch_raw(pa, bs_shift, bs_mask, p_start, p_hi, k0 + 16, cur_raw);
+      }
+      __builtin_amdgcn_sched_barrier(0);
+
+      // 4. 4-way parallel online softmax across all 64 heads
+      {
+        const int kp = k0 + l16;
+        const int32_t sl_v = (kp < p_hi) ? pa.indices[p_start + kp] : -1;
+        const bool vld = (sl_v >= 0 && sl_v < pa.num_rows);
+#pragma unroll
+        for (int e_sub = 0; e_sub < 2; ++e_sub) {
+          const int ei = wd * 2 + e_sub;
+          const int hm = 2 * ei + hrow;
+          const int h_loc = wh * 16 + hm;
+          float sc = S_part[wh][0][hm][l16] + S_part[wh][1][hm][l16]
+                   + S_part[wh][2][hm][l16] + S_part[wh][3][hm][l16];
+          sc = vld ? (sc * scale) : NEG_INF;
+          const float bmax = halfwave_max16(sc);
+          const float mold = s_m[h_loc];
+          const float mnew = fmaxf(mold, bmax);
+          const float alpha = (mold > -1e30f) ? exp2f((mold - mnew) * LOG2E) : 0.0f;
+          const float pv = (vld && mnew > -1e30f) ? exp2f((sc - mnew) * LOG2E) : 0.0f;
+          const float bsum = halfwave_sum16(pv);
+          P_lds[wh][hm][l16] = f32_to_bf16_rne(pv);
+          if (l16 == 0) {
+            s_alpha[h_loc] = alpha;
+            s_m[h_loc] = mnew;
+            s_l[h_loc] = s_l[h_loc] * alpha + bsum;
+          }
+        }
+      }
+      __syncthreads();
+
+      // 5. Rescale o_acc + conflict-free 1-ahead u4v ds_load_b128 P @ V WMMAs!
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) {
+        const float a = s_alpha[wh * 16 + 2 * ei + hrow];
+#pragma unroll
+        for (int j = 0; j < 8; ++j) o_acc[j][ei] *= a;
+      }
+
+      const u4v p0 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][0]);
+      const u4v p1 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][8]);
+      const bf16x16 pf = __builtin_bit_cast(bf16x16, (u8v){p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w});
+
+#pragma unroll
+      for (int j = 0; j < 8; ++j) {
+        const int vc = d_start + j * 16 + l16;
+        const int vg = vc >> 5;
+        const u4v v0 = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vg][(vc & 31) * VT_STR + 0]);
+        const u4v v1 = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vg][(vc & 31) * VT_STR + 8]);
+        const bf16x16 vf = __builtin_bit_cast(bf16x16, (u8v){v0.x, v0.y, v0.z, v0.w, v1.x, v1.y, v1.z, v1.w});
+        o_acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pf, vf, o_acc[j]);
+        __builtin_amdgcn_sched_barrier(0);
+      }
+      __syncthreads();
+    }
+  }
+
+  // Store partial (m, l, o_acc)
+  if (wd == 0 && l16 == 0) {
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) {
+      const int h = h0 + 2 * ei + hrow;
+      const int64_t off = ((int64_t)t * 64 + h) * NUM_SPLITS + sp;
+      part_m[off] = s_m[h];
+      part_l[off] = s_l[h];
+    }
+  }
+#pragma unroll
+  for (int ei = 0; ei < 8; ++ei) {
+    const int h = h0 + 2 * ei + hrow;
+    float* dst = part_o + (((int64_t)t * 64 + h) * NUM_SPLITS + sp) * HCA_DIM + d_start + l16;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) dst[j * 16] = o_acc[j][ei];
+  }
+}
+
 void ernie_hca_decode(
     torch::Tensor q,
     torch::Tensor main_cache, torch::Tensor main_indices, torch::Tensor main_indptr,
@@ -824,6 +1134,35 @@ void ernie_hca_decode(
                          sp, nullptr, nullptr, op, out.stride(0), out.stride(1), 0, H);
     }
   };
+
+  // Wave 15B: 64H/WG dim3(512) pipelined HCA decode (V<=192 2 WGs/WGP, 20-WGP-matched S=20/6/3)
+  if (pow2_bs && H == 64 && (has_extra || main_indices.numel() > (int64_t)T * 256)) {
+    auto run_512 = [&](auto tag) {
+      constexpr int S = decltype(tag)::value;
+      if (has_extra) {
+        hipLaunchKernelGGL((k_ernie_hca_decode_512_v28<S, 1>), dim3(T, S, 1), dim3(512), 0, st,
+                           qp, mc, mi, mip, ec, ei, eip,
+                           part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+                           q.stride(0), q.stride(1), main_cache.stride(0), es0,
+                           (int)(main_cache.size(0) * main_cache.size(1)), enr,
+                           mbs, ebs, (float)scale, is_fnuz_main ? 1 : 0);
+      } else {
+        hipLaunchKernelGGL((k_ernie_hca_decode_512_v28<S, 0>), dim3(T, S, 1), dim3(512), 0, st,
+                           qp, mc, mi, mip, ec, ei, eip,
+                           part_o.data_ptr<float>(), part_m.data_ptr<float>(), part_l.data_ptr<float>(),
+                           q.stride(0), q.stride(1), main_cache.stride(0), es0,
+                           (int)(main_cache.size(0) * main_cache.size(1)), enr,
+                           mbs, ebs, (float)scale, is_fnuz_main ? 1 : 0);
+      }
+      run_reduce(tag);
+    };
+    const int64_t cap = part_o.numel();
+    if (T <= 2 && cap >= (int64_t)T * 64 * 20 * HCA_DIM) run_512(std::integral_constant<int, 20>{});
+    else if (T <= 2)      run_512(std::integral_constant<int, 8>{});
+    else if (T <= 6)      run_512(std::integral_constant<int, 6>{});
+    else                  run_512(std::integral_constant<int, 3>{});
+    return;
+  }
 
   // v0.2.8 32H/WG Q-in-VGPRs + union KV/VT LDS + dynamic split-K (1.24x @ T=1, 1.31x @ T=6, 1.37x @ T=12!)
   if (pow2_bs && H >= 32) {
