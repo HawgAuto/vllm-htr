@@ -371,8 +371,11 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
         _rocm_sparse_attn_decode_hip._ernie5_gfx1151_hip = True  # type: ignore[attr-defined]
         rmod.rocm_sparse_attn_decode = _rocm_sparse_attn_decode_hip
 
-    # Also route HCA sparse prefill (D=512 BF16 KV) to native Wave32 WMMA HIP kernel
-    # (replaces build_ragged_indices_from_dense + _sparse_attn_prefill_ragged_kernel + extra out alloc)
+    # Wave 18A: Route HCA sparse prefill (D=512 BF16 KV) to dim3(512) 64-head Wave32 WMMA HIP
+    # with fused register GPT-J inverse RoPE (eliminates standalone inv_rope_gptj_inplace = -47..54 ms / 37L!)
+    _pref_rope_ctx = [None]   # active [base_ptr, row_bytes, positions, cs_cache, fused_rows]
+    _pref_rot_done = [None]   # completed (base_ptr, row_bytes, num_rows) awaiting rocm_inverse_rope_rows_ skip
+
     orig_pref_attn = getattr(rmod, "rocm_sparse_attn_prefill", None)
     if orig_pref_attn is not None and not getattr(orig_pref_attn, "_ernie5_gfx1151_hip", False):
         def _get_hca_pref_scratch(dev, T, H):
@@ -413,9 +416,27 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
                     sink_arg = None if attn_sink is None else attn_sink[:H].contiguous()
                     tl_arg = None if topk_length is None else topk_length.to(torch.int32).contiguous()
                     idx_arg = indices.to(torch.int32).contiguous() if (indices.dtype != torch.int32 or indices.stride(-1) != 1) else indices
-                    ext.hca_prefill(
-                        q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale)
-                    )
+                    rope_pos = None
+                    rope_cs = None
+                    ctx = _pref_rope_ctx[0]
+                    if ctx is not None and H <= 64 and T > 0:
+                        base_ptr, row_bytes, pos_all, cs_cache = ctx[0], ctx[1], ctx[2], ctx[3]
+                        off_bytes = output.data_ptr() - base_ptr
+                        if row_bytes > 0 and off_bytes >= 0 and (off_bytes % row_bytes) == 0:
+                            r0 = off_bytes // row_bytes
+                            if r0 + T <= pos_all.shape[0]:
+                                rope_pos = pos_all[r0 : r0 + T]
+                                rope_cs = cs_cache
+                                ctx[4] += T
+                    if rope_pos is not None:
+                        ext.hca_prefill(
+                            q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale),
+                            rope_pos, rope_cs,
+                        )
+                    else:
+                        ext.hca_prefill(
+                            q, kv, idx_arg, tl_arg, sink_arg, output, po, pm, pl, float(scale)
+                        )
                     return output
             return orig_pref_attn(
                 q=q, kv=kv, indices=indices, scale=scale, head_dim=head_dim,
@@ -426,14 +447,85 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
         _rocm_sparse_attn_prefill_hip._ernie5_gfx1151_hip = True  # type: ignore[attr-defined]
         rmod.rocm_sparse_attn_prefill = _rocm_sparse_attn_prefill_hip
 
+    # Hook DeepseekV4ROCMAiterMLAAttention._forward_prefill so prefill fuses inv_rope into hca_prefill
+    try:
+        import vllm.models.deepseek_v4.amd.rocm as _dsv4_rocm_pref
+        _attn_cls = getattr(_dsv4_rocm_pref, "DeepseekV4ROCMAiterMLAAttention", None)
+        _orig_fwd_pref = getattr(_attn_cls, "_forward_prefill", None) if _attn_cls is not None else None
+        if _orig_fwd_pref is not None and not getattr(_orig_fwd_pref, "_ernie5_gfx1151_hip", False):
+            @functools.wraps(_orig_fwd_pref)
+            def _forward_prefill_fused_rope(
+                self,
+                q,
+                positions,
+                compressed_k_cache,
+                swa_k_cache,
+                output,
+                attn_metadata,
+                swa_metadata,
+            ):
+                _pref_rot_done[0] = None
+                cs = getattr(getattr(self, "rotary_emb", None), "cos_sin_cache", None)
+                can_fuse = (
+                    not (getattr(rmod, "_ON_GFX950", False) or getattr(rmod, "_ON_GFX942", False))
+                    and getattr(self, "_wo_a_fp8_weight", None) is None
+                    and getattr(self, "rope_head_dim", 0) == 64
+                    and positions is not None
+                    and cs is not None
+                    and output is not None
+                    and output.shape[0] > 0
+                    and q.shape[1] <= 64
+                )
+                if not can_fuse:
+                    return _orig_fwd_pref(
+                        self, q, positions, compressed_k_cache, swa_k_cache,
+                        output, attn_metadata, swa_metadata,
+                    )
+                row_bytes = output.stride(0) * output.element_size()
+                ctx = [output.data_ptr(), row_bytes, positions, cs, 0]
+                _pref_rope_ctx[0] = ctx
+                try:
+                    ret = _orig_fwd_pref(
+                        self, q, positions, compressed_k_cache, swa_k_cache,
+                        output, attn_metadata, swa_metadata,
+                    )
+                finally:
+                    _pref_rope_ctx[0] = None
+                if ctx[4] == output.shape[0]:
+                    _pref_rot_done[0] = (ctx[0], row_bytes, output.shape[0])
+                return ret
+
+            _forward_prefill_fused_rope._ernie5_gfx1151_hip = True  # type: ignore[attr-defined]
+            _attn_cls._forward_prefill = _forward_prefill_fused_rope
+            # Ensure rocm module's bound reference to rocm_sparse_attn_prefill also points to our HIP wrapper
+            if getattr(_dsv4_rocm_pref, "rocm_sparse_attn_prefill", None) is not rmod.rocm_sparse_attn_prefill:
+                _dsv4_rocm_pref.rocm_sparse_attn_prefill = rmod.rocm_sparse_attn_prefill
+    except Exception:
+        pass
+
     # Replace in-place inverse GPT-J RoPE Triton kernel (which copied 448 unchanged NoPE dims = 87.5% wasted traffic)
     orig_inv_rope = getattr(rmod, "rocm_inverse_rope_rows_", None)
     if orig_inv_rope is not None and not getattr(orig_inv_rope, "_ernie5_gfx1151_hip", False):
         @functools.wraps(orig_inv_rope)
         def _rocm_inverse_rope_rows_hip(o, positions, cos_sin_cache, rope_head_dim):
             import torch
+            done = _pref_rot_done[0]
+            _pref_rot_done[0] = None
             if o.shape[0] == 0:
                 return
+            if done is not None:
+                pref_ptr, row_bytes, pref_rows = done
+                o_ptr = o.data_ptr()
+                o_rb = o.stride(0) * o.element_size()
+                if o_rb == row_bytes and o_ptr <= pref_ptr:
+                    o_end = o_ptr + o.shape[0] * o_rb
+                    pref_end = pref_ptr + pref_rows * row_bytes
+                    if o_end == pref_end:
+                        unfused = (pref_ptr - o_ptr) // o_rb
+                        if unfused == 0:
+                            return
+                        o = o[:unfused]
+                        positions = positions[:unfused]
             if (
                 not (getattr(rmod, "_ON_GFX950", False) or getattr(rmod, "_ON_GFX942", False))
                 and o.is_cuda
@@ -450,6 +542,11 @@ def _patch_rocm_paged_mqa_logits_triton() -> None:
 
         _rocm_inverse_rope_rows_hip._ernie5_gfx1151_hip = True  # type: ignore[attr-defined]
         rmod.rocm_inverse_rope_rows_ = _rocm_inverse_rope_rows_hip
+        try:
+            import vllm.models.deepseek_v4.amd.rocm as _dsv4_rocm_inv
+            _dsv4_rocm_inv.rocm_inverse_rope_rows_ = _rocm_inverse_rope_rows_hip
+        except Exception:
+            pass
 
     # Replace Triton dequantize_and_gather_k_cache (74x/prefill across 37 HCA layers) with Wave32 HIP
     try:
