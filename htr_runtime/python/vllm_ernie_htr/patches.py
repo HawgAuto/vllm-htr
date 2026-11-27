@@ -1612,6 +1612,56 @@ def _patch_kv_block_zeroer() -> None:
     cls.zero_block_ids = _zero_block_ids_hip
 
 
+def _patch_skip_ernie_mixed_kv_zeroing() -> None:
+    """Wave 58: Skip redundant mixed-precision KV block zeroing for ERNIE-5.5 HCA/DSA.
+
+    vLLM enables KVBlockZeroer whenever ``has_mamba_layers or has_mixed_precision_kv_cache``.
+    ERNIE-5.5 has ZERO Mamba layers, but triggers ``has_mixed_precision_kv_cache`` because
+    its HCA compressor ``state_cache`` is FP32 while HCA/DSA/Indexer KV caches are uint8.
+    Every ERNIE-5.5 KV-reading kernel (HCA prefill/decode, DSA sparse MLA, FP8/MXFP4
+    indexer prefill/decode, c128 gather, save_partial_states/compress_c128) strictly
+    bounds-checks ``slot >= 0`` / ``pos < seq_len`` before loading DRAM and overwrites
+    before reading, so zeroing all 52 segments per allocated block (~3.6 GB/4K chunk,
+    -84 ms Phase A / -22 ms Phase B / ~-220 ms per 32K prefill) is completely redundant.
+
+    Strictly scoped:
+      - NEVER disables zeroing when ``has_mamba_layers`` is True (Qwen3.8/GDN safe).
+      - ONLY skips for ERNIE-5.5 HCA/DSA configs (detected by compressor/indexer layers).
+      - Opt-out via ``ERNIE_SKIP_MIXED_KV_ZERO=0`` (falls back to native NT HIP zeroer).
+    """
+    try:
+        from vllm.v1.kv_cache_interface import KVCacheConfig
+    except Exception:
+        return
+    prop = getattr(KVCacheConfig, "needs_kv_cache_zeroing", None)
+    if not isinstance(prop, property) or prop.fget is None:
+        return
+    if getattr(prop.fget, "_ernie5_skip_mixed_zero", False):
+        return
+    orig_fget = prop.fget
+
+    @functools.wraps(orig_fget)
+    def _needs_kv_cache_zeroing_ernie(self) -> bool:
+        if self.has_mamba_layers:
+            return True
+        if os.environ.get("ERNIE_SKIP_MIXED_KV_ZERO", "1") == "0":
+            return bool(orig_fget(self))
+        groups = getattr(self, "kv_cache_groups", None) or ()
+        is_ernie_hca_dsa = any(
+            (".compressor" in ln or ".indexer" in ln)
+            for g in groups
+            for ln in getattr(g, "layer_names", ())
+        )
+        if is_ernie_hca_dsa:
+            return False
+        return bool(orig_fget(self))
+
+    _needs_kv_cache_zeroing_ernie._ernie5_skip_mixed_zero = True  # type: ignore[attr-defined]
+    KVCacheConfig.needs_kv_cache_zeroing = property(
+        _needs_kv_cache_zeroing_ernie, prop.fset, prop.fdel, prop.__doc__
+    )
+
+
 def apply_patches() -> None:
     global _applied
     if _applied:
@@ -1628,6 +1678,7 @@ def apply_patches() -> None:
     _patch_enable_thinking()
     _patch_rocm_paged_mqa_logits_triton()
     _patch_kv_block_zeroer()
+    _patch_skip_ernie_mixed_kv_zeroing()
     if _dspark_draft_filter_enabled():
         try:
             import q38spec
