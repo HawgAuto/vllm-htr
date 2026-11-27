@@ -124,9 +124,9 @@ def _decode_scratch(dev: torch.device) -> dict[str, torch.Tensor]:
         ns_dn = (MOE_I // 128 + BPS_DN - 1) // BPS_DN
         ns_gu_k2 = (MOE_H // 128 + BPS_GU_K2 - 1) // BPS_GU_K2
         ns_dn_k2 = (MOE_I // 128 + BPS_DN_K2 - 1) // BPS_DN_K2
-        # K=2 draft uses bps=4 only when T <= 8 (a_k2 <= a // 2), fitting inside the same lean 42 MiB part buffer!
-        ns_gu = max(ns_gu, (ns_gu_k2 + 1) // 2)
-        ns_dn = max(ns_dn, (ns_dn_k2 + 1) // 2)
+        # K=2 draft uses bps=4 up to T <= 16 (ns_k2 = 4) for B=2 DSpark-5!
+        ns_gu = max(ns_gu, ns_gu_k2)
+        ns_dn = max(ns_dn, ns_dn_k2)
         f = dict(dtype=torch.float32, device=dev)
         i32 = dict(dtype=torch.int32, device=dev)
         s = _SCRATCH[key] = dict(
@@ -271,8 +271,8 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
         else:
             ge, gr, gn, slot, ng = E.moe_plan2(ids32, M)
         sp3 = self.spad if self.K == 3 else 0
-        bps_gu = BPS_GU_K2 if (self.K == 2 and T <= 8) else BPS_GU
-        bps_dn = BPS_DN_K2 if (self.K == 2 and T <= 8) else BPS_DN
+        bps_gu = BPS_GU_K2 if (self.K == 2 and T <= 16) else BPS_GU
+        bps_dn = BPS_DN_K2 if (self.K == 2 and T <= 16) else BPS_DN
         E.moe_gemv(
             0, self.K, M,
             self.qw, self.qoff, self.kexp, self.scales, self.su, self.sv,
