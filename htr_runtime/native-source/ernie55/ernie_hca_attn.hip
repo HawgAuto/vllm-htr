@@ -1492,7 +1492,7 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_s1_v28(
 //  - Union KV_lds/VT_lds_g -> 26 KiB LDS (<32 KiB -> 2 WGs/CU = 16 waves/CU on gfx1151!)
 //  - Direct idx_row load (eliminates s_slots barrier: 4 barriers/tile instead of 5!)
 //  - Software-pipelined KV prefetch of tile k0+16 issued BEFORE P@V WMMAs (reuses v_hold[4], 0 extra VGPRs!)
-__global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
+__global__ __launch_bounds__(256) __attribute__((amdgpu_waves_per_eu(8, 8))) void k_ernie_hca_prefill_qreg_pipe_v28(
     const uint16_t* __restrict__ q_ptr,      // [T, H, 512] bf16
     const uint16_t* __restrict__ kv_ptr,     // [N_kv, 512] bf16
     const int32_t* __restrict__ indices,     // [T, K_max] int32
@@ -1512,6 +1512,7 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
   __shared__ float s_alpha[32];
   __shared__ float s_m[32];
   __shared__ float s_l[32];
+  __shared__ __attribute__((aligned(16))) uint16_t Q7_lds[2][4][16][16];
 
   const int hg32 = blockIdx.x;
   const int t = blockIdx.y;
@@ -1533,9 +1534,9 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
   // Preload Q[16 x 128] ONCE into registers -> ZERO Q loads inside K loop!
   const bool q_hvalid = (h0 + l16) < num_heads;
   const uint16_t* q_base = q_ptr + (int64_t)t * q_s0 + (int64_t)(q_hvalid ? (h0 + l16) : 0) * q_s1 + wd * 128;
-  bf16x16 q_reg[8];
+  bf16x16 q_reg[7];
 #pragma unroll
-  for (int step = 0; step < 8; ++step) {
+  for (int step = 0; step < 7; ++step) {
     if (q_hvalid) {
       const u4v q0 = *reinterpret_cast<const u4va*>(q_base + step * 16 + 0);
       const u4v q1 = *reinterpret_cast<const u4va*>(q_base + step * 16 + 8);
@@ -1543,6 +1544,12 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
     } else {
       q_reg[step] = __builtin_bit_cast(bf16x16, (u8v){0u,0u,0u,0u,0u,0u,0u,0u});
     }
+  }
+  if (hrow == 0) {
+    const u4v q0 = q_hvalid ? *reinterpret_cast<const u4va*>(q_base + 7 * 16 + 0) : (u4v){0u,0u,0u,0u};
+    const u4v q1 = q_hvalid ? *reinterpret_cast<const u4va*>(q_base + 7 * 16 + 8) : (u4v){0u,0u,0u,0u};
+    *reinterpret_cast<u4va*>(&Q7_lds[wh][wd][l16][0]) = q0;
+    *reinterpret_cast<u4va*>(&Q7_lds[wh][wd][l16][8]) = q1;
   }
 
   f32x8 o_acc[8];
@@ -1589,20 +1596,28 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
     __syncthreads();
 
     // 2. Q @ K^T: 8 WMMA steps, Q 100% in VGPRs, 1-ahead K_lds prefetch!
-    f32x8 s_acc = {0, 0, 0, 0, 0, 0, 0, 0};
-    u4v k0_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][d_start]);
-    u4v k1_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][d_start + 8]);
+    f32x8 s_acc;
+    {
+      float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f, z4 = 0.0f, z5 = 0.0f, z6 = 0.0f, z7 = 0.0f;
+      asm volatile("" : "+v"(z0), "+v"(z1), "+v"(z2), "+v"(z3), "+v"(z4), "+v"(z5), "+v"(z6), "+v"(z7));
+      s_acc = (f32x8){z0, z1, z2, z3, z4, z5, z6, z7};
+    }
 #pragma unroll
     for (int step = 0; step < 8; ++step) {
-      u4v k0_n = {0u, 0u, 0u, 0u}, k1_n = {0u, 0u, 0u, 0u};
-      if (step + 1 < 8) {
-        const int dn = d_start + (step + 1) * 16;
-        k0_n = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn]);
-        k1_n = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn + 8]);
-      }
+      const int dn = d_start + step * 16;
+      const u4v k0_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn]);
+      const u4v k1_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn + 8]);
       const bf16x16 kf = __builtin_bit_cast(bf16x16, (u8v){k0_c.x, k0_c.y, k0_c.z, k0_c.w, k1_c.x, k1_c.y, k1_c.z, k1_c.w});
-      s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(q_reg[step], kf, s_acc);
-      k0_c = k0_n; k1_c = k1_n;
+      bf16x16 qf;
+      if (step < 7) {
+        qf = q_reg[step];
+      } else {
+        const u4v q0 = *reinterpret_cast<const u4va*>(&Q7_lds[wh][wd][l16][0]);
+        const u4v q1 = *reinterpret_cast<const u4va*>(&Q7_lds[wh][wd][l16][8]);
+        qf = __builtin_bit_cast(bf16x16, (u8v){q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w});
+      }
+      s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(qf, kf, s_acc);
+      __builtin_amdgcn_sched_barrier(0);
     }
 
 #pragma unroll
@@ -1625,10 +1640,7 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
       vtg[6 * HCA_VT_STRIDE] = (uint16_t)(w3 & 0xFFFFu);
       vtg[7 * HCA_VT_STRIDE] = (uint16_t)(w3 >> 16);
     }
-    if (k0 + 16 < klen) {
-      load_kv_tile(k0 + 16, v_hold);
-    }
-    __builtin_amdgcn_sched_barrier(0);
+
 
     // 3b. 4-way parallel online softmax across ALL 4 wd waves (2 ei/wave instead of 8 on wd==0!)
     {
@@ -1658,33 +1670,29 @@ __global__ __launch_bounds__(256) void k_ernie_hca_prefill_qreg_pipe_v28(
     }
     __syncthreads();
 
-    float al[8];
 #pragma unroll
-    for (int ei = 0; ei < 8; ++ei) al[ei] = s_alpha[wh * 16 + 2 * ei + hrow];
+    for (int ei = 0; ei < 8; ++ei) {
+      const float a_v = s_alpha[wh * 16 + 2 * ei + hrow];
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-#pragma unroll
-      for (int ei = 0; ei < 8; ++ei) o_acc[j][ei] *= al[ei];
+      for (int j = 0; j < 8; ++j) o_acc[j][ei] *= a_v;
     }
 
+    if (k0 + 16 < klen) {
+      load_kv_tile(k0 + 16, v_hold);
+    }
+    __builtin_amdgcn_sched_barrier(0);
     const u4v p0 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][0]);
     const u4v p1 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][8]);
     const bf16x16 pf = __builtin_bit_cast(bf16x16, (u8v){p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w});
 
-    const int vc0 = d_start + l16;
-    u4v v0_c = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vc0 >> 5][(vc0 & 31) * HCA_VT_STRIDE + 0]);
-    u4v v1_c = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vc0 >> 5][(vc0 & 31) * HCA_VT_STRIDE + 8]);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      u4v v0_n = {0u, 0u, 0u, 0u}, v1_n = {0u, 0u, 0u, 0u};
-      if (j + 1 < 8) {
-        const int vc_n = d_start + (j + 1) * 16 + l16;
-        v0_n = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vc_n >> 5][(vc_n & 31) * HCA_VT_STRIDE + 0]);
-        v1_n = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vc_n >> 5][(vc_n & 31) * HCA_VT_STRIDE + 8]);
-      }
+      const int vc_n = d_start + j * 16 + l16;
+      const u4v v0_c = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vc_n >> 5][(vc_n & 31) * HCA_VT_STRIDE + 0]);
+      const u4v v1_c = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vc_n >> 5][(vc_n & 31) * HCA_VT_STRIDE + 8]);
       const bf16x16 vf = __builtin_bit_cast(bf16x16, (u8v){v0_c.x, v0_c.y, v0_c.z, v0_c.w, v1_c.x, v1_c.y, v1_c.z, v1_c.w});
       o_acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pf, vf, o_acc[j]);
-      v0_c = v0_n; v1_c = v1_n;
+      __builtin_amdgcn_sched_barrier(0);
     }
     __syncthreads();
   }
