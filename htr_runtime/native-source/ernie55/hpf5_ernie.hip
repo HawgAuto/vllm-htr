@@ -551,7 +551,7 @@ template <int BIT> __device__ __forceinline__ void reg_stage4(float v[4]) {
 
 // MT = M-tiles per wave (1 for bmw=32 -> 4 waves = 32x128; 2 for bmw=64 -> 4 waves = 64x128; 2 for bmw=128 -> 8 waves = 128x128)
 // NWM = M-wave-groups (2 for bmw=32/64 -> 4 waves total; 4 for bmw=128 -> 8 waves total)
-template <int K, int PH, int NWM, int MT, int NT_LOAD>
+template <int K, int PH, int NWM, int MT, int NT_LOAD, int REV_G = 1>
 __global__ __launch_bounds__(NWM * 2 * 32)
 void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
   constexpr int N = (PH == 0) ? (2 * MOE_I) : MOE_H;
@@ -562,16 +562,25 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
   constexpr int LBMW = NWM * MT * BM;
   constexpr int NWAVES = NWM * 2;
   constexpr int NTHR = NWAVES * 32;
-  constexpr int B_ITERS = 256 / NTHR;
+  constexpr int B_ITERS = (NTHR >= 256) ? 1 : (256 / NTHR);
   constexpr int W_PER_ROW = (K == 3) ? 2 : 1;
 
-  __shared__ __attribute__((aligned(16))) uint32_t Bs[2][BN * RS];
+  union SmemU {
+    uint32_t Bs[2][BN * RS];
+    struct {
+      float ep[NWAVES * 32 * 4];
+      uint16_t eb[(NWM * 16) * 128];
+    } epi;
+  };
+  __shared__ __attribute__((aligned(16))) SmemU smem;
   __shared__ int32_t s_tok[LBMW];
   const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, l16 = lane & 15;
   const int wm = wave >> 1;      // 0 .. NWM-1
   const int wn = wave & 1;       // 0 .. 1 (0: cols 0..63, 1: cols 64..127)
-  const int g = blockIdx.y, nb = blockIdx.x;
-  if (g >= a.grp_cnt[0]) return;
+  const int ng = a.grp_cnt[0];
+  const int g = REV_G ? (ng - 1 - (int)blockIdx.y) : (int)blockIdx.y;
+  const int nb = blockIdx.x;
+  if (g < 0 || g >= ng) return;
   const int y = a.grp_y[g];
   const int nblk = a.grp_nblk[g];
   const int e = a.expert_ids[y];
@@ -606,6 +615,9 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
     }
   };
   auto loadB = [&](uint32_t* br, int k0) {
+    if constexpr (NTHR > 256) {
+      if (tid >= 256) return;
+    }
 #pragma unroll
     for (int bi = 0; bi < B_ITERS; ++bi) {
       const int vtid = tid + bi * NTHR;
@@ -623,7 +635,10 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
     }
   };
   auto storeB = [&](int buf, const uint32_t* br) {
-    uint32_t* bs = Bs[buf];
+    if constexpr (NTHR > 256) {
+      if (tid >= 256) return;
+    }
+    uint32_t* bs = smem.Bs[buf];
 #pragma unroll
     for (int bi = 0; bi < B_ITERS; ++bi) {
       const int vtid = tid + bi * NTHR;
@@ -650,7 +665,7 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
     if (s + 1 < NS) loadA(nxtA, (s + 1) * BKS);
     if (s + 2 < NS) loadB(b2, (s + 2) * BKS);
     if (m_act[0]) {
-      const uint32_t* bs = Bs[buf];
+      const uint32_t* bs = smem.Bs[buf];
 #pragma unroll
       for (int kc = 0; kc < 2; ++kc) {
         f16x16 af[MT];
@@ -706,7 +721,7 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
     neg |= ((uint32_t)(svp[2 * j + (l16 >> 3)] >> (l16 & 7)) & 1u) << j;
   }
   const int hrow = lane >> 4;
-  float* ep = reinterpret_cast<float*>(&Bs[0][0]); // 5120 floats available (we use NWAVES*32*4 <= 1024 floats!)
+  float* ep = smem.epi.ep;
   const int my_ep = (wave * 32 + lane) * 4;
   const int peer_ep = ((wave ^ 1) * 32 + lane) * 4;
 
@@ -731,8 +746,7 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
       __syncthreads();
       if (m_act[m] && s_tok[rl] < a.num_valid) {
         const float pv[4] = {p4.x, p4.y, p4.z, p4.w};
-        uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[0][0]) + 2048; // byte +4096..20480 = 16,384 B (holds 64x128 BF16!)
-        uint16_t* dst_lds = eb + (wm * 16 + 2 * ei + hrow) * 128 + n_base + l16;
+        uint16_t* dst_lds = smem.epi.eb + (wm * 16 + 2 * ei + hrow) * 128 + n_base + l16;
 #pragma unroll
         for (int j = 0; j < 4; ++j) {
           float yv = ((wn == 0) ? (v[j] + pv[j]) : (pv[j] - v[j])) * INV128;
@@ -744,7 +758,6 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
     __syncthreads();
     // ONE single coalesced u32x4 (16B x 16 threads = 256B = 4 full 64B lines) pass for all 32 rows!
     {
-      uint16_t* eb = reinterpret_cast<uint16_t*>(&Bs[0][0]) + 2048;
       const int sr_base = tid >> 4;
       const int sc_off  = (tid & 15) * 8;
 #pragma unroll
@@ -755,7 +768,7 @@ void k_hpf_ernie_gemm_n2(ErnieGemmArgs a) {
         const int s_rl = s_mb * 16 + (r_loc & 15);
         if (s_tok[s_rl] < a.num_valid) {
           const size_t s_prow = (size_t)y * BM + s_rl;
-          const u32x4 v4 = *reinterpret_cast<const u32x4*>(eb + r_loc * 128 + sc_off);
+          const u32x4 v4 = *reinterpret_cast<const u32x4*>(smem.epi.eb + r_loc * 128 + sc_off);
           *reinterpret_cast<u32x4*>(reinterpret_cast<uint16_t*>(a.Y) + s_prow * (size_t)N + row0 + sc_off) = v4;
         }
       }
@@ -774,8 +787,8 @@ static void dispatch_gemm(int bmw, int nt_load, int max_g, hipStream_t st, Ernie
     if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 4, 1, 1>), dim3(N / BN, max_g), dim3(256), 0, st, a);
     else         hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 4, 1, 0>), dim3(N / BN, max_g), dim3(256), 0, st, a);
   } else {
-    if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 8, 1>), dim3(N / BN, max_g), dim3(256), 0, st, a);
-    else         hipLaunchKernelGGL((k_hpf_ernie_gemm<K, PH, 8, 0>), dim3(N / BN, max_g), dim3(256), 0, st, a);
+    if (nt_load) hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 8, 1, 1, 1>), dim3(N / BN, max_g), dim3(512), 0, st, a);
+    else         hipLaunchKernelGGL((k_hpf_ernie_gemm_n2<K, PH, 8, 1, 0, 1>), dim3(N / BN, max_g), dim3(512), 0, st, a);
   }
 }
 
