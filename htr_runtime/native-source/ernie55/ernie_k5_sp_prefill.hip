@@ -1455,30 +1455,23 @@ __device__ __forceinline__ void k5_unsplit_tile_loop(
 
     u4v wa_nxt = {0u, 0u, 0u, 0u};
     uint32_t w5_nxt = 0u;
-    if (step + 4 < nloc) {
-      int jn_base = step + 4 + phase;
-      if (jn_base >= nloc) jn_base -= nloc;
-      const int jn = jn_base + g;
-      if (jn < nloc) {
-        const uint32_t* tpn = qrow + (size_t)(j0 + jn) * 40;
-        wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn + q * 5));
-        w5_nxt = __builtin_nontemporal_load(tpn + q * 5 + 4);
-      }
-    }
 
     if (valid) {
-      uint32_t V[6];
-      V[0] = __builtin_amdgcn_permlane16(w5_cur, w5_cur, 0x65432107u, 0xedcba98fu, false, false);
-      V[1] = wa_cur.x; V[2] = wa_cur.y; V[3] = wa_cur.z; V[4] = wa_cur.w; V[5] = w5_cur;
-      __builtin_amdgcn_sched_barrier(0);
-
       const int j = j0 + jl;
+      // Wave 20: VMEM-FIFO-fixed prefetch! Issue GL1/GL2-hot u0/u1 BEFORE cold-DRAM wa_nxt/w5_nxt
+      // so s_waitcnt vmcnt(2) completes immediately on u1 while next tile streams from LPDDR5X!
       h2v xv[M][4];
 #pragma unroll
       for (int r = 0; r < M; ++r) {
         const uint4 u0 = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16)[0];
         xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
       }
+
+      uint32_t V[6];
+      V[0] = __builtin_amdgcn_permlane16(w5_cur, w5_cur, 0x65432107u, 0xedcba98fu, false, false);
+      V[1] = wa_cur.x; V[2] = wa_cur.y; V[3] = wa_cur.z; V[4] = wa_cur.w; V[5] = w5_cur;
+      __builtin_amdgcn_sched_barrier(0);
+
 #define K5U_DUAL(U0, U1)                                                                             \
       {                                                                                              \
         const h2v w0 = as_h2(val_f16bits2(ext16<16 + ((U0) + 1) * 5>(V), ext16<16 + ((U0) + 2) * 5>(V))); \
@@ -1495,8 +1488,29 @@ __device__ __forceinline__ void k5_unsplit_tile_loop(
         const uint4 u1 = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16)[1];
         xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
       }
+      __builtin_amdgcn_sched_barrier(0);
+      if (step + 4 < nloc) {
+        int jn_base = step + 4 + phase;
+        if (jn_base >= nloc) jn_base -= nloc;
+        const int jn = jn_base + g;
+        if (jn < nloc) {
+          const uint32_t* tpn = qrow + (size_t)(j0 + jn) * 40;
+          wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn + q * 5));
+          w5_nxt = __builtin_nontemporal_load(tpn + q * 5 + 4);
+        }
+      }
+      __builtin_amdgcn_sched_barrier(0);
       K5U_DUAL(8, 26) K5U_DUAL(10, 24) K5U_DUAL(12, 30) K5U_DUAL(14, 28)
 #undef K5U_DUAL
+    } else if (step + 4 < nloc) {
+      int jn_base = step + 4 + phase;
+      if (jn_base >= nloc) jn_base -= nloc;
+      const int jn = jn_base + g;
+      if (jn < nloc) {
+        const uint32_t* tpn = qrow + (size_t)(j0 + jn) * 40;
+        wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn + q * 5));
+        w5_nxt = __builtin_nontemporal_load(tpn + q * 5 + 4);
+      }
     }
     wa_cur = wa_nxt;
     w5_cur = w5_nxt;
@@ -1625,11 +1639,8 @@ __global__ __launch_bounds__(256) void k_gemv_k5_unsplit_epi8(
 
   const int j0 = sp * tps, j1 = min(nt, j0 + tps);
   const int nloc = j1 - j0;
-  // For tps=8, waves w=0..7 already hit w*1280B = w*5*256B (perfect 8/8 channel bijection).
-  // For tps=16,32,64, cyclic phase breaks channel aliasing across waves.
-  const int phase = ((nloc & 15) == 0 && nloc >= 16)
-      ? ((nloc >= 64) ? ((w & 7) * 8) : ((nloc >= 32) ? ((w & 7) * 4) : ((w & 3) * 4)))
-      : 0;
+  // Wave 20: inter-WG + intra-WG LPDDR5X channel stagger
+  const int phase = (nloc >= 16 && (nloc & 3) == 0) ? (((w + (int)blockIdx.x) & 3) * 4) : 0;
   k5_unsplit_tile_loop<M>(qw + (size_t)i * nt * 40, xt, j0, j1, n, lane, phase, a0, a1);
 
 #pragma unroll
@@ -1735,7 +1746,94 @@ __device__ __forceinline__ void k5_unsplit_tile_loop_big(
 
     u4v wa_nxt = {0u, 0u, 0u, 0u};
     uint32_t w5_nxt = 0u;
-    if (step + 4 < nloc) {
+
+    if (valid) {
+      const int j = j0 + jl;
+      uint32_t V[6];
+      V[0] = __builtin_amdgcn_permlane16(w5_cur, w5_cur, 0x65432107u, 0xedcba98fu, false, false);
+      V[1] = wa_cur.x; V[2] = wa_cur.y; V[3] = wa_cur.z; V[4] = wa_cur.w; V[5] = w5_cur;
+
+      h2v w0[4], w1[4], xv[8][4];
+      w0[0] = as_h2(val_f16bits2(ext16<16 +  1*5>(V), ext16<16 +  2*5>(V)));
+      w1[0] = as_h2(val_f16bits2(ext16<16 + 19*5>(V), ext16<16 + 20*5>(V)));
+      w0[1] = as_h2(val_f16bits2(ext16<16 +  3*5>(V), ext16<16 +  4*5>(V)));
+      w1[1] = as_h2(val_f16bits2(ext16<16 + 17*5>(V), ext16<16 + 18*5>(V)));
+      w0[2] = as_h2(val_f16bits2(ext16<16 +  5*5>(V), ext16<16 +  6*5>(V)));
+      w1[2] = as_h2(val_f16bits2(ext16<16 + 23*5>(V), ext16<16 + 24*5>(V)));
+      w0[3] = as_h2(val_f16bits2(ext16<16 +  7*5>(V), ext16<16 +  8*5>(V)));
+      w1[3] = as_h2(val_f16bits2(ext16<16 + 21*5>(V), ext16<16 + 22*5>(V)));
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        const uint4 u0 = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16)[0];
+        xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
+      }
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        a0[r] = __builtin_amdgcn_fdot2(w0[0], xv[r][0], a0[r], false); a1[r] = __builtin_amdgcn_fdot2(w1[0], xv[r][1], a1[r], false);
+        a0[r] = __builtin_amdgcn_fdot2(w0[1], xv[r][1], a0[r], false); a1[r] = __builtin_amdgcn_fdot2(w1[1], xv[r][0], a1[r], false);
+        a0[r] = __builtin_amdgcn_fdot2(w0[2], xv[r][2], a0[r], false); a1[r] = __builtin_amdgcn_fdot2(w1[2], xv[r][3], a1[r], false);
+        a0[r] = __builtin_amdgcn_fdot2(w0[3], xv[r][3], a0[r], false); a1[r] = __builtin_amdgcn_fdot2(w1[3], xv[r][2], a1[r], false);
+      }
+#pragma unroll
+      for (int r = 0; r < R2; ++r) {
+        const int rr = min(8 + r, mr - 1);
+        const uint4 u0 = reinterpret_cast<const uint4*>(xt + (size_t)rr * n + j * 16)[0];
+        xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
+      }
+#pragma unroll
+      for (int r = 0; r < R2; ++r) {
+        a0[8+r] = __builtin_amdgcn_fdot2(w0[0], xv[r][0], a0[8+r], false); a1[8+r] = __builtin_amdgcn_fdot2(w1[0], xv[r][1], a1[8+r], false);
+        a0[8+r] = __builtin_amdgcn_fdot2(w0[1], xv[r][1], a0[8+r], false); a1[8+r] = __builtin_amdgcn_fdot2(w1[1], xv[r][0], a1[8+r], false);
+        a0[8+r] = __builtin_amdgcn_fdot2(w0[2], xv[r][2], a0[8+r], false); a1[8+r] = __builtin_amdgcn_fdot2(w1[2], xv[r][3], a1[8+r], false);
+        a0[8+r] = __builtin_amdgcn_fdot2(w0[3], xv[r][3], a0[8+r], false); a1[8+r] = __builtin_amdgcn_fdot2(w1[3], xv[r][2], a1[8+r], false);
+      }
+
+      w0[0] = as_h2(val_f16bits2(ext16<16 +  9*5>(V), ext16<16 + 10*5>(V)));
+      w1[0] = as_h2(val_f16bits2(ext16<16 + 27*5>(V), ext16<16 + 28*5>(V)));
+      w0[1] = as_h2(val_f16bits2(ext16<16 + 11*5>(V), ext16<16 + 12*5>(V)));
+      w1[1] = as_h2(val_f16bits2(ext16<16 + 25*5>(V), ext16<16 + 26*5>(V)));
+      w0[2] = as_h2(val_f16bits2(ext16<16 + 13*5>(V), ext16<16 + 14*5>(V)));
+      w1[2] = as_h2(val_f16bits2(ext16<16 + 31*5>(V), ext16<16 + 32*5>(V)));
+      w0[3] = as_h2(val_f16bits2(ext16<16 + 15*5>(V), ext16<16 + 16*5>(V)));
+      w1[3] = as_h2(val_f16bits2(ext16<16 + 29*5>(V), ext16<16 + 30*5>(V)));
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        const uint4 u1 = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16)[1];
+        xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+      }
+#pragma unroll
+      for (int r = 0; r < 8; ++r) {
+        a0[r] = __builtin_amdgcn_fdot2(w0[0], xv[r][0], a0[r], false); a1[r] = __builtin_amdgcn_fdot2(w1[0], xv[r][1], a1[r], false);
+        a0[r] = __builtin_amdgcn_fdot2(w0[1], xv[r][1], a0[r], false); a1[r] = __builtin_amdgcn_fdot2(w1[1], xv[r][0], a1[r], false);
+        a0[r] = __builtin_amdgcn_fdot2(w0[2], xv[r][2], a0[r], false); a1[r] = __builtin_amdgcn_fdot2(w1[2], xv[r][3], a1[r], false);
+        a0[r] = __builtin_amdgcn_fdot2(w0[3], xv[r][3], a0[r], false); a1[r] = __builtin_amdgcn_fdot2(w1[3], xv[r][2], a1[r], false);
+      }
+#pragma unroll
+      for (int r = 0; r < R2; ++r) {
+        const int rr = min(8 + r, mr - 1);
+        const uint4 u1 = reinterpret_cast<const uint4*>(xt + (size_t)rr * n + j * 16)[1];
+        xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
+      }
+      __builtin_amdgcn_sched_barrier(0);
+      if (step + 4 < nloc) {
+        int jn_base = step + 4 + phase;
+        if (jn_base >= nloc) jn_base -= nloc;
+        const int jn = jn_base + g;
+        if (jn < nloc) {
+          const uint32_t* tpn = qrow + (size_t)(j0 + jn) * 40;
+          wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn + q * 5));
+          w5_nxt = __builtin_nontemporal_load(tpn + q * 5 + 4);
+        }
+      }
+      __builtin_amdgcn_sched_barrier(0);
+#pragma unroll
+      for (int r = 0; r < R2; ++r) {
+        a0[8+r] = __builtin_amdgcn_fdot2(w0[0], xv[r][0], a0[8+r], false); a1[8+r] = __builtin_amdgcn_fdot2(w1[0], xv[r][1], a1[8+r], false);
+        a0[8+r] = __builtin_amdgcn_fdot2(w0[1], xv[r][1], a0[8+r], false); a1[8+r] = __builtin_amdgcn_fdot2(w1[1], xv[r][0], a1[8+r], false);
+        a0[8+r] = __builtin_amdgcn_fdot2(w0[2], xv[r][2], a0[8+r], false); a1[8+r] = __builtin_amdgcn_fdot2(w1[2], xv[r][3], a1[8+r], false);
+        a0[8+r] = __builtin_amdgcn_fdot2(w0[3], xv[r][3], a0[8+r], false); a1[8+r] = __builtin_amdgcn_fdot2(w1[3], xv[r][2], a1[8+r], false);
+      }
+    } else if (step + 4 < nloc) {
       int jn_base = step + 4 + phase;
       if (jn_base >= nloc) jn_base -= nloc;
       const int jn = jn_base + g;
@@ -1743,115 +1841,6 @@ __device__ __forceinline__ void k5_unsplit_tile_loop_big(
         const uint32_t* tpn = qrow + (size_t)(j0 + jn) * 40;
         wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn + q * 5));
         w5_nxt = __builtin_nontemporal_load(tpn + q * 5 + 4);
-      }
-    }
-
-    if (valid) {
-      uint32_t V[6];
-      V[0] = __builtin_amdgcn_permlane16(w5_cur, w5_cur, 0x65432107u, 0xedcba98fu, false, false);
-      V[1] = wa_cur.x; V[2] = wa_cur.y; V[3] = wa_cur.z; V[4] = wa_cur.w; V[5] = w5_cur;
-      __builtin_amdgcn_sched_barrier(0);
-
-      const int j = j0 + jl;
-      const h2v w0a = as_h2(val_f16bits2(ext16<16 + 1 * 5>(V),  ext16<16 + 2 * 5>(V)));
-      const h2v w1a = as_h2(val_f16bits2(ext16<16 + 19 * 5>(V), ext16<16 + 20 * 5>(V)));
-      const h2v w0b = as_h2(val_f16bits2(ext16<16 + 3 * 5>(V),  ext16<16 + 4 * 5>(V)));
-      const h2v w1b = as_h2(val_f16bits2(ext16<16 + 17 * 5>(V), ext16<16 + 18 * 5>(V)));
-      const h2v w0c = as_h2(val_f16bits2(ext16<16 + 5 * 5>(V),  ext16<16 + 6 * 5>(V)));
-      const h2v w1c = as_h2(val_f16bits2(ext16<16 + 23 * 5>(V), ext16<16 + 24 * 5>(V)));
-      const h2v w0d = as_h2(val_f16bits2(ext16<16 + 7 * 5>(V),  ext16<16 + 8 * 5>(V)));
-      const h2v w1d = as_h2(val_f16bits2(ext16<16 + 21 * 5>(V), ext16<16 + 22 * 5>(V)));
-
-      {
-        h2v xv[8][4];
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-          const uint4 u0 = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16)[0];
-          xv[r][0] = as_h2(u0.x); xv[r][1] = as_h2(u0.y); xv[r][2] = as_h2(u0.z); xv[r][3] = as_h2(u0.w);
-        }
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-          a0[r] = __builtin_amdgcn_fdot2(w0a, xv[r][0], a0[r], false);
-          a1[r] = __builtin_amdgcn_fdot2(w1a, xv[r][1], a1[r], false);
-          a0[r] = __builtin_amdgcn_fdot2(w0b, xv[r][1], a0[r], false);
-          a1[r] = __builtin_amdgcn_fdot2(w1b, xv[r][0], a1[r], false);
-          a0[r] = __builtin_amdgcn_fdot2(w0c, xv[r][2], a0[r], false);
-          a1[r] = __builtin_amdgcn_fdot2(w1c, xv[r][3], a1[r], false);
-          a0[r] = __builtin_amdgcn_fdot2(w0d, xv[r][3], a0[r], false);
-          a1[r] = __builtin_amdgcn_fdot2(w1d, xv[r][2], a1[r], false);
-        }
-      }
-      __builtin_amdgcn_sched_barrier(0);
-      {
-        h2v xv2[R2][4];
-#pragma unroll
-        for (int k = 0; k < R2; ++k) {
-          const int rr = (8 + k < mr) ? (8 + k) : (mr - 1);
-          const uint4 u0 = reinterpret_cast<const uint4*>(xt + (size_t)rr * n + j * 16)[0];
-          xv2[k][0] = as_h2(u0.x); xv2[k][1] = as_h2(u0.y); xv2[k][2] = as_h2(u0.z); xv2[k][3] = as_h2(u0.w);
-        }
-#pragma unroll
-        for (int k = 0; k < R2; ++k) {
-          a0[8 + k] = __builtin_amdgcn_fdot2(w0a, xv2[k][0], a0[8 + k], false);
-          a1[8 + k] = __builtin_amdgcn_fdot2(w1a, xv2[k][1], a1[8 + k], false);
-          a0[8 + k] = __builtin_amdgcn_fdot2(w0b, xv2[k][1], a0[8 + k], false);
-          a1[8 + k] = __builtin_amdgcn_fdot2(w1b, xv2[k][0], a1[8 + k], false);
-          a0[8 + k] = __builtin_amdgcn_fdot2(w0c, xv2[k][2], a0[8 + k], false);
-          a1[8 + k] = __builtin_amdgcn_fdot2(w1c, xv2[k][3], a1[8 + k], false);
-          a0[8 + k] = __builtin_amdgcn_fdot2(w0d, xv2[k][3], a0[8 + k], false);
-          a1[8 + k] = __builtin_amdgcn_fdot2(w1d, xv2[k][2], a1[8 + k], false);
-        }
-      }
-      __builtin_amdgcn_sched_barrier(0);
-
-      const h2v w0e = as_h2(val_f16bits2(ext16<16 + 9 * 5>(V),  ext16<16 + 10 * 5>(V)));
-      const h2v w1e = as_h2(val_f16bits2(ext16<16 + 27 * 5>(V), ext16<16 + 28 * 5>(V)));
-      const h2v w0f = as_h2(val_f16bits2(ext16<16 + 11 * 5>(V), ext16<16 + 12 * 5>(V)));
-      const h2v w1f = as_h2(val_f16bits2(ext16<16 + 25 * 5>(V), ext16<16 + 26 * 5>(V)));
-      const h2v w0g = as_h2(val_f16bits2(ext16<16 + 13 * 5>(V), ext16<16 + 14 * 5>(V)));
-      const h2v w1g = as_h2(val_f16bits2(ext16<16 + 31 * 5>(V), ext16<16 + 32 * 5>(V)));
-      const h2v w0h = as_h2(val_f16bits2(ext16<16 + 15 * 5>(V), ext16<16 + 16 * 5>(V)));
-      const h2v w1h = as_h2(val_f16bits2(ext16<16 + 29 * 5>(V), ext16<16 + 30 * 5>(V)));
-
-      {
-        h2v xv[8][4];
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-          const uint4 u1 = reinterpret_cast<const uint4*>(xt + (size_t)r * n + j * 16)[1];
-          xv[r][0] = as_h2(u1.x); xv[r][1] = as_h2(u1.y); xv[r][2] = as_h2(u1.z); xv[r][3] = as_h2(u1.w);
-        }
-#pragma unroll
-        for (int r = 0; r < 8; ++r) {
-          a0[r] = __builtin_amdgcn_fdot2(w0e, xv[r][0], a0[r], false);
-          a1[r] = __builtin_amdgcn_fdot2(w1e, xv[r][1], a1[r], false);
-          a0[r] = __builtin_amdgcn_fdot2(w0f, xv[r][1], a0[r], false);
-          a1[r] = __builtin_amdgcn_fdot2(w1f, xv[r][0], a1[r], false);
-          a0[r] = __builtin_amdgcn_fdot2(w0g, xv[r][2], a0[r], false);
-          a1[r] = __builtin_amdgcn_fdot2(w1g, xv[r][3], a1[r], false);
-          a0[r] = __builtin_amdgcn_fdot2(w0h, xv[r][3], a0[r], false);
-          a1[r] = __builtin_amdgcn_fdot2(w1h, xv[r][2], a1[r], false);
-        }
-      }
-      __builtin_amdgcn_sched_barrier(0);
-      {
-        h2v xv2[R2][4];
-#pragma unroll
-        for (int k = 0; k < R2; ++k) {
-          const int rr = (8 + k < mr) ? (8 + k) : (mr - 1);
-          const uint4 u1 = reinterpret_cast<const uint4*>(xt + (size_t)rr * n + j * 16)[1];
-          xv2[k][0] = as_h2(u1.x); xv2[k][1] = as_h2(u1.y); xv2[k][2] = as_h2(u1.z); xv2[k][3] = as_h2(u1.w);
-        }
-#pragma unroll
-        for (int k = 0; k < R2; ++k) {
-          a0[8 + k] = __builtin_amdgcn_fdot2(w0e, xv2[k][0], a0[8 + k], false);
-          a1[8 + k] = __builtin_amdgcn_fdot2(w1e, xv2[k][1], a1[8 + k], false);
-          a0[8 + k] = __builtin_amdgcn_fdot2(w0f, xv2[k][1], a0[8 + k], false);
-          a1[8 + k] = __builtin_amdgcn_fdot2(w1f, xv2[k][0], a1[8 + k], false);
-          a0[8 + k] = __builtin_amdgcn_fdot2(w0g, xv2[k][2], a0[8 + k], false);
-          a1[8 + k] = __builtin_amdgcn_fdot2(w1g, xv2[k][3], a1[8 + k], false);
-          a0[8 + k] = __builtin_amdgcn_fdot2(w0h, xv2[k][3], a0[8 + k], false);
-          a1[8 + k] = __builtin_amdgcn_fdot2(w1h, xv2[k][2], a1[8 + k], false);
-        }
       }
     }
     wa_cur = wa_nxt;
@@ -1979,9 +1968,8 @@ __global__ __launch_bounds__(256) void k_gemv_k5_unsplit_epi8_big(
 
   const int j0 = sp * tps, j1 = min(nt, j0 + tps);
   const int nloc = j1 - j0;
-  const int phase = ((nloc & 15) == 0 && nloc >= 16)
-      ? ((nloc >= 64) ? ((w & 7) * 8) : ((nloc >= 32) ? ((w & 7) * 4) : ((w & 3) * 4)))
-      : 0;
+  // Wave 20: inter-WG + intra-WG LPDDR5X channel stagger
+  const int phase = (nloc >= 16 && (nloc & 3) == 0) ? (((w + (int)blockIdx.x) & 3) * 4) : 0;
   k5_unsplit_tile_loop_big<M_CAP>(qw + (size_t)i * nt * 40, xt, j0, j1, n, lane, phase, mr, a0, a1);
 
 #pragma unroll
@@ -2085,9 +2073,8 @@ void k_gemv_k5_wmma_dec_epi8(
 
   const int j0 = sp * tps, j1 = min(nt, j0 + tps);
   const int nloc = j1 - j0;
-  const int phase = ((nloc & 15) == 0 && nloc >= 16)
-      ? ((nloc >= 64) ? ((w & 7) * 8) : ((nloc >= 32) ? ((w & 7) * 4) : ((w & 3) * 4)))
-      : 0;
+  // Wave 20: inter-WG + intra-WG LPDDR5X channel stagger
+  const int phase = (nloc >= 16 && (nloc & 3) == 0) ? (((w + (int)blockIdx.x) & 3) * 4) : 0;
 
   f8v acc = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   const uint32_t* qrow = qw + (size_t)i * nt * 40;
@@ -2242,6 +2229,87 @@ void k_gemv_k5_wmma_dec_epi8(
   if (threadIdx.x == 0) counters[b] = 0u;
 }
 
+// Wave 20: Zero-partial, zero-fence, zero-atomic 128-row WG (dim3(512) = 16 waves = 2 K-splits x 8 tiles)
+// Eliminates part DRAM R/W + agent release/acquire fences + atomicAdd on medium-mt / short-K shapes
+// (HCA o_gate 4096x1536: 180.6 GB/s, MoE up_lat 4096x2048: 179.8 GB/s, DSA o_gate 8192x1536: 193.2 GB/s)!
+template <int M>
+__global__ __launch_bounds__(512) void k_gemv_k5_unsplit_ns1_128_w16(
+    const uint32_t* __restrict__ qw, const _Float16* __restrict__ xt,
+    const float* __restrict__ xs, const float* __restrict__ tok,
+    const __half* __restrict__ scales, float cb,
+    const uint8_t* __restrict__ sv, const uint16_t* __restrict__ bias,
+    uint16_t* __restrict__ y, int mt, int nt) {
+  __shared__ float blk_s[2][M][128];
+  const int lane = threadIdx.x & 31;
+  const int w = threadIdx.x >> 5;
+  const int b = blockIdx.x;
+  const int ti = w & 7;
+  const int sp = w >> 3;
+  const int i = b * 8 + ti;
+  const int g = lane >> 3, q = lane & 7;
+  const int n = nt * 16, m = mt * 16;
+
+  float a0[M], a1[M];
+#pragma unroll
+  for (int r = 0; r < M; ++r) { a0[r] = 0.f; a1[r] = 0.f; }
+
+  const int tps = (nt + 1) >> 1;
+  const int j0 = sp * tps, j1 = min(nt, j0 + tps);
+  const int nloc = j1 - j0;
+  const int phase = (nloc >= 16 && (nloc & 3) == 0) ? (((ti + b) & 3) * 4) : 0;
+  k5_unsplit_tile_loop<M>(qw + (size_t)i * nt * 40, xt, j0, j1, n, lane, phase, a0, a1);
+
+#pragma unroll
+  for (int r = 0; r < M; ++r) {
+    a0[r] += shx<8>(a0[r]); a0[r] += shx<16>(a0[r]);
+    a1[r] += shx<8>(a1[r]); a1[r] += shx<16>(a1[r]);
+  }
+  if (g == 0) {
+#pragma unroll
+    for (int r = 0; r < M; ++r) {
+      blk_s[sp][r][ti * 16 + 2 * q]     = a0[r];
+      blk_s[sp][r][ti * 16 + 2 * q + 1] = a1[r];
+    }
+  }
+  __syncthreads();
+
+  if (w < M) {
+    const int base = b * 128 + lane * 4;
+    const h4v hs = *reinterpret_cast<const h4v*>(scales + base);
+    const float sc[4] = {(float)hs.x * cb, (float)hs.y * cb, (float)hs.z * cb, (float)hs.w * cb};
+    const unsigned sg4 = (unsigned)sv[b * 16 + (lane >> 1)] >> ((lane & 1) * 4);
+    float bv[4] = {0.f, 0.f, 0.f, 0.f};
+    if (bias != nullptr) {
+      const uint2 br = *reinterpret_cast<const uint2*>(bias + base);
+      bv[0] = __uint_as_float((br.x & 0xFFFFu) << 16); bv[1] = __uint_as_float(br.x & 0xFFFF0000u);
+      bv[2] = __uint_as_float((br.y & 0xFFFFu) << 16); bv[3] = __uint_as_float(br.y & 0xFFFF0000u);
+    }
+    const int r = w;
+    f4v s4 = *reinterpret_cast<const f4v*>(&blk_s[0][r][lane * 4])
+           + *reinterpret_cast<const f4v*>(&blk_s[1][r][lane * 4]);
+    const float c = 1534.0f * xs[r], t = tok[r];
+    float v[4] = { (s4.x - c) * sc[0] * t, (s4.y - c) * sc[1] * t, (s4.z - c) * sc[2] * t, (s4.w - c) * sc[3] * t };
+    fwht128_wave(v, lane);
+    float o[4] = {
+      v[0] * (1.0f / 11.313708498984761f), v[1] * (1.0f / 11.313708498984761f),
+      v[2] * (1.0f / 11.313708498984761f), v[3] * (1.0f / 11.313708498984761f),
+    };
+    if (sg4 & 1u) o[0] = -o[0]; if (sg4 & 2u) o[1] = -o[1];
+    if (sg4 & 4u) o[2] = -o[2]; if (sg4 & 8u) o[3] = -o[3];
+    if (bias != nullptr) { o[0] += bv[0]; o[1] += bv[1]; o[2] += bv[2]; o[3] += bv[3]; }
+    *reinterpret_cast<uint2*>(y + (size_t)r * m + base) = {f32_to_bf16x2_rne(o[0], o[1]), f32_to_bf16x2_rne(o[2], o[3])};
+  }
+}
+
+static torch::Tensor g_k5u_part_buf;
+static float* get_k5u_part_ptr(int64_t need, const torch::Tensor& ref) {
+  if (!g_k5u_part_buf.defined() || g_k5u_part_buf.numel() < need || g_k5u_part_buf.device() != ref.device()) {
+    // 4M floats = 16 MiB covers all ERNIE-5.5 shapes up to M=16 (including lm_head 201216) without HIP-graph realloc!
+    g_k5u_part_buf = torch::empty({std::max<int64_t>(need, 4 * 1024 * 1024)}, ref.options().dtype(torch::kFloat32));
+  }
+  return g_k5u_part_buf.data_ptr<float>();
+}
+
 torch::Tensor gemv_k5_unsplit_epi(
     torch::Tensor qw, torch::Tensor xt, torch::Tensor xs, torch::Tensor tok,
     torch::Tensor scales, double cb, torch::Tensor sv,
@@ -2253,26 +2321,44 @@ torch::Tensor gemv_k5_unsplit_epi(
   const int M = (int)xt.size(0);
   const int m = mt * 16;
   TORCH_CHECK(M >= 1 && M <= 16 && (mt % 8) == 0 && xt.size(1) == nt * 16);
-  const int ns = std::max(1, std::min((int)nsplit, nt));
-  const int tps = (nt + ns - 1) / ns;
-  const int ns_eff = (nt + tps - 1) / tps;
-  const bool e8 = (use_e8 != 0) && ((ns_eff % 8) == 0);
-  const int ns_part = e8 ? (ns_eff >> 3) : ns_eff;
 
-  auto part = torch::empty({ns_part, M, m}, qw.options().dtype(torch::kFloat32));
   auto y = torch::empty({M, m}, qw.options().dtype(torch::kBFloat16));
   auto st = c10::hip::getCurrentHIPStream().stream();
 
   const uint32_t* qwp = reinterpret_cast<const uint32_t*>(qw.data_ptr<int32_t>());
   const _Float16* xtp = reinterpret_cast<const _Float16*>(xt.data_ptr<at::Half>());
-  float* pp = part.data_ptr<float>();
-  unsigned* cntp = reinterpret_cast<unsigned*>(counters.data_ptr<int32_t>());
   const float* xsp = xs.data_ptr<float>();
   const float* tokp = tok.data_ptr<float>();
   const __half* sclp = reinterpret_cast<const __half*>(scales.data_ptr<at::Half>());
   const uint8_t* svp = sv.data_ptr<uint8_t>();
   const uint16_t* bp = bias.has_value() ? reinterpret_cast<const uint16_t*>(bias->data_ptr()) : nullptr;
   uint16_t* yp = reinterpret_cast<uint16_t*>(y.data_ptr());
+
+  // Zero-fence, zero-atomic 128-row WG for medium-mt / short-K shapes at M=1..8:
+  // HCA o_gate (mt=256,nt=96), MoE up_lat (mt=256,nt=128), DSA o_gate (mt=512,nt=96) -> 180-193 GB/s!
+  if (M <= 8 && mt >= 256 && mt <= 512 && nt >= 32 && nt <= 128) {
+    dim3 g128(mt >> 3);
+#define LAUNCH_K5U_NS1(MM) \
+    hipLaunchKernelGGL((k_gemv_k5_unsplit_ns1_128_w16<MM>), g128, dim3(512), 0, st, \
+                       qwp, xtp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt)
+    switch (M) {
+      case 1: LAUNCH_K5U_NS1(1); break; case 2: LAUNCH_K5U_NS1(2); break;
+      case 3: LAUNCH_K5U_NS1(3); break; case 4: LAUNCH_K5U_NS1(4); break;
+      case 5: LAUNCH_K5U_NS1(5); break; case 6: LAUNCH_K5U_NS1(6); break;
+      case 7: LAUNCH_K5U_NS1(7); break; case 8: LAUNCH_K5U_NS1(8); break;
+    }
+#undef LAUNCH_K5U_NS1
+    return y;
+  }
+
+  const int ns = std::max(1, std::min((int)nsplit, nt));
+  const int tps = (nt + ns - 1) / ns;
+  const int ns_eff = (nt + tps - 1) / tps;
+  const bool e8 = (use_e8 != 0) && ((ns_eff % 8) == 0);
+  const int ns_part = e8 ? (ns_eff >> 3) : ns_eff;
+
+  float* pp = get_k5u_part_ptr((int64_t)ns_part * M * m, qw);
+  unsigned* cntp = reinterpret_cast<unsigned*>(counters.data_ptr<int32_t>());
 
   dim3 grid = e8 ? dim3(mt * (ns_eff >> 3)) : dim3((mt * ns_eff + 7) / 8);
 #define LAUNCH_K5U(MM)                                                                                         \
@@ -2290,6 +2376,12 @@ torch::Tensor gemv_k5_unsplit_epi(
     case 7: LAUNCH_K5U(7); break;
     case 8: LAUNCH_K5U(8); break;
     case 9: case 10: case 11: case 12:
+      // Wave 20: VMEM-FIFO-fixed big<12> beats k_gemv_k5_wmma_dec_epi8 across ALL 11 ERNIE-5.5 shapes (-1.27 ms/step)!
+      if (e8) hipLaunchKernelGGL((k_gemv_k5_unsplit_epi8_big<12>), grid, dim3(256), 0, st,
+                                 qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
+      else    hipLaunchKernelGGL((k_gemv_k5_unsplit_epi_big<12>), grid, dim3(256), 0, st,
+                                 qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
+      break;
     default:
       if (e8 && nt >= 32) {
         int ns_w = (mt <= 256 && nt >= 256 && nt <= 512) ? 16 : 8;
@@ -2299,11 +2391,6 @@ torch::Tensor gemv_k5_unsplit_epi(
         const dim3 grid_w((mt * ns_w + 7) / 8);
         hipLaunchKernelGGL(k_gemv_k5_wmma_dec_epi8, grid_w, dim3(256), 0, st,
                            qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_w, tps_w, M);
-      } else if (M <= 12) {
-        if (e8) hipLaunchKernelGGL((k_gemv_k5_unsplit_epi8_big<12>), grid, dim3(256), 0, st,
-                                   qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
-        else    hipLaunchKernelGGL((k_gemv_k5_unsplit_epi_big<12>), grid, dim3(256), 0, st,
-                                   qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);
       } else {
         if (e8) hipLaunchKernelGGL((k_gemv_k5_unsplit_epi8_big<16>), grid, dim3(256), 0, st,
                                    qwp, xtp, pp, cntp, xsp, tokp, sclp, (float)cb, svp, bp, yp, mt, nt, ns_eff, tps, M);

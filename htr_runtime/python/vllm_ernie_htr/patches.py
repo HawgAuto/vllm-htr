@@ -1328,6 +1328,17 @@ def _patch_htr_linear_for_repacked_k5() -> None:
                         ns = htr_ops.nsplit_for(mt, nt, min(M, 8))
                         if nt >= 32:
                             ns = min(32, max(8, ((ns + 7) // 8) * 8))
+                            # Wave 20: ensure ns_eff % 8 == 0 (e8=1)! Specifically nt=96 (K=1536) with ns=16
+                            # rounds to ns_eff=12 (e8=0!), collapsing BW to 58-132 GB/s; ns=8 gives ns_eff=8 (e8=1)!
+                            if nt == 96:
+                                ns = 8
+                            elif nt == 256 and mt <= 256 and M >= 4:
+                                ns = 16
+                            elif htr_ops._ns_eff(mt, nt, ns) % 8 != 0:
+                                for _c in (8, 16, 24, 32):
+                                    if _c <= nt and htr_ops._ns_eff(mt, nt, _c) % 8 == 0:
+                                        ns = _c
+                                        break
                         _e8 = int(htr_ops.EPI8 and htr_ops._ns_eff(mt, nt, ns) % 8 == 0)
                         return sp_ext.gemv_k5_unsplit_epi(
                             qweight, xt, xs, tok, scales, float(htr_ops.CB), sv, bias, cnt, ns, _e8
