@@ -2760,6 +2760,7 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
   if constexpr (USE_BPERM) {
     if (tid < 16) e2m1_lds[tid] = __float_as_uint(e2m1_reg_to_f32((uint32_t)tid));
   }
+  __shared__ int s_max_blk;
   if (tid < 64) { s_m[tid] = NEG_INF; s_l[tid] = 0.0f; }
 
   const int kd_start = wd * 144;
@@ -2798,7 +2799,24 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
   const int sp = (NUM_SPLITS > 1) ? (int)blockIdx.y : 0;
   const int blk_chunk = (NUM_SPLITS > 1) ? ((total_blks + NUM_SPLITS - 1) / NUM_SPLITS) : total_blks;
   const int blk_lo = (NUM_SPLITS > 1) ? (sp * blk_chunk) : 0;
-  const int blk_hi = (NUM_SPLITS > 1) ? min(blk_lo + blk_chunk, total_blks) : total_blks;
+  int blk_hi = (NUM_SPLITS > 1) ? min(blk_lo + blk_chunk, total_blks) : total_blks;
+  const int c_end_trim = min(W, blk_hi * 16);
+  const int32_t last_sl = (c_end_trim > blk_lo * 16) ? idx_row[c_end_trim - 1] : -1;
+  const bool need_trim = (c_end_trim > blk_lo * 16) && (last_sl < 0 || last_sl >= total_slots);
+  if (tid == 0) s_max_blk = need_trim ? blk_lo : blk_hi;
+  if (need_trim) {
+    int my_hi = blk_lo;
+    for (int c = blk_lo * 16 + tid; c < c_end_trim; c += 512) {
+      int32_t sl = idx_row[c];
+      if (sl >= 0 && sl < total_slots) my_hi = (c >> 4) + 1;
+    }
+    my_hi = max(my_hi, __shfl_xor(my_hi, 16));
+    my_hi = max(my_hi, __shfl_xor(my_hi, 8));
+    my_hi = max(my_hi, __shfl_xor(my_hi, 4));
+    my_hi = max(my_hi, __shfl_xor(my_hi, 2));
+    my_hi = max(my_hi, __shfl_xor(my_hi, 1));
+    if (lane == 0 && my_hi > blk_lo) atomicMax(&s_max_blk, my_hi);
+  }
 
   struct RawKV16 {
     u4v raw_fp8;
@@ -2840,9 +2858,10 @@ void k_ernie_dsa_sparse_mla_quant_512_v28(
     }
   };
 
+  __syncthreads();
+  if (need_trim) blk_hi = min(blk_hi, s_max_blk);
   RawKV16 cur_raw;
   if (blk_lo < blk_hi) prefetch_raw(blk_lo, cur_raw);
-  __syncthreads();
 
 #pragma unroll 1
   for (int blk = blk_lo; blk < blk_hi; ++blk) {
