@@ -52,6 +52,9 @@ __device__ __forceinline__ uint32_t val_f16bits2(uint32_t a, uint32_t b) {
 #endif
 }
 __device__ __forceinline__ h2v as_h2(uint32_t u) { return __builtin_bit_cast(h2v, u); }
+__device__ __forceinline__ void moe_lds_barrier() {
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
 
 template <int MSK> __device__ __forceinline__ float shx(float v) {
   const int iv = __builtin_bit_cast(int, v);
@@ -310,7 +313,7 @@ __global__ __launch_bounds__(256) void k_e82_moe_ernie(MoeArgs a) {
     sum = wave_sum(sum);
     if (lane == 0) { bscale[r][bl] = sc; bsum[r][bl] = sum; }
   }
-  __syncthreads();
+  moe_lds_barrier();
   const int il = sbl * 8 + w;
   float a0[M], a1[M];
 #pragma unroll
@@ -358,10 +361,10 @@ __global__ __launch_bounds__(256) void k_e82_moe_ernie(MoeArgs a) {
     }
   }
   if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent"); else __threadfence();
-  __syncthreads();
+  moe_lds_barrier();
   unsigned* cnt = a.counters + (size_t)gidx * MPB + sb;
   if (threadIdx.x == 0) is_last = (atomicAdd(cnt, 1u) == (unsigned)(ns - 1));
-  __syncthreads();
+  moe_lds_barrier();
   if (!is_last) return;
   if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); else __threadfence();
 
@@ -374,15 +377,15 @@ __global__ __launch_bounds__(256) void k_e82_moe_ernie(MoeArgs a) {
       f4v pv[NSC ? NSC : 1];
 #pragma unroll
       for (int k = 0; k < NSC; ++k) {
-        pv[k] = __builtin_nontemporal_load(reinterpret_cast<const f4v*>(
-            a.part + (((size_t)gidx * NSC + k) * M + r) * m + sb * 128 + lane * 4));
+        pv[k] = *reinterpret_cast<const f4v*>(
+            a.part + (((size_t)gidx * NSC + k) * M + r) * m + sb * 128 + lane * 4);
       }
 #pragma unroll
       for (int k = 0; k < NSC; ++k) s4 += pv[k];
     } else {
       for (int k = 0; k < ns; ++k) {
-        s4 += __builtin_nontemporal_load(reinterpret_cast<const f4v*>(
-            a.part + (((size_t)gidx * ns + k) * M + r) * m + sb * 128 + lane * 4));
+        s4 += *reinterpret_cast<const f4v*>(
+            a.part + (((size_t)gidx * ns + k) * M + r) * m + sb * 128 + lane * 4);
       }
     }
     const h4v hs = *reinterpret_cast<const h4v*>(scl + sbl * 128 + lane * 4);
@@ -408,11 +411,10 @@ __global__ __launch_bounds__(256) void k_e82_moe_ernie(MoeArgs a) {
   if (t == 0) *cnt = 0u;
 
   if constexpr (FUSE != 0 && PH == 1) {
-    __syncthreads();
     if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent"); else __threadfence();
-    __syncthreads();
+    moe_lds_barrier();
     if (t == 0) is_last2 = (atomicAdd(a.cnt2 + sb, 1u) == (unsigned)(a.ng[0] - 1));
-    __syncthreads();
+    moe_lds_barrier();
     if (!is_last2) return;
     if (a.fence_ra) __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent"); else __threadfence();
     // CMB: unrolled 10-slot fused combine across both 128-thread halves of the WG
@@ -466,24 +468,24 @@ __global__ void k_moe_plan2(const int* __restrict__ ids, int A, int topk, int M,
   __shared__ int s_ng;
   const int a = threadIdx.x;
   if (a == 0) s_ng = 0;
-  __syncthreads();
+  if (a < A) { grp_e[a] = -1; grp_n[a] = 0; }
+  moe_lds_barrier();
   if (a < A) {
     const int e = ids[a];
     int rank = 0;
     if (e >= 0)
       for (int b = 0; b < a; ++b) rank += (ids[b] == e);
-    if (e < 0) { grp_e[a] = -1; grp_n[a] = 0; slot[a] = -1; }
-    else if (rank % M != 0) { grp_e[a] = -1; grp_n[a] = 0; }
-    else {
+    if (e < 0) { slot[a] = -1; }
+    else if ((rank & (M - 1)) == 0) {
+      const int g = atomicAdd(&s_ng, 1);
       int c = 0;
       for (int b = a; b < A && c < M; ++b)
-        if (ids[b] == e) { grp_rows[a * M + c] = b / topk; slot[b] = a * M + c; ++c; }
-      grp_e[a] = e; grp_n[a] = c;
-      for (int c2 = c; c2 < M; ++c2) grp_rows[a * M + c2] = 0;
-      atomicAdd(&s_ng, 1);
+        if (ids[b] == e) { grp_rows[g * M + c] = b / topk; slot[b] = g * M + c; ++c; }
+      grp_e[g] = e; grp_n[g] = c;
+      for (int c2 = c; c2 < M; ++c2) grp_rows[g * M + c2] = 0;
     }
   }
-  __syncthreads();
+  moe_lds_barrier();
   if (a == 0) ng[0] = s_ng;
 }
 
