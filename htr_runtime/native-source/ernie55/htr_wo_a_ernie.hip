@@ -86,6 +86,10 @@ __device__ __forceinline__ uint32_t f32_to_bf16x2_rne(float a, float b) {
   return __builtin_amdgcn_perm(ub, ua, 0x07060302u);
 }
 
+__device__ __forceinline__ void woa_lds_barrier() {
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
 // K=5 batched 8-group wo_a GEMV:
 //   x:    [T, G, 4096] bf16  (G = 8)
 //   qw:   [G, 64, 256, 40] int32 (contiguous)
@@ -172,7 +176,7 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched(
     sum = wave_sum(sum);
     if (lane == 0) { bscale[r][bl] = sc; bsum[r][bl] = sum; }
   }
-  __syncthreads();
+  woa_lds_barrier();
 
   const int il = sb * 8 + w;
   const int g_lane = lane >> 3, q = lane & 7;
@@ -223,8 +227,8 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched(
         w5_nxt = __builtin_nontemporal_load(p4_grp + tidn * 8 + q);
       } else {
         const uint32_t* tpn = qm + (size_t)il * pitch + (size_t)jn * 40;
-        wa_nxt = *reinterpret_cast<const u4va*>(tpn + q * 5);
-        w5_nxt = tpn[q * 5 + 4];
+        wa_nxt = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(tpn + q * 5));
+        w5_nxt = __builtin_nontemporal_load(tpn + q * 5 + 4);
       }
     }
     __builtin_amdgcn_sched_barrier(0);
@@ -281,10 +285,10 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched(
     }
   }
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-  __syncthreads();
+  woa_lds_barrier();
   unsigned* cnt = counters + (size_t)grp * MPB + sb;
   if (threadIdx.x == 0) is_last = (atomicAdd(cnt, 1u) == (unsigned)(NS - 1));
-  __syncthreads();
+  woa_lds_barrier();
   if (!is_last) return;
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 
@@ -295,8 +299,8 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched(
     f4v pv[NS];
 #pragma unroll
     for (int k = 0; k < NS; ++k) {
-      pv[k] = __builtin_nontemporal_load(reinterpret_cast<const f4v*>(
-          part + (((size_t)grp * NS + k) * M + r) * M_OUT + sb * 128 + lane * 4));
+      pv[k] = *reinterpret_cast<const f4v*>(
+          part + (((size_t)grp * NS + k) * M + r) * M_OUT + sb * 128 + lane * 4);
     }
 #pragma unroll
     for (int k = 0; k < NS; ++k) s4 += pv[k];
@@ -429,7 +433,7 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched_big(
     sum = wave_sum(sum);
     if (lane == 0) { bscale[r][bl] = sc; bsum[r][bl] = sum; }
   }
-  __syncthreads();
+  woa_lds_barrier();
 
   const int il = sb * 8 + w;
   const int g_lane = lane >> 3, q = lane & 7;
@@ -622,10 +626,10 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched_big(
     }
   }
   __builtin_amdgcn_fence(__ATOMIC_RELEASE, "agent");
-  __syncthreads();
+  woa_lds_barrier();
   unsigned* cnt = counters + (size_t)grp * MPB + sb;
   if (threadIdx.x == 0) is_last = (atomicAdd(cnt, 1u) == (unsigned)(NS - 1));
-  __syncthreads();
+  woa_lds_barrier();
   if (!is_last) return;
   __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "agent");
 
@@ -636,8 +640,8 @@ __global__ __launch_bounds__(256) void k_wo_a_k5_batched_big(
     f4v pv[NS];
 #pragma unroll
     for (int k = 0; k < NS; ++k) {
-      pv[k] = __builtin_nontemporal_load(reinterpret_cast<const f4v*>(
-          part + (((size_t)grp * NS + k) * M_CAP + r) * M_OUT + sb * 128 + lane * 4));
+      pv[k] = *reinterpret_cast<const f4v*>(
+          part + (((size_t)grp * NS + k) * M_CAP + r) * M_OUT + sb * 128 + lane * 4);
     }
 #pragma unroll
     for (int k = 0; k < NS; ++k) s4 += pv[k];
@@ -773,9 +777,7 @@ struct u2_128 { uint4 a, b; };
 
 // Prologue: x [T, 8, 4096] bf16 -> xt [T, 8, 4096] fp16, tok [T, 8] fp32
 // Grid: (T, 8), Block: 256 (8 waves x 4 blocks of 128 = 4096 exact!)
-__device__ __forceinline__ void woa_lds_barrier() {
-  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
-}
+// woa_lds_barrier defined above
 
 __global__ __launch_bounds__(256) void k_wo_a_prologue(
     const uint16_t* __restrict__ x,
