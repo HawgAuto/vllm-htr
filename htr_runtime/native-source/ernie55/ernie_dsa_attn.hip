@@ -1379,6 +1379,184 @@ __global__ __launch_bounds__(512, 2) void k_ernie_fp8_mqa_logits_prefill_h8_v28(
   }
 }
 
+
+// Wave 75 (adapted from HawgAuto/vllm-htr PR #13 by @boxwrench):
+// Shared-K multi-query (QB=2/4, KT=4 -> 64 keys/barrier pair) H=64 FP8 MQA Indexer Score Prefill.
+// Bit-identical (torch.equal) to k_ernie_fp8_mqa_logits_prefill, 1.21-1.24x faster (~31 TF/s) when
+// FlashIndexer (H=8) is disabled. Uses LDS-only dsa_lds_barrier() and 0 spills/0 scratch.
+template <int QB, int KT>
+__global__ __launch_bounds__(128 * QB) void k_ernie_fp8_mqa_logits_prefill_h64_qb_v28(
+    const uint8_t* __restrict__ q_fp8, const uint8_t* __restrict__ k_fp8, const float* __restrict__ k_scale,
+    const float* __restrict__ weights, const int32_t* __restrict__ cu_ks, const int32_t* __restrict__ cu_ke,
+    float* __restrict__ out_logits, int64_t q_s0, int64_t q_s1, int64_t k_s0, int64_t w_s0,
+    int M, int N, int is_fnuz) {
+  constexpr int NT = 128 * QB;
+  constexpr int G = KT * 16;                // 64 keys/group (pow2)
+  constexpr int LU = G * 8;                 // 16B K load units/group
+  constexpr int LPT = (LU + NT - 1) / NT;
+  __shared__ _Float16 fp8_lut[256];
+  __shared__ __attribute__((aligned(16))) _Float16 K_lds[G][136];
+  __shared__ float s_wsum[QB][4][G];
+  __shared__ float s_weights[QB][64];
+  __shared__ float s_kscale[G];
+  __shared__ int s_rng[QB][2];
+
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int l16 = lane & 15;
+  const int hrow = lane >> 4;
+  const int qw = wave >> 2;
+  const int h0 = (wave & 3) * 16;
+  const int m0 = blockIdx.x * QB;
+
+  for (int i = tid; i < 256; i += NT) fp8_lut[i] = fp8_byte_to_f16((uint32_t)i, is_fnuz);
+  if (tid < QB * 64) {
+    const int qi = m0 + (tid >> 6);
+    s_weights[tid >> 6][tid & 63] = (qi < M) ? weights[(int64_t)qi * w_s0 + (tid & 63)] : 0.0f;
+  }
+  if (tid < QB) {
+    const int qi = m0 + tid;
+    int ks = 0, ke = 0;
+    if (qi < M) {
+      ks = max(0, min(N, cu_ks[qi]));
+      ke = max(ks, min(N, cu_ke[qi]));
+    }
+    s_rng[tid][0] = ks;
+    s_rng[tid][1] = ke;
+  }
+  dsa_lds_barrier();
+
+  int lo = N, hi = 0;
+#pragma unroll
+  for (int q = 0; q < QB; ++q) {
+    if (s_rng[q][0] < s_rng[q][1]) {
+      lo = min(lo, s_rng[q][0]);
+      hi = max(hi, s_rng[q][1]);
+    }
+  }
+  const int g_lo = (lo < hi) ? (lo / G) : 0;
+  const int g_hi = (lo < hi) ? ((hi + G - 1) / G) : 0;
+#pragma unroll
+  for (int q = 0; q < QB; ++q) {
+    if (m0 + q >= M) continue;
+    float* row = out_logits + (int64_t)(m0 + q) * N;
+    for (int gn = tid; gn < min(N, g_lo * G); gn += NT) row[gn] = -INFINITY;
+    for (int gn = g_hi * G + tid; gn < N; gn += NT) row[gn] = -INFINITY;
+  }
+
+  const uint8_t* qp = q_fp8 + (int64_t)min(m0 + qw, M - 1) * q_s0 + (int64_t)(h0 + l16) * q_s1;
+  f16x16 q_reg[8];
+#pragma unroll
+  for (int pair = 0; pair < 4; ++pair) {
+    const u4v raw0 = *reinterpret_cast<const u4va*>(qp + (pair * 2 + 0) * 16);
+    const u4v raw1 = *reinterpret_cast<const u4va*>(qp + (pair * 2 + 1) * 16);
+    const u4v raws[2] = {raw0, raw1};
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+      const uint32_t ws[4] = {raws[s].x, raws[s].y, raws[s].z, raws[s].w};
+      f16x16 qf;
+#pragma unroll
+      for (int w4 = 0; w4 < 4; ++w4) {
+        const uint32_t x = ws[w4];
+        qf[w4 * 4 + 0] = fp8_lut[x & 0xFFu];
+        qf[w4 * 4 + 1] = fp8_lut[(x >> 8) & 0xFFu];
+        qf[w4 * 4 + 2] = fp8_lut[(x >> 16) & 0xFFu];
+        qf[w4 * 4 + 3] = fp8_lut[(x >> 24) & 0xFFu];
+      }
+      q_reg[pair * 2 + s] = qf;
+    }
+    __builtin_amdgcn_sched_barrier(0);
+  }
+
+  auto fetch = [&](int g, u4v (&raw)[LPT], float& sc) {
+    const int n0 = g * G;
+#pragma unroll
+    for (int j = 0; j < LPT; ++j) {
+      const int i = tid + j * NT;
+      const int gn = n0 + (i >> 3);
+      raw[j] = (i < LU && gn >= lo && gn < hi)
+                   ? *reinterpret_cast<const u4va*>(k_fp8 + (int64_t)gn * k_s0 + (i & 7) * 16)
+                   : (u4v){0u, 0u, 0u, 0u};
+    }
+    const int gns = n0 + tid;
+    sc = (tid < G && gns >= lo && gns < hi) ? k_scale[gns] : 0.0f;
+  };
+
+  u4v raw[LPT];
+  float sc = 0.0f;
+  if (g_lo < g_hi) fetch(g_lo, raw, sc);
+  for (int g = g_lo; g < g_hi; ++g) {
+#pragma unroll
+    for (int j = 0; j < LPT; ++j) {
+      const int i = tid + j * NT;
+      if (i < LU) {
+        const uint32_t ws[4] = {raw[j].x, raw[j].y, raw[j].z, raw[j].w};
+        uint32_t pk[8];
+#pragma unroll
+        for (int w4 = 0; w4 < 4; ++w4) {
+          const uint32_t x = ws[w4];
+          const uint32_t b0 = (uint32_t)__builtin_bit_cast(uint16_t, fp8_lut[x & 0xFFu]);
+          const uint32_t b1 = (uint32_t)__builtin_bit_cast(uint16_t, fp8_lut[(x >> 8) & 0xFFu]);
+          const uint32_t b2 = (uint32_t)__builtin_bit_cast(uint16_t, fp8_lut[(x >> 16) & 0xFFu]);
+          const uint32_t b3 = (uint32_t)__builtin_bit_cast(uint16_t, fp8_lut[(x >> 24) & 0xFFu]);
+          pk[w4 * 2 + 0] = b0 | (b1 << 16);
+          pk[w4 * 2 + 1] = b2 | (b3 << 16);
+        }
+        *reinterpret_cast<u4va*>(&K_lds[i >> 3][(i & 7) * 16 + 0]) = (u4v){pk[0], pk[1], pk[2], pk[3]};
+        *reinterpret_cast<u4va*>(&K_lds[i >> 3][(i & 7) * 16 + 8]) = (u4v){pk[4], pk[5], pk[6], pk[7]};
+      }
+    }
+    if (tid < G) s_kscale[tid] = sc;
+    dsa_lds_barrier();
+
+    u4v raw_nxt[LPT];
+    float sc_nxt = 0.0f;
+#pragma unroll
+    for (int j = 0; j < LPT; ++j) raw_nxt[j] = (u4v){0u, 0u, 0u, 0u};
+    if (g + 1 < g_hi) fetch(g + 1, raw_nxt, sc_nxt);
+    __builtin_amdgcn_sched_barrier(0);
+
+#pragma unroll
+    for (int s = 0; s < KT; ++s) {
+      f32x8 acc = {0, 0, 0, 0, 0, 0, 0, 0};
+#pragma unroll
+      for (int step = 0; step < 8; ++step) {
+        const int d = step * 16;
+        const u4v k0 = *reinterpret_cast<const u4va*>(&K_lds[s * 16 + l16][d]);
+        const u4v k1 = *reinterpret_cast<const u4va*>(&K_lds[s * 16 + l16][d + 8]);
+        const f16x16 kf = __builtin_bit_cast(f16x16, (u8v){k0.x, k0.y, k0.z, k0.w, k1.x, k1.y, k1.z, k1.w});
+        acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(q_reg[step], kf, acc);
+      }
+      const float kscl = s_kscale[s * 16 + l16];
+      float sum_h = 0.0f;
+#pragma unroll
+      for (int ei = 0; ei < 8; ++ei) {
+        const float scv = fmaxf(acc[ei] * kscl, 0.0f);
+        sum_h = __builtin_fmaf(scv, s_weights[qw][h0 + 2 * ei + hrow], sum_h);
+      }
+      sum_h += shx_f<16>(sum_h);
+      if (hrow == 0) s_wsum[qw][wave & 3][s * 16 + l16] = sum_h;
+    }
+    dsa_lds_barrier();
+
+    for (int i = tid; i < QB * G; i += NT) {
+      const int q = i / G;
+      const int k = i % G;
+      const int gn = g * G + k;
+      if (m0 + q < M && gn < N) {
+        out_logits[(int64_t)(m0 + q) * N + gn] =
+            (gn >= s_rng[q][0] && gn < s_rng[q][1])
+                ? (s_wsum[q][0][k] + s_wsum[q][1][k] + s_wsum[q][2][k] + s_wsum[q][3][k])
+                : -INFINITY;
+      }
+    }
+#pragma unroll
+    for (int j = 0; j < LPT; ++j) raw[j] = raw_nxt[j];
+    sc = sc_nxt;
+  }
+}
+
 torch::Tensor ernie_fp8_mqa_logits_prefill(
     torch::Tensor q_fp8, torch::Tensor k_fp8, torch::Tensor k_scale,
     torch::Tensor weights, torch::Tensor cu_ks, torch::Tensor cu_ke) {
@@ -1425,6 +1603,34 @@ torch::Tensor ernie_fp8_mqa_logits_prefill(
         out.data_ptr<float>(),
         q_fp8.stride(0), q_fp8.stride(1), k_fp8.stride(0), weights.stride(0),
         M, N, n_splits, is_fnuz);
+    return out;
+  }
+  if (M >= 2048 && q_fp8.stride(2) == 1 && k_fp8.stride(1) == 1 && weights.stride(1) == 1) {
+    hipLaunchKernelGGL(
+        (k_ernie_fp8_mqa_logits_prefill_h64_qb_v28<4, 4>), dim3((M + 3) / 4), dim3(512), 0, st,
+        reinterpret_cast<const uint8_t*>(q_fp8.data_ptr()),
+        reinterpret_cast<const uint8_t*>(k_fp8.data_ptr()),
+        ks_flat.data_ptr<float>(),
+        weights.data_ptr<float>(),
+        cu_ks.data_ptr<int32_t>(),
+        cu_ke.data_ptr<int32_t>(),
+        out.data_ptr<float>(),
+        q_fp8.stride(0), q_fp8.stride(1), k_fp8.stride(0), weights.stride(0),
+        M, N, is_fnuz);
+    return out;
+  }
+  if (M >= 256 && q_fp8.stride(2) == 1 && k_fp8.stride(1) == 1 && weights.stride(1) == 1) {
+    hipLaunchKernelGGL(
+        (k_ernie_fp8_mqa_logits_prefill_h64_qb_v28<2, 4>), dim3((M + 1) / 2), dim3(256), 0, st,
+        reinterpret_cast<const uint8_t*>(q_fp8.data_ptr()),
+        reinterpret_cast<const uint8_t*>(k_fp8.data_ptr()),
+        ks_flat.data_ptr<float>(),
+        weights.data_ptr<float>(),
+        cu_ks.data_ptr<int32_t>(),
+        cu_ke.data_ptr<int32_t>(),
+        out.data_ptr<float>(),
+        q_fp8.stride(0), q_fp8.stride(1), k_fp8.stride(0), weights.stride(0),
+        M, N, is_fnuz);
     return out;
   }
   const int n_splits = max(1, min(n_tiles, max(1, 256 / M)));
