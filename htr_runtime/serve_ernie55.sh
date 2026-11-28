@@ -6,6 +6,11 @@
 #   MODE=dspark4  ./serve_ernie55.sh   # 43L + 3L K=2 DSpark (num_spec=4, fastest prose)
 #   MODE=dspark7  ./serve_ernie55.sh   # 43L + 3L K=2 DSpark (num_spec=7, peak burst)
 #   MODE=target   ./serve_ernie55.sh   # 43L target-only (batch/long-ctx serving)
+#
+# Reasoning & tool-call parsing are enabled by default using the built-in ERNIE-5.5
+# parser (both `ernie55` and `ernie5` aliases are registered). Note: vLLM exposes
+# the parsed thinking channel on `message.reasoning` / `delta.reasoning` (not
+# `reasoning_content`). Override with REASONING_PARSER=none or TOOL_CALL_PARSER=none.
 set -euo pipefail
 
 IMAGE="${IMAGE:-ghcr.io/hawgauto/vllm-htr:v0.2.8}"
@@ -21,8 +26,18 @@ MAX_BATCH="${MAX_BATCH:-2048}"
 # On hosts with GRUB `cma=64M` (unlocking +6 GiB GTT), override KV_MEM or set USE_GPU_UTIL=1 GPU_UTIL=0.89.
 KV_MEM="${KV_MEM:-1395864371}"
 GPU_UTIL="${GPU_UTIL:-0.865}"
+REASONING_PARSER="${REASONING_PARSER:-ernie55}"
+TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-ernie55}"
 
 mkdir -p "${WORKSPACE}"
+
+PARSER_ARGS=()
+if [[ -n "${REASONING_PARSER}" && "${REASONING_PARSER}" != "none" ]]; then
+  PARSER_ARGS+=(--reasoning-parser "${REASONING_PARSER}")
+fi
+if [[ -n "${TOOL_CALL_PARSER}" && "${TOOL_CALL_PARSER}" != "none" ]]; then
+  PARSER_ARGS+=(--enable-auto-tool-choice --tool-call-parser "${TOOL_CALL_PARSER}")
+fi
 
 SPEC_ARGS=()
 MEM_ARGS=(--kv-cache-memory "${KV_MEM}")
@@ -80,6 +95,7 @@ exec docker run --rm --name "ernie55_${MODE}" \
   --max-num-batched-tokens "${MAX_BATCH}" \
   --max-num-seqs "${MAX_NUM_SEQS}" \
   --hf-overrides '{"enable_flashindexer": true}' \
+  "${PARSER_ARGS[@]}" \
   "${MEM_ARGS[@]}" \
   --compilation-config "{\"mode\":0,\"cudagraph_mode\":\"FULL_AND_PIECEWISE\",\"cudagraph_capture_sizes\":${CG_SIZES}}" \
   "${SPEC_ARGS[@]}"

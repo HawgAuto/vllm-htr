@@ -1690,16 +1690,17 @@ def _register_parsers() -> None:
     from vllm.reasoning import ReasoningParserManager
     from vllm.tool_parsers import ToolParserManager
 
-    ReasoningParserManager.register_lazy_module(
-        "ernie5",
-        "vllm_ernie_htr.reasoning_parser",
-        "Ernie5ParserReasoningAdapter",
-    )
-    ToolParserManager.register_lazy_module(
-        "ernie5",
-        "vllm_ernie_htr.tool_parser",
-        "Ernie5ToolParser",
-    )
+    for name in ("ernie5", "ernie55"):
+        ReasoningParserManager.register_lazy_module(
+            name,
+            "vllm_ernie_htr.reasoning_parser",
+            "Ernie5ParserReasoningAdapter",
+        )
+        ToolParserManager.register_lazy_module(
+            name,
+            "vllm_ernie_htr.tool_parser",
+            "Ernie5ToolParser",
+        )
 
 
 def _register_renderer() -> None:

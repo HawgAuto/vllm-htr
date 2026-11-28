@@ -37,6 +37,7 @@ if TYPE_CHECKING:
 _EMPTY_PARAMETERS = {"type": "object", "properties": {}}
 
 
+@register_vllm_structural_tag("ernie55")
 @register_vllm_structural_tag("ernie5")
 def get_ernie5_structural_tag(
     tools: list[FunctionToolParam],

@@ -30,5 +30,16 @@ archs = ModelRegistry.get_supported_archs()
 assert "Ernie5_5_MoeForCausalLM" in archs, "Missing Ernie5_5_MoeForCausalLM!"
 assert "Ernie5_5_MoeDSparkDraftModel" in archs, "Missing Ernie5_5_MoeDSparkDraftModel!"
 assert e_patches._serving_ernie5 is False, "Qwen3.8 isolation broken: _serving_ernie5 must start False!"
-print("ModelRegistry (target + DSpark draft) & Qwen3.8 isolation (_serving_ernie5=False) VERIFIED!")
+from vllm.reasoning import ReasoningParserManager
+from vllm.tool_parsers import ToolParserManager
+from vllm_ernie_htr.reasoning_parser import Ernie5ParserReasoningAdapter
+from vllm_ernie_htr.tool_parser import Ernie5ToolParser
+
+for pname in ("ernie5", "ernie55"):
+    assert pname in ReasoningParserManager.list_registered(), f"Missing reasoning parser {pname}"
+    assert pname in ToolParserManager.list_registered(), f"Missing tool parser {pname}"
+    assert ReasoningParserManager.get_reasoning_parser(pname) is Ernie5ParserReasoningAdapter
+    assert ToolParserManager.get_tool_parser(pname) is Ernie5ToolParser
+
+print("ModelRegistry (target + DSpark draft), parsers (ernie5/ernie55), & Qwen3.8 isolation (_serving_ernie5=False) VERIFIED!")
 print("ALL CPU-ONLY RELEASE VERIFICATION CHECKS PASSED!")

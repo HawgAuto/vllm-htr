@@ -229,9 +229,23 @@ _TOOL_PARSERS_TO_REGISTER = {
 }
 
 
+_EXTERNAL_TOOL_PARSERS_TO_REGISTER = {
+    "ernie5": (
+        "vllm_ernie_htr.tool_parser",
+        "Ernie5ToolParser",
+    ),
+    "ernie55": (
+        "vllm_ernie_htr.tool_parser",
+        "Ernie5ToolParser",
+    ),
+}
+
+
 def register_lazy_tool_parsers():
     for name, (file_name, class_name) in _TOOL_PARSERS_TO_REGISTER.items():
         module_path = f"vllm.tool_parsers.{file_name}"
+        ToolParserManager.register_lazy_module(name, module_path, class_name)
+    for name, (module_path, class_name) in _EXTERNAL_TOOL_PARSERS_TO_REGISTER.items():
         ToolParserManager.register_lazy_module(name, module_path, class_name)
 
 

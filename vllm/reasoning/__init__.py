@@ -159,9 +159,25 @@ _REASONING_PARSERS_TO_REGISTER = {
 }
 
 
+_EXTERNAL_REASONING_PARSERS_TO_REGISTER = {
+    "ernie5": (
+        "vllm_ernie_htr.reasoning_parser",
+        "Ernie5ParserReasoningAdapter",
+    ),
+    "ernie55": (
+        "vllm_ernie_htr.reasoning_parser",
+        "Ernie5ParserReasoningAdapter",
+    ),
+}
+
+
 def register_lazy_reasoning_parsers():
     for name, (file_name, class_name) in _REASONING_PARSERS_TO_REGISTER.items():
         module_path = f"vllm.reasoning.{file_name}"
+        ReasoningParserManager.register_lazy_module(name, module_path, class_name)
+    for name, (module_path, class_name) in (
+        _EXTERNAL_REASONING_PARSERS_TO_REGISTER.items()
+    ):
         ReasoningParserManager.register_lazy_module(name, module_path, class_name)
 
 
