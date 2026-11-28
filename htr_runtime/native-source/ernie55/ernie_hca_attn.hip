@@ -84,6 +84,21 @@ __device__ __forceinline__ uint16_t f32_to_bf16_rne(float f) {
   u += 0x7fffu + ((u >> 16) & 1u);
   return (uint16_t)(u >> 16);
 }
+// Wave 67: LDS-only barrier (no vmcnt(0), no vscnt(0), no buffer_gl0_inv L0 data cache wipe!)
+__device__ __forceinline__ void hca_lds_barrier() {
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+__device__ __forceinline__ uint16_t f32_to_bf16_rne_finite(float f) {
+  uint32_t u = __float_as_uint(f);
+  u += 0x7fffu + ((u >> 16) & 1u);
+  return (uint16_t)(u >> 16);
+}
+__device__ __forceinline__ uint16_t f32_to_bf16_rne_bl(float f) {
+  uint32_t u = __float_as_uint(f);
+  const uint32_t rne = u + 0x7fffu + ((u >> 16) & 1u);
+  const uint32_t out = ((u & 0x7fffffffu) > 0x7f800000u) ? 0u : (rne >> 16);
+  return (uint16_t)out;
+}
 __device__ __forceinline__ float fp8_byte_to_f32(uint32_t b, int is_fnuz) {
   const uint32_t sign = (b >> 7) & 1u;
   const uint32_t exp = (b >> 3) & 0xFu;
@@ -2112,15 +2127,18 @@ void k_ernie_hca_prefill_512_v28(
     int64_t out_s0, int64_t out_s1,
     int64_t cs_s0,
     int num_heads, int num_kv_rows, int K_max, float scale, float q_norm_eps = 0.0f) {
-  __shared__ union {
-    __attribute__((aligned(16))) uint16_t KV_lds[16][HCA_STRIDE];
-    __attribute__((aligned(16))) uint16_t VT_lds_g[16][32 * HCA_VT_STRIDE + 2];
-  } u_kv;
-  __shared__ float S_part[4][4][16][16];                                  // 16,384 B
-  __shared__ __attribute__((aligned(16))) uint16_t P_lds[4][16][16];      // 2,048 B
+  // Wave 67: 3-barrier separate KV_lds + VT_lds_g (54,352 B <= 64 KiB -> 2 WGs/WGP, NO Barrier #4!),
+  // hca_lds_barrier() (0 buffer_gl0_inv, 0 vmcnt stall on KV prefetch), software-pipelined QK^T & PV
+  // LDS loads (removing 16x per-WMMA sched_barrier stalls), Wave 37 if (__any(a_v != 1.0f)) rescale,
+  // SMEM wave-uniform sl_next prefetch, s_vld[16], and branchless RNE!
+  __shared__ __attribute__((aligned(16))) uint16_t KV_lds[16][HCA_STRIDE];               // 16,640 B
+  __shared__ __attribute__((aligned(16))) uint16_t VT_lds_g[16][32 * HCA_VT_STRIDE + 2]; // 18,496 B
+  __shared__ float S_part[4][4][16][16];                                                  // 16,384 B
+  __shared__ __attribute__((aligned(16))) uint16_t P_lds[4][16][16];                      //  2,048 B
   __shared__ float s_alpha[64];
   __shared__ float s_m[64];
   __shared__ float s_l[64];
+  __shared__ uint8_t s_vld[16];
 
   const int t = blockIdx.x;
   const int tid = threadIdx.x;               // 0..511
@@ -2164,32 +2182,35 @@ void k_ernie_hca_prefill_512_v28(
     if (tl < klen) klen = tl;
   }
   const int32_t* idx_row = indices + (int64_t)t * idx_s0;
-  const int kr_ld = tid >> 5;   // 0..15 (1 wave per KV row)
-  const int sub_ld = tid & 31;  // 0..31 (32 threads * 8 bf16 = 256 bf16 = 512B coalesced!)
+  const int kr_ld = __builtin_amdgcn_readfirstlane(tid >> 5);   // wave-uniform 0..15 (1 wave per KV row)
+  const int sub_ld = tid & 31;                                  // 0..31 (32 * 8 bf16 = 512B coalesced!)
 
-  auto load_kv_tile = [&](int k_base, u4v out_v[2]) {
+  auto load_sl = [&](int k_base) -> int32_t {
     const int kp = k_base + kr_ld;
     int32_t sl = (kp < klen) ? idx_row[kp] : -1;
-    if (sl >= 0 && sl < num_kv_rows) {
+    if (sl < 0 || sl >= num_kv_rows) sl = -1;
+    return __builtin_amdgcn_readfirstlane(sl);
+  };
+
+  auto load_kv_from_sl = [&](int32_t sl, u4v out_v[2], uint8_t& out_vld) {
+    if (sl >= 0) {
       const uint16_t* src = kv_ptr + (int64_t)sl * kv_s0 + sub_ld * 8;
       out_v[0] = *reinterpret_cast<const u4va*>(src);
       out_v[1] = *reinterpret_cast<const u4va*>(src + 256);
+      out_vld = 1u;
     } else {
       const u4v z = {0u, 0u, 0u, 0u};
       out_v[0] = z;
       out_v[1] = z;
+      out_vld = 0u;
     }
   };
 
   u4v v_hold[2];
-  if (klen > 0) load_kv_tile(0, v_hold);
+  uint8_t cur_vld = 0u;
+  if (klen > 0) load_kv_from_sl(load_sl(0), v_hold, cur_vld);
   float qsc0 = scale, qsc1 = scale;
   if constexpr (FUSE_QNR) {
-    // Wave 45: Zero-copy algebraic Q-RMSNorm + 64-dim GPT-J RoPE directly in VGPRs!
-    //   Q_norm_roped . K = (Q_roped . K) * rrms -> fold rrms into preloaded qsc0/qsc1 (0 extra LDS, 0 LDS reads in K-loop!)
-    //   1. 64x v_dot2_f32_bf16 for per-quarter sq across wd=0..3, reduced via S_part[wh][wd][0][l16]
-    //   2. ZERO multiply/re-pack on 448 NoPE dims; GPT-J RoPE ONLY on wd==3, step=4..7 using s_alpha[0..63]
-    //   3. Overlapped with load_kv_tile(0, v_hold) global load; ZERO extra barriers (K-loop syncthreads separates reads/writes)!
     float sq0 = 0.0f, sq1 = 0.0f;
     if (q_hvalid) {
 #pragma unroll
@@ -2211,7 +2232,7 @@ void k_ernie_hca_prefill_512_v28(
         s_alpha[tid] = reinterpret_cast<const float*>(cs_ptr)[cs_off];
       }
     }
-    __syncthreads();
+    hca_lds_barrier();
     const int hm0 = wd * 4 + 0 + hrow;
     const int hm1 = wd * 4 + 2 + hrow;
     const float sq_h0 = S_part[wh][0][0][hm0] + S_part[wh][1][0][hm0] + S_part[wh][2][0][hm0] + S_part[wh][3][0][hm0];
@@ -2236,40 +2257,28 @@ void k_ernie_hca_prefill_512_v28(
       }
     }
   } else {
-    __syncthreads();
+    hca_lds_barrier();
   }
 
 #pragma unroll 1
   for (int k0 = 0; k0 < klen; k0 += 16) {
-    *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][sub_ld * 8])       = v_hold[0];
-    *reinterpret_cast<u4va*>(&u_kv.KV_lds[kr_ld][256 + sub_ld * 8]) = v_hold[1];
-    __syncthreads();
+    if (sub_ld == 0) s_vld[kr_ld] = cur_vld;
+    *reinterpret_cast<u4va*>(&KV_lds[kr_ld][sub_ld * 8])       = v_hold[0];
+    *reinterpret_cast<u4va*>(&KV_lds[kr_ld][256 + sub_ld * 8]) = v_hold[1];
 
-    f32x8 s_acc;
-    {
-      float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f, z4 = 0.0f, z5 = 0.0f, z6 = 0.0f, z7 = 0.0f;
-      asm volatile("" : "+v"(z0), "+v"(z1), "+v"(z2), "+v"(z3), "+v"(z4), "+v"(z5), "+v"(z6), "+v"(z7));
-      s_acc = (f32x8){z0, z1, z2, z3, z4, z5, z6, z7};
+    int32_t sl_next = -1;
+    if (k0 + 16 < klen) {
+      const int kp_n = k0 + 16 + kr_ld;
+      sl_next = (kp_n < klen) ? idx_row[kp_n] : -1;
     }
-#pragma unroll
-    for (int step = 0; step < 8; ++step) {
-      const int dn = d_start + step * 16;
-      const u4v k0_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn]);
-      const u4v k1_c = *reinterpret_cast<const u4va*>(&u_kv.KV_lds[l16][dn + 8]);
-      const bf16x16 kf = __builtin_bit_cast(bf16x16, (u8v){k0_c.x, k0_c.y, k0_c.z, k0_c.w, k1_c.x, k1_c.y, k1_c.z, k1_c.w});
-      s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(q_reg[step], kf, s_acc);
-      __builtin_amdgcn_sched_barrier(0);
-    }
+    hca_lds_barrier(); // BARRIER A: KV_lds & s_vld ready for QK^T/softmax; prev PV done with VT_lds_g & P_lds
 
-#pragma unroll
-    for (int ei = 0; ei < 8; ++ei) S_part[wh][wd][2 * ei + hrow][l16] = s_acc[ei];
-    __syncthreads();
-
+    // Write VT_lds_g BEFORE QK^T -> v_hold[0..1] dies immediately (frees 8 VGPRs for QK^T pipelining!)
 #pragma unroll
     for (int c = 0; c < 2; ++c) {
       const int col0 = c * 256 + sub_ld * 8;
       const uint32_t w0 = v_hold[c].x, w1 = v_hold[c].y, w2 = v_hold[c].z, w3 = v_hold[c].w;
-      uint16_t* vtg = &u_kv.VT_lds_g[col0 >> 5][(col0 & 31) * HCA_VT_STRIDE + kr_ld];
+      uint16_t* vtg = &VT_lds_g[col0 >> 5][(col0 & 31) * HCA_VT_STRIDE + kr_ld];
       vtg[0 * HCA_VT_STRIDE] = (uint16_t)(w0 & 0xFFFFu);
       vtg[1 * HCA_VT_STRIDE] = (uint16_t)(w0 >> 16);
       vtg[2 * HCA_VT_STRIDE] = (uint16_t)(w1 & 0xFFFFu);
@@ -2279,11 +2288,41 @@ void k_ernie_hca_prefill_512_v28(
       vtg[6 * HCA_VT_STRIDE] = (uint16_t)(w3 & 0xFFFFu);
       vtg[7 * HCA_VT_STRIDE] = (uint16_t)(w3 >> 16);
     }
+    __builtin_amdgcn_sched_barrier(0);
+
+    f32x8 s_acc;
+    {
+      float z0 = 0.0f, z1 = 0.0f, z2 = 0.0f, z3 = 0.0f, z4 = 0.0f, z5 = 0.0f, z6 = 0.0f, z7 = 0.0f;
+      asm volatile("" : "+v"(z0), "+v"(z1), "+v"(z2), "+v"(z3), "+v"(z4), "+v"(z5), "+v"(z6), "+v"(z7));
+      s_acc = (f32x8){z0, z1, z2, z3, z4, z5, z6, z7};
+    }
+    u4v k0_c = *reinterpret_cast<const u4va*>(&KV_lds[l16][d_start]);
+    u4v k1_c = *reinterpret_cast<const u4va*>(&KV_lds[l16][d_start + 8]);
+#pragma unroll
+    for (int step = 0; step < 8; ++step) {
+      u4v k0_n, k1_n;
+      if (step + 1 < 8) {
+        const int dn = d_start + (step + 1) * 16;
+        k0_n = *reinterpret_cast<const u4va*>(&KV_lds[l16][dn]);
+        k1_n = *reinterpret_cast<const u4va*>(&KV_lds[l16][dn + 8]);
+      }
+      const bf16x16 kf = __builtin_bit_cast(bf16x16, (u8v){k0_c.x, k0_c.y, k0_c.z, k0_c.w, k1_c.x, k1_c.y, k1_c.z, k1_c.w});
+      s_acc = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(q_reg[step], kf, s_acc);
+      if (step + 1 < 8) { k0_c = k0_n; k1_c = k1_n; }
+    }
+
+#pragma unroll
+    for (int ei = 0; ei < 8; ++ei) S_part[wh][wd][2 * ei + hrow][l16] = s_acc[ei];
+    hca_lds_barrier(); // BARRIER B: S_part ready for softmax & VT_lds_g ready for PV
+
+    if (k0 + 16 < klen) {
+      if (sl_next < 0 || sl_next >= num_kv_rows) sl_next = -1;
+      load_kv_from_sl(__builtin_amdgcn_readfirstlane(sl_next), v_hold, cur_vld);
+    }
+    __builtin_amdgcn_sched_barrier(0);
 
     {
-      const int kp = k0 + l16;
-      const int32_t sl_v = (kp < klen) ? idx_row[kp] : -1;
-      const bool vld = (sl_v >= 0 && sl_v < num_kv_rows);
+      const bool vld = (s_vld[l16] != 0);
 #pragma unroll
       for (int e_sub = 0; e_sub < 2; ++e_sub) {
         const int ei = wd * 2 + e_sub;
@@ -2298,7 +2337,7 @@ void k_ernie_hca_prefill_512_v28(
         const float alpha = (mold > -1e30f) ? exp2f((mold - mnew) * LOG2E) : 0.0f;
         const float pv = (vld && (h0 + hm) < num_heads && mnew > -1e30f) ? exp2f((sc - mnew) * LOG2E) : 0.0f;
         const float bsum = halfwave_sum16(pv);
-        P_lds[wh][hm][l16] = f32_to_bf16_rne(pv);
+        P_lds[wh][hm][l16] = f32_to_bf16_rne_finite(pv);
         if (l16 == 0) {
           s_alpha[h_loc] = alpha;
           s_m[h_loc] = mnew;
@@ -2306,35 +2345,41 @@ void k_ernie_hca_prefill_512_v28(
         }
       }
     }
-    __syncthreads();
+    hca_lds_barrier(); // BARRIER C: P_lds & s_alpha ready for PV
 
 #pragma unroll
     for (int ei = 0; ei < 8; ++ei) {
       const float a_v = s_alpha[wh * 16 + 2 * ei + hrow];
+      if (__any(a_v != 1.0f)) {
 #pragma unroll
-      for (int j = 0; j < 8; ++j) o_acc[j][ei] *= a_v;
+        for (int j = 0; j < 8; ++j) o_acc[j][ei] *= a_v;
+      }
     }
 
-    if (k0 + 16 < klen) {
-      load_kv_tile(k0 + 16, v_hold);
-    }
-    __builtin_amdgcn_sched_barrier(0);
     const u4v p0 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][0]);
     const u4v p1 = *reinterpret_cast<const u4va*>(&P_lds[wh][l16][8]);
     const bf16x16 pf = __builtin_bit_cast(bf16x16, (u8v){p0.x, p0.y, p0.z, p0.w, p1.x, p1.y, p1.z, p1.w});
 
+    const int vg0 = d_start >> 5;
+    u4v v0_c = *reinterpret_cast<const u4va*>(&VT_lds_g[vg0][l16 * HCA_VT_STRIDE + 0]);
+    u4v v1_c = *reinterpret_cast<const u4va*>(&VT_lds_g[vg0][l16 * HCA_VT_STRIDE + 8]);
 #pragma unroll
     for (int j = 0; j < 8; ++j) {
-      const int vc_n = d_start + j * 16 + l16;
-      const u4v v0_c = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vc_n >> 5][(vc_n & 31) * HCA_VT_STRIDE + 0]);
-      const u4v v1_c = *reinterpret_cast<const u4va*>(&u_kv.VT_lds_g[vc_n >> 5][(vc_n & 31) * HCA_VT_STRIDE + 8]);
+      u4v v0_n, v1_n;
+      if (j + 1 < 8) {
+        const int vc_n = d_start + (j + 1) * 16 + l16;
+        const int vgn = vc_n >> 5;
+        v0_n = *reinterpret_cast<const u4va*>(&VT_lds_g[vgn][(vc_n & 31) * HCA_VT_STRIDE + 0]);
+        v1_n = *reinterpret_cast<const u4va*>(&VT_lds_g[vgn][(vc_n & 31) * HCA_VT_STRIDE + 8]);
+      }
       const bf16x16 vf = __builtin_bit_cast(bf16x16, (u8v){v0_c.x, v0_c.y, v0_c.z, v0_c.w, v1_c.x, v1_c.y, v1_c.z, v1_c.w});
       o_acc[j] = __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32(pf, vf, o_acc[j]);
-      __builtin_amdgcn_sched_barrier(0);
+      if (j + 1 < 8) { v0_c = v0_n; v1_c = v1_n; }
     }
-    __syncthreads();
+    // NO BARRIER D needed: KV_lds is separate from VT_lds_g!
   }
 
+  hca_lds_barrier(); // ensure all waves finished reading s_alpha before epilogue overwrites s_alpha
   if (tid < 64) {
     const int h = tid;
     float m_cur = s_m[tid];
@@ -2353,7 +2398,7 @@ void k_ernie_hca_prefill_512_v28(
     }
     s_alpha[tid] = scale_o;
   }
-  __syncthreads();
+  hca_lds_barrier();
 
   float rc[4], rs_signed[4];
   if constexpr (FUSE_ROPE) {
@@ -2380,24 +2425,24 @@ void k_ernie_hca_prefill_512_v28(
         if (wd == 3) {
 #pragma unroll
           for (int j = 0; j < 4; ++j) {
-            dst[j * 16] = f32_to_bf16_rne(o_acc[j][ei] * sc_o);
+            dst[j * 16] = f32_to_bf16_rne_bl(o_acc[j][ei] * sc_o);
           }
 #pragma unroll
           for (int jr = 0; jr < 4; ++jr) {
             const float v = o_acc[4 + jr][ei] * sc_o;
             const float v_other = shx_f<1>(v);
-            dst[(4 + jr) * 16] = f32_to_bf16_rne(fmaf(v_other, rs_signed[jr], v * rc[jr]));
+            dst[(4 + jr) * 16] = f32_to_bf16_rne_bl(fmaf(v_other, rs_signed[jr], v * rc[jr]));
           }
         } else {
 #pragma unroll
           for (int j = 0; j < 8; ++j) {
-            dst[j * 16] = f32_to_bf16_rne(o_acc[j][ei] * sc_o);
+            dst[j * 16] = f32_to_bf16_rne_bl(o_acc[j][ei] * sc_o);
           }
         }
       } else {
 #pragma unroll
         for (int j = 0; j < 8; ++j) {
-          dst[j * 16] = f32_to_bf16_rne(o_acc[j][ei] * sc_o);
+          dst[j * 16] = f32_to_bf16_rne_bl(o_acc[j][ei] * sc_o);
         }
       }
     }
