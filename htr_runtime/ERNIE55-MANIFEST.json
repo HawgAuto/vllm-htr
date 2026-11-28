@@ -1,64 +1,65 @@
 {
   "package": "vllm-ernie-htr",
+  "version": "0.2.8",
   "target_image": "ghcr.io/hawgauto/vllm-htr:v0.2.8",
   "base_image": "ghcr.io/hawgauto/vllm-htr:v0.2.7",
   "arch": "gfx1151",
-  "wave": "v0.2.8-roofline-prefill-flashindexer-h8-dspark-filter",
-  "total_kernels": 497,
+  "wave": "v0.2.8-ernie55-roofline-prefill-decode-parsers",
+  "total_kernels": 686,
   "native_bins": {
     "ernie_dsa_attn.so": {
-      "sha256": "ed2fe088f545787ab87de823cc9c10055b94670eaebc2de01b9f0d88c12e030f",
-      "bytes": 683552,
-      "kernels": 20,
-      "max_vgpr": 238,
+      "sha256": "f5a5c645ef96ca78879cfc148c2046d4ab553b5f2b0f8ab06e161150283f528c",
+      "bytes": 837640,
+      "kernels": 33,
+      "max_vgpr": 247,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
       "div_ops": 0,
       "scratch_ops": 0
     },
     "ernie_fast_ops.so": {
-      "sha256": "4effa5a5fe6d9d5c3fc458de8326b4aaad5c2f65594c42bca0b43010162176ba",
-      "bytes": 1147904,
-      "kernels": 101,
-      "max_vgpr": 89,
+      "sha256": "7c5b1bce4100a62fe259dfd5211655d21d03f520569a321e40cb4232dfe9b11d",
+      "bytes": 1771192,
+      "kernels": 198,
+      "max_vgpr": 254,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
       "div_ops": 0,
       "scratch_ops": 0
     },
     "ernie_hca_attn.so": {
-      "sha256": "033fa8cbe86d1142453cb53c1648268bd460cbf2dd53a332158427e25faa7d5d",
-      "bytes": 504008,
-      "kernels": 15,
-      "max_vgpr": 223,
+      "sha256": "f0588ed0f87f1c817a858815e6a36fffb84549bb9329802576dc57a438cb2b02",
+      "bytes": 871392,
+      "kernels": 44,
+      "max_vgpr": 237,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
       "div_ops": 0,
       "scratch_ops": 0
     },
     "ernie_k5_sp_prefill.so": {
-      "sha256": "a64c02e265ca19b0acd3cae45dc32adfc865b12918c4e361bfdbd336d3be6745",
-      "bytes": 878664,
-      "kernels": 46,
-      "max_vgpr": 229,
+      "sha256": "663dfabfed82ba490087bc40eb0971e1e557a29d9c3ed0911af40ab2111f2a00",
+      "bytes": 1393408,
+      "kernels": 86,
+      "max_vgpr": 193,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
       "div_ops": 0,
       "scratch_ops": 0
     },
     "hpf5_ernie.so": {
-      "sha256": "fd8b49432362f68df3e0bcdb9e817c05c974a3f2ce6ce15f058bfc576e774bf9",
-      "bytes": 936688,
-      "kernels": 29,
-      "max_vgpr": 176,
+      "sha256": "71062bd12d83b55fd607eb9ade6a254c8ca45436889cead19150dc2627377c1f",
+      "bytes": 939648,
+      "kernels": 35,
+      "max_vgpr": 118,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
       "div_ops": 0,
       "scratch_ops": 0
     },
     "htr_moe_ernie.so": {
-      "sha256": "72854825245bcb5297a78ce8bec1dae2a5691d85b344efa45bf17dcb98fcb751",
-      "bytes": 2834168,
+      "sha256": "2787b275e75659759e8d646c716b90cbec7538526b7c74ed1c6168bf690d2caa",
+      "bytes": 2832952,
       "kernels": 151,
       "max_vgpr": 93,
       "vgpr_spills": 0,
@@ -67,19 +68,19 @@
       "scratch_ops": 0
     },
     "htr_wo_a_ernie.so": {
-      "sha256": "303166cc553f9bef656bcf48d98462ab5eb39d1f3aa4e93ce6c6dd368a1ee600",
-      "bytes": 1746128,
-      "kernels": 118,
-      "max_vgpr": 166,
+      "sha256": "f133d86067b76efa53903bd1334c142e06be184b6bc1aad13b11fba3c2e810a2",
+      "bytes": 1715056,
+      "kernels": 120,
+      "max_vgpr": 232,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
       "div_ops": 0,
       "scratch_ops": 0
     },
     "mhc_ernie.so": {
-      "sha256": "b321dbe6996bde7e80e8247deb1a5c136f66303a81dde2b3e806529935525ec2",
-      "bytes": 427080,
-      "kernels": 17,
+      "sha256": "fe5b0f415774fe3a72292018bdba9f7718deee29a382425df75cb2fc70e019e1",
+      "bytes": 442248,
+      "kernels": 19,
       "max_vgpr": 108,
       "vgpr_spills": 0,
       "sgpr_spills": 0,
@@ -89,12 +90,70 @@
   },
   "shared_spec_bin": {
     "htr_spec_sample.so": {
-      "sha256": "e5f6bbb6c66be64f83a511f0766f4e555c3ba441e5987ace10e49bcfa8d8b95f",
+      "sha256": "2737362b8f0052a65238251c0c68d6870d4d963ad1ba9f8ea57331c15d850c3e",
       "bytes": 1060936,
       "kernels": 18,
       "max_vgpr": 66,
       "vgpr_spills": 0,
       "scratch_ops": 0
+    }
+  },
+  "python_files": {
+    "vllm_ernie_htr/__init__.py": {
+      "sha256": "9690aa0b8abb3765e192be8900a22e7d654402b5b17f6674ae91d26cd727a555",
+      "bytes": 1022
+    },
+    "vllm_ernie_htr/attention.py": {
+      "sha256": "ebfde4717e2c4502bf3e0f1237afdbdfc739e8aef39c581cc5c98062e7a7b89d",
+      "bytes": 71196
+    },
+    "vllm_ernie_htr/config.py": {
+      "sha256": "f16d057b11bd8b8e920259657b41651d003908f99ff8aff4a94118a4912c343d",
+      "bytes": 7887
+    },
+    "vllm_ernie_htr/dspark.py": {
+      "sha256": "b9674f46a0e5ccc5bbc7eafc1f290326ec714c1a0190dcc374a52b68fba60ddf",
+      "bytes": 23118
+    },
+    "vllm_ernie_htr/fast_ops.py": {
+      "sha256": "16f8123c0c864f4d7fd3f2c455e32e141a6f66f2651b11031be22c8669c28c38",
+      "bytes": 4254
+    },
+    "vllm_ernie_htr/flashindexer.py": {
+      "sha256": "4bdcb4f90d290e7198ab13651e54b4cca6531341a2bdc7d776460a455ed012e4",
+      "bytes": 9805
+    },
+    "vllm_ernie_htr/mhc.py": {
+      "sha256": "e9e065b664c13457c530946e7819518f7c3a2fafc16d21a5f32b4257bded5d3a",
+      "bytes": 14057
+    },
+    "vllm_ernie_htr/model.py": {
+      "sha256": "f1375f14ed6cdd7a0134e4f25120e29392fcbff4b16d493a359bd01f055ed4db",
+      "bytes": 38224
+    },
+    "vllm_ernie_htr/moe_ops.py": {
+      "sha256": "0fe082c08396d023f6fdc7c53a3d26674d34e33498bc4f05ca1982247be5edfe",
+      "bytes": 16147
+    },
+    "vllm_ernie_htr/parser.py": {
+      "sha256": "7b10a59d750d1f7108adad6b8a1ce6717b30ba3bdc6ddadf85df6e7587f5000b",
+      "bytes": 9970
+    },
+    "vllm_ernie_htr/patches.py": {
+      "sha256": "a756be1b58e175e56dd0d318d4cb02926383de671d0a3f1f5a637d8580260be2",
+      "bytes": 89609
+    },
+    "vllm_ernie_htr/reasoning_parser.py": {
+      "sha256": "617d4ec8cbebffa0f6b228d80b4020a749c09be11cdc7fe3a760761b7268d4f7",
+      "bytes": 215
+    },
+    "vllm_ernie_htr/renderer.py": {
+      "sha256": "af79e42b0159b88cd98795f1ce85955ff40bdfeedb97b63aa40121b561e0434e",
+      "bytes": 7107
+    },
+    "vllm_ernie_htr/tool_parser.py": {
+      "sha256": "dce6d27d75926c65f1cbe52dd60a7c0c27b304319fa89f520a85d753bd9e3505",
+      "bytes": 4840
     }
   }
 }

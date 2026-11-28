@@ -1,0 +1,48 @@
+{
+  "schema": "htr-v028-native-manifest-v1",
+  "version": "0.2.8",
+  "base_version": "0.2.7",
+  "target": "gfx1151",
+  "scope": "ERNIE-5.5-Flash-Preview-HTR v0.2.8 roofline prefill, decode, FlashIndexer H=8, DSpark filtered drafting & parser registration (Qwen3.8 v0.2.7 stack preserved intact)",
+  "shared_binaries": {
+    "htr_spec_sample.so": {
+      "sha256": "2737362b8f0052a65238251c0c68d6870d4d963ad1ba9f8ea57331c15d850c3e",
+      "bytes": 1060936
+    }
+  },
+  "ernie55_binaries": {
+    "ernie_dsa_attn.so": {
+      "sha256": "f5a5c645ef96ca78879cfc148c2046d4ab553b5f2b0f8ab06e161150283f528c",
+      "bytes": 837640
+    },
+    "ernie_fast_ops.so": {
+      "sha256": "7c5b1bce4100a62fe259dfd5211655d21d03f520569a321e40cb4232dfe9b11d",
+      "bytes": 1771192
+    },
+    "ernie_hca_attn.so": {
+      "sha256": "f0588ed0f87f1c817a858815e6a36fffb84549bb9329802576dc57a438cb2b02",
+      "bytes": 871392
+    },
+    "ernie_k5_sp_prefill.so": {
+      "sha256": "663dfabfed82ba490087bc40eb0971e1e557a29d9c3ed0911af40ab2111f2a00",
+      "bytes": 1393408
+    },
+    "hpf5_ernie.so": {
+      "sha256": "71062bd12d83b55fd607eb9ade6a254c8ca45436889cead19150dc2627377c1f",
+      "bytes": 939648
+    },
+    "htr_moe_ernie.so": {
+      "sha256": "2787b275e75659759e8d646c716b90cbec7538526b7c74ed1c6168bf690d2caa",
+      "bytes": 2832952
+    },
+    "htr_wo_a_ernie.so": {
+      "sha256": "f133d86067b76efa53903bd1334c142e06be184b6bc1aad13b11fba3c2e810a2",
+      "bytes": 1715056
+    },
+    "mhc_ernie.so": {
+      "sha256": "fe5b0f415774fe3a72292018bdba9f7718deee29a382425df75cb2fc70e019e1",
+      "bytes": 442248
+    }
+  },
+  "ernie55_manifest": "/opt/vllm-htr/ERNIE55-MANIFEST.json"
+}

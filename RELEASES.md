@@ -1,5 +1,12 @@
 # vLLM HTR release history
 
+## v0.2.8 — ERNIE-5.5 2.1× Roofline Prefill, FlashIndexer H=8, DSpark Filtering & Built-in Parsers
+
+- **Image:** `ghcr.io/hawgauto/vllm-htr@sha256:356d896546b905ccf89f5611b3376d8cd0a23d82fd0f5e97ecf9aaa5f44e7fbb` (alias `ghcr.io/hawgauto/vllm-htr:v0.2.8`)
+- **What's new:** **686 native `gfx1151` Wave32 HIP kernels** (`0` VGPR spills, `0` SGPR spills, `0` divOps, `0` scratchOps) delivering **`2.04–2.13×` faster ERNIE-5.5 cold prefill** (`669.0 tok/s` @ 8K, `666.2 tok/s` @ 16K, `658.4 tok/s` @ 32K, 3/3 Needle-in-a-Haystack PASS) with `0.00 GiB` extra VRAM (3-barrier 2-WG/WGP HCA at 96.5% BF16 WMMA peak, 2-WG/WGP DSA FP8/NVFP4, fused split-plane K=5 & `wo_a`+VHA WMMA, `hpf5_ernie` MoE prefill, `H=8` FlashIndexer, skip redundant mixed-KV zeroing, and `1.24–1.33×` bit-identical `H=64` shared-K indexer fallback from #13). Also adds zero-in-loop-barrier `1r4w`/`2r2w` BF16 GEMV, LDS-only barriers in `wo_a`/`moe`, exact `top_k` & full-vocab `top_p`-only filtered DSpark drafting, import-time `ernie55`/`ernie5` reasoning & tool parser registration enabled by default in `serve_ernie55.sh` (#14), and host `render` GID auto-detection (#11). Qwen3.8 `v0.2.7` stack preserved intact.
+- **Verified zero-overlay E2E (`nvfp4_ds_mla`, FlashIndexer + DSpark-5):** `8K: 669.0 tok/s`, `16K: 666.2 tok/s`, `32K: 658.4 tok/s` (3/3 Needle PASS), `code: 61.41 tok/s` (`acc=5.35`), `primes: 60.78 tok/s` (`acc=5.27`), `B=2: 42.83 tok/s` agg, live blocking + streaming `ernie55` parser PASS.
+- **Details:** [htr_runtime/releases/v0.2.8/README.md](htr_runtime/releases/v0.2.8/README.md)
+
 ## v0.2.7 — Qwen3.8 decode + 2.32× faster cold boot & unified ERNIE-5.5-Flash-HTR (DSpark)
 
 - **Image:** `ghcr.io/hawgauto/vllm-htr:v0.2.7` *(staged locally)*

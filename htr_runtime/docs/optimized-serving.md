@@ -1,7 +1,7 @@
-# HTR v0.2.7 optimized serving
+# HTR v0.2.8 optimized serving
 
 This serving update keeps the model weights, tokenizer, KV formats, and native
-`vllm serve` interface unchanged. All **v0.2.7** optimizations (Qwen3.8 + unified ERNIE-5.5) are enabled by
+`vllm serve` interface unchanged. All **v0.2.8** optimizations (Qwen3.8 + unified ERNIE-5.5) are enabled by
 default via `runtime-env.json` with zero extra `-e` flags required:
 
 - **Zero-Triton-JIT hot path (`20` new zero-spill AOT `gfx1151` Wave32 HIP kernels):**
@@ -20,7 +20,7 @@ default via `runtime-env.json` with zero extra `-e` flags required:
   fused GDN MTP spec decode, native QSA decode union (BF16 / INT8 / INT4 KV),
   `ple_gather_v25`, native Q38 draft filter, and async PLE defaults.
 
-See the [v0.2.7 release notes](../releases/v0.2.7/README.md) for exact verified
+See the [v0.2.8 release notes](../releases/v0.2.8/README.md) for exact verified
 zero-overlay E2E results and INT8 WMMA parity data.
 
 ## Native controls
@@ -30,7 +30,7 @@ sampling, context, KV budget, concurrency, and speculation flags remain native.
 Pull the qualified image first (no registry login required):
 
 ```sh
-docker pull ghcr.io/hawgauto/vllm-htr@sha256:ac7d31a9fcf22da19c412f3d2db2192d163a2e0a06d9a40de7f4697542186e5b
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:356d896546b905ccf89f5611b3376d8cd0a23d82fd0f5e97ecf9aaa5f44e7fbb
 ```
 
 Then start it:
@@ -38,7 +38,7 @@ Then start it:
 ```bash
 #!/usr/bin/env bash
 set -euo pipefail
-IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:ac7d31a9fcf22da19c412f3d2db2192d163a2e0a06d9a40de7f4697542186e5b
+IMAGE=ghcr.io/hawgauto/vllm-htr@sha256:356d896546b905ccf89f5611b3376d8cd0a23d82fd0f5e97ecf9aaa5f44e7fbb
 MODEL=${MODEL:-"$PWD/Qwen3.8-Flash-Next-HTR/Htr5Core"}
 WORKSPACE=${WORKSPACE:-"$PWD/htr-cache/Htr5Core-v026"}
 mkdir -p "$WORKSPACE"

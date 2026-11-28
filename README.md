@@ -1,16 +1,43 @@
-# vLLM HTR — v0.2.7
+# vLLM HTR — v0.2.8
 
-Unified native HTR serving for **AMD Strix Halo / `gfx1151` (Radeon 8060S, 128 GB unified memory)** — serving **both** [**Qwen3.8-Flash-Next-HTR**](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) (**2.32× faster cold boot**, up to **+21.5% faster decode**) and [**ERNIE-5.5-Flash-Preview-HTR**](https://huggingface.co/hstolte/ERNIE-5.5-Flash-Preview-HTR) (**280B MoE + DSpark-5**, **472 native Wave32 HIP kernels**, **1M Pure FP8** & **2M+ NVFP4 `2.02×` KV pools**, up to **59–60 tok/s**) from a single zero-overlay container image built for models quantized with **[HTR v0.2.0 (Halo Trellis)](https://github.com/HawgAuto/HTR/tree/v0.2.0)**.
+Unified native HTR serving for **AMD Strix Halo / `gfx1151` (Radeon 8060S, 128 GB unified memory)** — serving **both** [**ERNIE-5.5-Flash-Preview-HTR**](https://huggingface.co/hstolte/ERNIE-5.5-Flash-Preview-HTR) (**280B MoE + DSpark-5**, **686 native Wave32 HIP kernels**, **`2.1×` faster cold prefill at `658–669 tok/s`**, **FlashIndexer `H=8`**, **filtered DSpark drafting**, **built-in `ernie55`/`ernie5` parsers**, **1M Pure FP8 & 2M+ NVFP4 KV pools**) and [**Qwen3.8-Flash-Next-HTR**](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) (`v0.2.7` stack preserved intact) from a single zero-overlay container image built for models quantized with **[HTR v0.2.0 (Halo Trellis)](https://github.com/HawgAuto/HTR/tree/v0.2.0)**.
 
-[Run v0.2.7](htr_runtime/docs/optimized-serving.md) · [ERNIE-5.5-HTR Model](https://huggingface.co/hstolte/ERNIE-5.5-Flash-Preview-HTR) · [Qwen3.8-HTR Model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [HTR v0.2.0 Quantizer](https://github.com/HawgAuto/HTR/tree/v0.2.0) · [Release Notes](htr_runtime/releases/v0.2.7/README.md) · [Release History](RELEASES.md)
+[Run v0.2.8](htr_runtime/docs/optimized-serving.md) · [ERNIE-5.5-HTR Model](https://huggingface.co/hstolte/ERNIE-5.5-Flash-Preview-HTR) · [Qwen3.8-HTR Model](https://huggingface.co/hstolte/Qwen3.8-Flash-Next-HTR) · [HTR v0.2.0 Quantizer](https://github.com/HawgAuto/HTR/tree/v0.2.0) · [Release Notes](htr_runtime/releases/v0.2.8/README.md) · [Release History](RELEASES.md)
 
 ```sh
-docker pull ghcr.io/hawgauto/vllm-htr@sha256:ac7d31a9fcf22da19c412f3d2db2192d163a2e0a06d9a40de7f4697542186e5b
+docker pull ghcr.io/hawgauto/vllm-htr@sha256:356d896546b905ccf89f5611b3376d8cd0a23d82fd0f5e97ecf9aaa5f44e7fbb
 ```
 
-Version alias: `ghcr.io/hawgauto/vllm-htr:v0.2.7`. Standard `vllm serve` auto-detects Qwen3.8 vs ERNIE-5.5 and enables every native `gfx1151` Wave32 HIP optimization automatically with zero overlays.
+Version alias: `ghcr.io/hawgauto/vllm-htr:v0.2.8`. Standard `vllm serve` auto-detects Qwen3.8 vs ERNIE-5.5 and enables every native `gfx1151` Wave32 HIP optimization automatically with zero overlays.
 
-## What's new in v0.2.7
+## What's new in v0.2.8
+
+### ERNIE-5.5-Flash-Preview-HTR — 2.1× Roofline Prefill, FlashIndexer H=8 & Built-in Parsers
+- **686 native `gfx1151` Wave32 HIP kernels** across 8 `.so` libraries (`0` VGPR spills, `0` SGPR spills, `0` integer divOps, `0` scratchOps), strictly auto-gated from Qwen3.8 (`_serving_ernie5`).
+- **2.1× faster cold prefill (`0.00 GiB` extra VRAM):**
+  - 3-barrier separate-LDS 2-WG/WGP HCA prefill (`96.5%` of 85W Strix Halo BF16 WMMA peak), 2-WG/WGP DSA FP8/NVFP4 prefill, fused split-plane K=5 & `wo_a`+VHA WMMA prefill, `hpf5_ernie` MoE prefill, skip redundant mixed-precision KV block zeroing, and `1.24–1.33×` bit-identical `H=64` shared-K indexer score fallback (credit `@boxwrench`, #13).
+  - **FlashIndexer `H=8`** (`--hf-overrides '{"enable_flashindexer": true}'`) cuts indexer prefill ~`7×` (`4.77 ms` @ 16K).
+- **Faster decode & filtered DSpark-5 speculation:** Zero-in-loop-barrier `1r4w`/`2r2w` BF16 GEMV (`1.32–2.14×`), LDS-only barriers & GL2-cached partials in `htr_wo_a_ernie` / `htr_moe_ernie`, plus exact `top_k` & full-vocab `logsumexp` `top_p`-only filtered DSpark drafting (`htr_spec_sample.so`).
+- **Built-in `ernie55` & `ernie5` parsers + launcher fixes (#14, #11):** Both `ernie55` and `ernie5` reasoning/tool-call parsers registered at import time (no `--reasoning-parser-plugin` needed) and enabled by default in `htr_runtime/serve_ernie55.sh`, plus automatic numeric host `render` GID detection. *(Note: vLLM `0.29.x` exposes parsed thinking text on `message.reasoning` / `delta.reasoning`, not `reasoning_content`.)*
+
+### Verified Zero-Overlay E2E Gate — v0.2.8 (`gfx1151`, AMD Strix Halo 128 GB)
+
+| ERNIE-5.5 Benchmark (`nvfp4_ds_mla`, FlashIndexer + DSpark-5, `mbt=4096`) | `v0.2.7` | **`v0.2.8` Zero-Overlay** | Result |
+|---|---:|---:|---|
+| **Cold Prefill 8K** | `328.4 tok/s` | **`669.0 tok/s`** (`12.00 s`) | **2.04×** · Needle PASS |
+| **Cold Prefill 16K** | `319.1 tok/s` | **`666.2 tok/s`** (`24.24 s`) | **2.09×** · Needle PASS |
+| **Cold Prefill 32K** | `308.6 tok/s` | **`658.4 tok/s`** (`49.19 s`) | **2.13×** · Needle PASS |
+| **B=1 `code` / `primes` (`tk40/tp95`)** | — | **`61.41` / `60.78 tok/s`** dec | `acc = 5.35 / 5.27` |
+| **B=1 `prose` / `code (top_p-only)`** | — | **`31.44` / `31.31 tok/s`** dec | `acc = 2.75 / 2.84` |
+| **B=2 Concurrent (`T=12`)** | — | **`42.83 tok/s`** agg (`21.42/user`) | `acc = 3.13`, `0` restarts |
+| **`ernie55` Reasoning Parser (blocking & streaming)** | unparsed by default | **PASS** | `content == "OK"`, `reasoning` separated |
+
+Full manifests & notes: [v0.2.8 README](htr_runtime/releases/v0.2.8/README.md) · [V028-NATIVE-MANIFEST.json](htr_runtime/V028-NATIVE-MANIFEST.json) · [ERNIE55-MANIFEST.json](htr_runtime/ERNIE55-MANIFEST.json) · [GitHub Release `htr-v0.2.8`](https://github.com/HawgAuto/vllm-htr/releases/tag/htr-v0.2.8).
+
+---
+
+## Preserved v0.2.7 baseline (Qwen3.8 + ERNIE-5.5 1M/2M KV)
+
 
 ### Unified ERNIE-5.5-Flash-Preview-HTR (280B MoE) + DSpark-5 on 128 GB Strix Halo
 - **472 native `gfx1151` Wave32 HIP kernels** across 8 `.so` libraries (`0` VGPR spills, `0` SGPR spills, `0` integer divOps), strictly auto-gated from Qwen3.8 (`_serving_ernie5`).
