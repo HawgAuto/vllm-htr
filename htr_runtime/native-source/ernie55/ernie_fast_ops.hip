@@ -2237,6 +2237,208 @@ static void dispatch_bf16_gemv_xlds512(
   }
 }
 
+// Wave 70: Zero-in-loop-barrier multi-wave-per-row BF16 GEMV (1r4w & 2r2w) for gfx1151!
+//   - Eliminates 2x __syncthreads() (buffer_gl0_inv) per 512-K step -> X stays 100% in 32 KiB L0 cache!
+//   - 1r4w (grid=N, 4 waves/row) & 2r2w (grid=(N+1)/2, 2 waves/row) saturate all 40 CUs on N=192..2048
+//     and hit 233 GB/s (LPDDR5X roofline) on DSpark main_proj 4096x12288 (T<=8)!
+//   - Only ONE LDS-only barrier (s_waitcnt lgkmcnt(0); s_barrier) at final reduction (<= 256 B LDS).
+__device__ __forceinline__ void fops_lds_barrier_v70() {
+  asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+}
+
+template <int R, int OUT_BF16>
+__global__ __launch_bounds__(128) void k_bf16_gemv_1r4w_v28(
+    const uint16_t* __restrict__ x, int64_t x_s0,
+    const uint16_t* __restrict__ w, int64_t w_s0,
+    void* __restrict__ out, int N, int K) {
+  __shared__ float s_part[4][R];
+  const int n = blockIdx.x;
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const uint16_t* w_row = w + (int64_t)n * w_s0;
+
+  const int k_1024 = K & ~1023;
+  const int n1024 = k_1024 >> 10;
+  const int ph = (n1024 >= 4) ? ((n & 3) << 10) : ((n1024 >= 2) ? ((n & 1) << 10) : 0);
+
+  float acc0[R], acc1[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) { acc0[r] = 0.0f; acc1[r] = 0.0f; }
+
+  for (int ks = 0; ks < k_1024; ks += 1024) {
+    int kb = ks + ph;
+    if (kb >= k_1024) kb -= k_1024;
+    const int ko = kb + wave * 256 + lane * 8;
+    const u4v wv = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(w_row + ko));
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const u4v xv = *reinterpret_cast<const u4va*>(x + (int64_t)r * x_s0 + ko);
+      acc0[r] = bf16_dot2(wv.x, xv.x, acc0[r]);
+      acc1[r] = bf16_dot2(wv.y, xv.y, acc1[r]);
+      acc0[r] = bf16_dot2(wv.z, xv.z, acc0[r]);
+      acc1[r] = bf16_dot2(wv.w, xv.w, acc1[r]);
+    }
+  }
+  for (int ks = k_1024 + wave * 256; ks < K; ks += 1024) {
+    const int ko = ks + lane * 8;
+    const u4v wv = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(w_row + ko));
+#pragma unroll
+    for (int r = 0; r < R; ++r) {
+      const u4v xv = *reinterpret_cast<const u4va*>(x + (int64_t)r * x_s0 + ko);
+      acc0[r] = bf16_dot2(wv.x, xv.x, acc0[r]);
+      acc1[r] = bf16_dot2(wv.y, xv.y, acc1[r]);
+      acc0[r] = bf16_dot2(wv.z, xv.z, acc0[r]);
+      acc1[r] = bf16_dot2(wv.w, xv.w, acc1[r]);
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    float a = acc0[r] + acc1[r];
+    a += __shfl_xor(a, 16, 32);
+    a += __shfl_xor(a, 8, 32);
+    a += __shfl_xor(a, 4, 32);
+    a += __shfl_xor(a, 2, 32);
+    a += __shfl_xor(a, 1, 32);
+    if (lane == 0) s_part[wave][r] = a;
+  }
+  fops_lds_barrier_v70();
+  if (tid < R) {
+    const float tot = s_part[0][tid] + s_part[1][tid] + s_part[2][tid] + s_part[3][tid];
+    if constexpr (OUT_BF16) {
+      reinterpret_cast<uint16_t*>(out)[(int64_t)tid * N + n] = f32_to_bf16_rne(tot);
+    } else {
+      reinterpret_cast<float*>(out)[(int64_t)tid * N + n] = tot;
+    }
+  }
+}
+
+template <int R, int OUT_BF16>
+__global__ __launch_bounds__(128) void k_bf16_gemv_2r2w_v28(
+    const uint16_t* __restrict__ x, int64_t x_s0,
+    const uint16_t* __restrict__ w, int64_t w_s0,
+    void* __restrict__ out, int N, int K) {
+  __shared__ float s_part[2][2][R];
+  const int tid = threadIdx.x;
+  const int wave = tid >> 5;
+  const int lane = tid & 31;
+  const int rloc = wave >> 1;
+  const int wsub = wave & 1;
+  const int n = blockIdx.x * 2 + rloc;
+  const bool vn = (n < N);
+  const uint16_t* w_row = w + (int64_t)(vn ? n : (N - 1)) * w_s0;
+
+  const int k_512 = K & ~511;
+  const int n512 = k_512 >> 9;
+  const int ph = (n512 >= 4) ? ((n & 3) << 9) : ((n512 >= 2) ? ((n & 1) << 9) : 0);
+
+  float acc0[R], acc1[R];
+#pragma unroll
+  for (int r = 0; r < R; ++r) { acc0[r] = 0.0f; acc1[r] = 0.0f; }
+
+  if (vn) {
+    for (int ks = 0; ks < k_512; ks += 512) {
+      int kb = ks + ph;
+      if (kb >= k_512) kb -= k_512;
+      const int ko = kb + wsub * 256 + lane * 8;
+      const u4v wv = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(w_row + ko));
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const u4v xv = *reinterpret_cast<const u4va*>(x + (int64_t)r * x_s0 + ko);
+        acc0[r] = bf16_dot2(wv.x, xv.x, acc0[r]);
+        acc1[r] = bf16_dot2(wv.y, xv.y, acc1[r]);
+        acc0[r] = bf16_dot2(wv.z, xv.z, acc0[r]);
+        acc1[r] = bf16_dot2(wv.w, xv.w, acc1[r]);
+      }
+    }
+    for (int ks = k_512 + wsub * 256; ks < K; ks += 512) {
+      const int ko = ks + lane * 8;
+      const u4v wv = __builtin_nontemporal_load(reinterpret_cast<const u4va*>(w_row + ko));
+#pragma unroll
+      for (int r = 0; r < R; ++r) {
+        const u4v xv = *reinterpret_cast<const u4va*>(x + (int64_t)r * x_s0 + ko);
+        acc0[r] = bf16_dot2(wv.x, xv.x, acc0[r]);
+        acc1[r] = bf16_dot2(wv.y, xv.y, acc1[r]);
+        acc0[r] = bf16_dot2(wv.z, xv.z, acc0[r]);
+        acc1[r] = bf16_dot2(wv.w, xv.w, acc1[r]);
+      }
+    }
+  }
+
+#pragma unroll
+  for (int r = 0; r < R; ++r) {
+    float a = acc0[r] + acc1[r];
+    a += __shfl_xor(a, 16, 32);
+    a += __shfl_xor(a, 8, 32);
+    a += __shfl_xor(a, 4, 32);
+    a += __shfl_xor(a, 2, 32);
+    a += __shfl_xor(a, 1, 32);
+    if (lane == 0) s_part[rloc][wsub][r] = a;
+  }
+  fops_lds_barrier_v70();
+  if (vn && wsub == 0 && lane < R) {
+    const float tot = s_part[rloc][0][lane] + s_part[rloc][1][lane];
+    if constexpr (OUT_BF16) {
+      reinterpret_cast<uint16_t*>(out)[(int64_t)lane * N + n] = f32_to_bf16_rne(tot);
+    } else {
+      reinterpret_cast<float*>(out)[(int64_t)lane * N + n] = tot;
+    }
+  }
+}
+
+template <int OUT_BF16>
+static void dispatch_bf16_gemv_1r4w(
+    int T, dim3 grid, hipStream_t st,
+    const uint16_t* xp, int64_t xs0, const uint16_t* wp, int64_t ws0,
+    void* op, int N, int K) {
+  switch (T) {
+    case 1:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<1,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 2:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<2,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 3:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<3,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 4:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<4,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 5:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<5,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 6:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<6,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 7:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<7,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 8:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<8,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 9:  hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<9,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 10: hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<10, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 11: hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<11, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 12: hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<12, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 13: hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<13, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 14: hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<14, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 15: hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<15, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 16: hipLaunchKernelGGL((k_bf16_gemv_1r4w_v28<16, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    default: TORCH_CHECK(false, "T must be 1..16");
+  }
+}
+
+template <int OUT_BF16>
+static void dispatch_bf16_gemv_2r2w(
+    int T, dim3 grid, hipStream_t st,
+    const uint16_t* xp, int64_t xs0, const uint16_t* wp, int64_t ws0,
+    void* op, int N, int K) {
+  switch (T) {
+    case 1:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<1,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 2:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<2,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 3:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<3,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 4:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<4,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 5:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<5,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 6:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<6,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 7:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<7,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 8:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<8,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 9:  hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<9,  OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 10: hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<10, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 11: hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<11, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 12: hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<12, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 13: hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<13, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 14: hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<14, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 15: hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<15, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    case 16: hipLaunchKernelGGL((k_bf16_gemv_2r2w_v28<16, OUT_BF16>), grid, dim3(128), 0, st, xp, xs0, wp, ws0, op, N, K); break;
+    default: TORCH_CHECK(false, "T must be 1..16");
+  }
+}
+
 torch::Tensor ernie_bf16_gemv_nt(torch::Tensor x, torch::Tensor w, bool out_bf16 = false) {
   TORCH_CHECK(x.is_cuda() && w.is_cuda() && x.dim() == 2 && w.dim() == 2);
   TORCH_CHECK(x.scalar_type() == torch::kBFloat16 && w.scalar_type() == torch::kBFloat16);
@@ -2245,10 +2447,28 @@ torch::Tensor ernie_bf16_gemv_nt(torch::Tensor x, torch::Tensor w, bool out_bf16
   const int N = (int)w.size(0);
   TORCH_CHECK(w.size(1) == K && (K % 256) == 0 && x.stride(1) == 1 && w.stride(1) == 1 && T >= 1 && T <= 16);
   auto st = c10::hip::getCurrentHIPStream().stream();
-  const dim3 grid((N + 3) / 4);
   const uint16_t* xp = reinterpret_cast<const uint16_t*>(x.data_ptr());
   const uint16_t* wp = reinterpret_cast<const uint16_t*>(w.data_ptr());
 
+  // Wave 70: zero-in-loop-barrier multi-wave-per-row L0-cached X kernels:
+  //   - Small/medium N (N<=2048, K>=1024): 1r4w (N<=384 or T<=6) / 2r2w (T>6, N>384) -> 1.20-2.20x!
+  //   - Wide K (K>=8192, T<=8, e.g. DSpark main_proj 4096x12288): 1r4w -> 233 GB/s (1.10-1.19x)!
+  if ((N <= 2048 && K >= 1024) || (K >= 8192 && T <= 8)) {
+    const bool use_2r2w = (N <= 2048 && N > 384 && T > 6);
+    if (out_bf16) {
+      auto out = torch::empty({T, N}, x.options());
+      if (use_2r2w) dispatch_bf16_gemv_2r2w<1>(T, dim3((N + 1) / 2), st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+      else          dispatch_bf16_gemv_1r4w<1>(T, dim3(N), st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+      return out;
+    } else {
+      auto out = torch::empty({T, N}, x.options().dtype(torch::kFloat32));
+      if (use_2r2w) dispatch_bf16_gemv_2r2w<0>(T, dim3((N + 1) / 2), st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+      else          dispatch_bf16_gemv_1r4w<0>(T, dim3(N), st, xp, x.stride(0), wp, w.stride(0), out.data_ptr(), N, K);
+      return out;
+    }
+  }
+
+  const dim3 grid((N + 3) / 4);
   // T==1 on non-pow2-K tall shapes (e.g. DSA idx wq_b 8192x1536): 4x MLP direct kernel peaks at 230 GB/s!
   if (T == 1 && N >= 4096 && (K & 2047) != 0) {
     if (out_bf16) {

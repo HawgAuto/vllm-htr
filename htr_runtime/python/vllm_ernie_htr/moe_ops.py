@@ -301,7 +301,7 @@ class Ernie5_5HTRRoutedExperts(nn.Module):
         if _HPF5_BMW_ENV is not None:
             bmw = 32 if T <= 128 else HPF5_BMW
         else:
-            bmw = 32 if T <= 1280 else (64 if T <= 2560 else 128)
+            bmw = 32 if T <= 1152 else (64 if T <= 2560 else 128)
         nt_use = HPF5_NT
         return _hpf5().hpf5_ernie_forward(
             x, ids32, w32,
