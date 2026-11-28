@@ -31,6 +31,12 @@ TOOL_CALL_PARSER="${TOOL_CALL_PARSER:-ernie55}"
 
 mkdir -p "${WORKSPACE}"
 
+GROUP_ARGS=(--group-add video)
+RENDER_GID="$(getent group render 2>/dev/null | cut -d: -f3 || true)"
+if [[ -n "${RENDER_GID}" ]]; then
+  GROUP_ARGS+=(--group-add "${RENDER_GID}")
+fi
+
 PARSER_ARGS=()
 if [[ -n "${REASONING_PARSER}" && "${REASONING_PARSER}" != "none" ]]; then
   PARSER_ARGS+=(--reasoning-parser "${REASONING_PARSER}")
@@ -77,7 +83,7 @@ free -h
 exec docker run --rm --name "ernie55_${MODE}" \
   --memory="${MEM_LIMIT}" --memory-swap="${MEM_LIMIT}" \
   --device=/dev/kfd --device=/dev/dri \
-  --security-opt seccomp=unconfined --group-add video --ipc=host \
+  --security-opt seccomp=unconfined "${GROUP_ARGS[@]}" --ipc=host \
   -p "${PORT}:8000" \
   -v "${WORKSPACE}:/workspace" \
   -v "${MODEL}:${MODEL}:ro" \
